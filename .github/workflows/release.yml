@@ -14,19 +14,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build wheels
+      - name: Build wheels (x86_64)
         uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --out dist
           manylinux: auto
-          # cross-compile aarch64 on Linux
-          target: ${{ matrix.os == 'ubuntu-latest' && 'x86_64' || '' }}
 
       - name: Build wheels (Linux aarch64)
         if: matrix.os == 'ubuntu-latest'
@@ -36,14 +34,6 @@ jobs:
           args: --release --out dist
           manylinux: auto
           target: aarch64
-
-      - name: Build wheels (macOS arm64)
-        if: matrix.os == 'macos-latest'
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          args: --release --out dist
-          target: aarch64-apple-darwin
 
       - uses: actions/upload-artifact@v4
         with:
