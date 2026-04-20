@@ -23,7 +23,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist
+          args: --release --out dist -i python3
           manylinux: auto
 
       - name: Build wheels (Linux aarch64)
@@ -31,7 +31,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist
+          args: --release --out dist -i python3
           manylinux: auto
           target: aarch64
 
