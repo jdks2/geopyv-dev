@@ -10,20 +10,44 @@ permissions:
 
 jobs:
   build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build wheels on ${{ matrix.os }} ${{ matrix.python-version || '' }}
     runs-on: ${{ matrix.os }}
+
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          # -------------------------
+          # Linux (single job builds all versions)
+          # -------------------------
+          - os: ubuntu-latest
+            python-version: ""
+
+          # -------------------------
+          # Windows (matrix per Python version)
+          # -------------------------
+          - os: windows-latest
+            python-version: "3.8"
+          - os: windows-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.12"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build wheels (x86_64)
+      # -------------------------
+      # Linux (manylinux wheels)
+      # -------------------------
+      - name: Build wheels (Linux x86_64)
+        if: matrix.os == 'ubuntu-latest'
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: -release --out dist -i cp38 -i cp39 -i cp310 -i cp311 -i cp312
+          args: --release --out dist -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12
           manylinux: auto
 
       - name: Build wheels (Linux aarch64)
@@ -31,18 +55,38 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: -release --out dist -i cp38 -i cp39 -i cp310 -i cp311 -i cp312
+          args: --release --out dist -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12
           manylinux: auto
-          target: aarch64
+          target: aarch64-unknown-linux-gnu
 
+      # -------------------------
+      # Windows (per Python version)
+      # -------------------------
+      - name: Set up Python (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out dist
+
+      # -------------------------
+      # Upload artifacts
+      # -------------------------
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.os }}-${{ matrix.python-version || 'linux' }}
           path: dist/*.whl
 
   build_sdist:
     name: Build source distribution
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -62,8 +106,9 @@ jobs:
     needs: [build_wheels, build_sdist]
     runs-on: ubuntu-latest
     environment: pypi
+
     permissions:
-      id-token: write  # required for OIDC trusted publishing
+      id-token: write
 
     steps:
       - uses: actions/download-artifact@v4
