@@ -1,0 +1,14 @@
+[package]
+name = "geopyv-dev-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_geopyv_dev"
+crate-type = ["cdylib"]
+
+[dependencies]
+geopyv-dev = { path = ".." }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = "0.16"

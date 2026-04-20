@@ -1,6 +1,19 @@
+[workspace]
+members = [".", "python"]
+resolver = "2"
+
 [package]
 name = "geopyv-dev"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+thiserror = "2"
+nalgebra = "0.33"
+ndarray = { version = "0.16", features = ["serde"] }
+rustfft = "6"
+image = "0.25"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+spade = "2"
