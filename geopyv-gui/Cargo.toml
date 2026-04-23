@@ -1,0 +1,20 @@
+[package]
+name = "geopyv-gui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "geopyv-gui"
+path = "src/main.rs"
+
+[dependencies]
+geopyv-dev = { path = ".." }
+eframe = { version = "0.31", features = ["default"] }
+egui = "0.31"
+egui_plot = "0.31"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff"] }
+ndarray = "0.16"

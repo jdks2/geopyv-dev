@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 // PyArray1<u32> is used for iterations getter
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -18,7 +19,7 @@ use geopyv_dev::mesh::{
     self, Mesh, MeshSolution, SolveConfig, SolveMethod,
 };
 
-use crate::{py_image::PyImage, Error};
+use crate::{py_image::PyImage, py_templates::{PyCircle, PySquare}, Error};
 
 // ---------------------------------------------------------------------------
 // Mesh class
@@ -78,8 +79,8 @@ impl PyMesh {
     ///     Reference image (pre-computed B-spline data).
     /// g_img : Image
     ///     Target image.
-    /// template_coords : numpy.ndarray, shape (n_px, 2), float64
-    ///     Subset template pixel offsets.
+    /// template : Circle or Square
+    ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Image coordinate ``[x, y]`` near a region of low deformation.
     /// seed_warp : list[float]
@@ -98,14 +99,14 @@ impl PyMesh {
     /// Returns
     /// -------
     /// MeshSolution
-    #[pyo3(signature = (f_img, g_img, template_coords, seed_coord, seed_warp,
+    #[pyo3(signature = (f_img, g_img, template, seed_coord, seed_warp,
                          max_norm=1e-5, max_iterations=50, subset_order=1,
                          tolerance=0.75, method="icgn"))]
     fn solve(
         &self,
         f_img: PyRef<'_, PyImage>,
         g_img: PyRef<'_, PyImage>,
-        template_coords: PyReadonlyArray2<f64>,
+        template: &Bound<'_, PyAny>,
         seed_coord: [f64; 2],
         seed_warp: Vec<f64>,
         max_norm: f64,
@@ -122,12 +123,16 @@ impl PyMesh {
             tolerance,
             method: solve_method,
         };
-        let tc = template_coords.as_array().to_owned();
         let f_path = f_img.filepath.clone();
         let g_path = g_img.filepath.clone();
-        let sol = self.inner
-            .solve(&f_img.inner, &g_img.inner, &tc, seed_coord, &seed_warp, &cfg)
-            .map_err(Error::from)?;
+        let sol = if let Ok(circle) = template.extract::<PyRef<'_, PyCircle>>() {
+            self.inner.solve(&f_img.inner, &g_img.inner, &circle.inner.coords, seed_coord, &seed_warp, &cfg)
+        } else if let Ok(square) = template.extract::<PyRef<'_, PySquare>>() {
+            self.inner.solve(&f_img.inner, &g_img.inner, &square.inner.coords, seed_coord, &seed_warp, &cfg)
+        } else {
+            return Err(PyTypeError::new_err("template must be a Circle or Square"));
+        }
+        .map_err(Error::from)?;
         Ok(PyMeshSolution { inner: sol, f_img_path: f_path, g_img_path: g_path })
     }
 

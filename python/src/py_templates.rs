@@ -22,7 +22,7 @@ use crate::Error;
 ///     Radius of the subset in pixels. Default 25.
 #[pyclass(name = "Circle")]
 pub struct PyCircle {
-    inner: Template,
+    pub(crate) inner: Template,
 }
 
 #[pymethods]
@@ -102,7 +102,7 @@ impl PyCircle {
 ///     Half side-length of the subset in pixels. Default 25.
 #[pyclass(name = "Square")]
 pub struct PySquare {
-    inner: Template,
+    pub(crate) inner: Template,
 }
 
 #[pymethods]

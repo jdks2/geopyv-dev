@@ -4,13 +4,18 @@
 //! The constructor accepts a subset centre coordinate, template pixel offsets,
 //! and the reference image QCQT; it precomputes all reference quantities.
 
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use geopyv_dev::subset::Subset;
 
-use crate::Error;
+use crate::{
+    py_image::PyImage,
+    py_templates::{PyCircle, PySquare},
+    Error,
+};
 
 // ---------------------------------------------------------------------------
 // Python class
@@ -22,10 +27,10 @@ use crate::Error;
 /// ----------
 /// coord : array_like of shape (2,)
 ///     Subset centre coordinate ``[coord0, coord1]``.
-/// template_coords : numpy.ndarray of shape (n_px, 2), dtype float64
-///     Pixel offsets relative to the centre (from a `Circle` or `Square`).
-/// f_qcqt : numpy.ndarray of shape (rows*6, cols*6), dtype float64
-///     B-spline coefficient matrix from `Image.qcqt`.
+/// template : Circle or Square
+///     Template object whose pixel offsets define the subset shape.
+/// f_img : Image
+///     Reference image (pre-computed B-spline data).
 ///
 /// Attributes
 /// ----------
@@ -59,18 +64,23 @@ pub struct PySubset {
 #[pymethods]
 impl PySubset {
     #[new]
-    #[pyo3(signature = (coord, template_coords, f_qcqt, f_img_path=None, template_size=None, template_shape=None))]
+    #[pyo3(signature = (coord, template, f_img, f_img_path=None, template_size=None, template_shape=None))]
     fn new(
         coord: [f64; 2],
-        template_coords: PyReadonlyArray2<f64>,
-        f_qcqt: PyReadonlyArray2<f64>,
+        template: &Bound<'_, PyAny>,
+        f_img: PyRef<'_, PyImage>,
         f_img_path: Option<String>,
         template_size: Option<usize>,
         template_shape: Option<String>,
     ) -> PyResult<Self> {
-        let tc = template_coords.as_array().to_owned();
-        let qcqt = f_qcqt.as_array().to_owned();
-        let s = Subset::new(coord, &tc, &qcqt).map_err(Error::from)?;
+        let s = if let Ok(circle) = template.extract::<PyRef<'_, PyCircle>>() {
+            Subset::new(coord, &circle.inner.coords, &f_img.inner.qcqt)
+        } else if let Ok(square) = template.extract::<PyRef<'_, PySquare>>() {
+            Subset::new(coord, &square.inner.coords, &f_img.inner.qcqt)
+        } else {
+            return Err(PyTypeError::new_err("template must be a Circle or Square"));
+        }
+        .map_err(Error::from)?;
         Ok(PySubset { inner: s, f_img_path, template_size, template_shape, solve_result: None })
     }
 
@@ -132,8 +142,8 @@ impl PySubset {
     ///
     /// Parameters
     /// ----------
-    /// g_qcqt : numpy.ndarray of shape (rows*6, cols*6), dtype float64
-    ///     Target image B-spline coefficient matrix.
+    /// g_img : Image
+    ///     Target image (pre-computed B-spline data).
     /// p_0 : list[float]
     ///     Initial warp vector. Length 6 for order-1, 12 for order-2.
     /// max_norm : float, optional
@@ -147,19 +157,18 @@ impl PySubset {
     ///     ``p`` (list[float]), ``c_zncc`` (float), ``c_znssd`` (float),
     ///     ``iterations`` (int), ``converged`` (bool),
     ///     ``history`` (list of (iter, norm, zncc, znssd)).
-    #[pyo3(signature = (g_qcqt, p_0, max_norm=1e-3, max_iterations=50))]
+    #[pyo3(signature = (g_img, p_0, max_norm=1e-3, max_iterations=50))]
     fn solve_icgn<'py>(
         &mut self,
         py: Python<'py>,
-        g_qcqt: PyReadonlyArray2<f64>,
+        g_img: PyRef<'_, PyImage>,
         p_0: Vec<f64>,
         max_norm: f64,
         max_iterations: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let qcqt = g_qcqt.as_array().to_owned();
         let result = self
             .inner
-            .solve_icgn(&qcqt, &p_0, max_norm, max_iterations)
+            .solve_icgn(&g_img.inner.qcqt, &p_0, max_norm, max_iterations)
             .map_err(Error::from)?;
         let d = result_to_dict(py, result)?;
         d.set_item("max_norm", max_norm)?;
@@ -171,19 +180,18 @@ impl PySubset {
     /// Forward Additive Gauss-Newton solver.
     ///
     /// Parameters and return value same as :meth:`solve_icgn`.
-    #[pyo3(signature = (g_qcqt, p_0, max_norm=1e-3, max_iterations=50))]
+    #[pyo3(signature = (g_img, p_0, max_norm=1e-3, max_iterations=50))]
     fn solve_fagn<'py>(
         &mut self,
         py: Python<'py>,
-        g_qcqt: PyReadonlyArray2<f64>,
+        g_img: PyRef<'_, PyImage>,
         p_0: Vec<f64>,
         max_norm: f64,
         max_iterations: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let qcqt = g_qcqt.as_array().to_owned();
         let result = self
             .inner
-            .solve_fagn(&qcqt, &p_0, max_norm, max_iterations)
+            .solve_fagn(&g_img.inner.qcqt, &p_0, max_norm, max_iterations)
             .map_err(Error::from)?;
         let d = result_to_dict(py, result)?;
         d.set_item("max_norm", max_norm)?;

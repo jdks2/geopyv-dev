@@ -29,7 +29,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     field::FieldSolution,
     mesh::MeshSolution,
+    particle::ParticleSolution,
     sequence::SequenceSolution,
+    subset::SubsetSolution,
     Error,
 };
 
@@ -48,9 +50,11 @@ const VERSION: u8 = 0x01;
 /// `.pyv` file.  The variant tag is embedded in the bincode stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeopyvObject {
+    Subset(SubsetSolution),
     Mesh(MeshSolution),
     Field(FieldSolution),
     Sequence(SequenceSolution),
+    Particle(ParticleSolution),
 }
 
 // ---------------------------------------------------------------------------

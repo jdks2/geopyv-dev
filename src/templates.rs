@@ -24,7 +24,7 @@ use crate::Error;
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TemplateShape {
     Circle,
     Square,
