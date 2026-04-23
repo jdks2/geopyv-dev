@@ -6,6 +6,7 @@ use eframe::egui;
 
 /// Converts between image-pixel space and screen space, given the current
 /// pan offset and zoom of the image viewer.
+#[derive(Clone, Copy)]
 pub struct ImageCoord {
     pub canvas_center: egui::Pos2,
     pub offset: egui::Vec2,

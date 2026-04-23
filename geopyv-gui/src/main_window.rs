@@ -4,7 +4,12 @@ use std::time::SystemTime;
 use eframe::egui;
 
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
+use crate::field_tab::{FieldSpawnParams, FieldTabState};
+use crate::mesh_tab::{MeshSpawnParams, MeshTabState};
+use crate::particle_tab::{ParticleSpawnParams, ParticleTabState};
 use crate::project::Project;
+use crate::sequence_tab::{SequenceSpawnParams, SequenceTabState};
+use crate::subset_tab::{SubsetSpawnParams, SubsetTabState};
 use crate::template::{shape_label, render_template_preview, TemplateConfig, TemplateShape};
 
 // ---------------------------------------------------------------------------
@@ -237,6 +242,12 @@ impl RightPaneState {
 }
 
 // ---------------------------------------------------------------------------
+// PaneMode re-exported for subset_tab.rs
+// ---------------------------------------------------------------------------
+// (already defined above — just ensuring it is pub)
+
+
+// ---------------------------------------------------------------------------
 // Main window
 // ---------------------------------------------------------------------------
 
@@ -246,8 +257,14 @@ pub struct MainWindow {
     pub left: LeftPaneState,
     pub middle: MiddlePaneState,
     pub right: RightPaneState,
+    pub subset: SubsetTabState,
+    pub mesh: MeshTabState,
+    pub sequence: SequenceTabState,
+    pub particle: ParticleTabState,
+    pub field: FieldTabState,
     pub texture_cache: TextureCache,
     pending_refresh: bool,
+    pub error_modal: Option<String>,
 }
 
 impl MainWindow {
@@ -258,13 +275,143 @@ impl MainWindow {
             left: LeftPaneState::new(),
             middle: MiddlePaneState::new(),
             right: RightPaneState::new(),
+            subset: SubsetTabState::new(),
+            mesh: MeshTabState::new(),
+            sequence: SequenceTabState::new(),
+            particle: ParticleTabState::new(),
+            field: FieldTabState::new(),
             texture_cache: TextureCache::new(),
             pending_refresh: false,
+            error_modal: None,
         }
     }
 
     pub fn show(&mut self, ctx: &egui::Context, project: &mut Project) {
         self.left.refresh(self.active_tab, project, false);
+
+        // Request continuous repaint while a solve is running.
+        if self.subset.is_solving()
+            || self.mesh.is_solving()
+            || self.sequence.is_solving()
+            || self.particle.is_solving()
+            || self.field.is_solving()
+        {
+            ctx.request_repaint();
+        }
+
+        // Poll subset solve completion.
+        if let Some(outcome) = self.subset.check_solve_complete() {
+            match outcome {
+                Ok((solution, name)) => {
+                    let save_path = project.subsets_dir().join(format!("{name}.pyv"));
+                    if let Err(e) = geopyv_dev::io::save(
+                        &save_path,
+                        &geopyv_dev::io::GeopyvObject::Subset(solution.clone()),
+                    ) {
+                        self.error_modal = Some(format!("Save error: {e}"));
+                    } else {
+                        self.subset.view.solution = Some(solution);
+                        self.subset.view.loaded_path = Some(save_path);
+                        self.mode = PaneMode::View;
+                        self.pending_refresh = true;
+                    }
+                }
+                Err(e) => {
+                    self.error_modal = Some(e);
+                }
+            }
+        }
+
+        // Poll mesh solve completion.
+        if let Some(outcome) = self.mesh.check_solve_complete() {
+            match outcome {
+                Ok((solution, name, target_image)) => {
+                    let save_path = project.meshes_dir().join(format!("{name}.pyv"));
+                    if let Err(e) = geopyv_dev::io::save(
+                        &save_path,
+                        &geopyv_dev::io::GeopyvObject::Mesh(solution.clone()),
+                    ) {
+                        self.error_modal = Some(format!("Save error: {e}"));
+                    } else {
+                        self.mesh.view.solution = Some(solution);
+                        self.mesh.view.loaded_path = Some(save_path);
+                        self.mesh.view.target_image = target_image;
+                        self.mesh.view.nodal_cache = None;
+                        self.mode = PaneMode::View;
+                        self.pending_refresh = true;
+                    }
+                }
+                Err(e) => {
+                    self.error_modal = Some(e);
+                }
+            }
+        }
+
+        // Poll sequence solve completion.
+        if let Some(outcome) = self.sequence.check_solve_complete() {
+            match outcome {
+                Ok((solution, name, image_paths)) => {
+                    self.sequence.view.solution = Some(solution);
+                    self.sequence.view.loaded_path =
+                        Some(project.sequences_dir().join(format!("{name}.pyv")));
+                    self.sequence.view.image_paths = image_paths;
+                    self.sequence.view.current_frame = 0;
+                    self.sequence.view.nodal_cache = None;
+                    self.sequence.view.animate = false;
+                    self.mode = PaneMode::View;
+                    self.pending_refresh = true;
+                }
+                Err(e) => {
+                    self.error_modal = Some(e);
+                }
+            }
+        }
+
+        // Poll particle solve completion.
+        if let Some(outcome) = self.particle.check_solve_complete() {
+            match outcome {
+                Ok((solution, name)) => {
+                    let save_path = project.particles_dir().join(format!("{name}.pyv"));
+                    if let Err(e) = geopyv_dev::io::save(
+                        &save_path,
+                        &geopyv_dev::io::GeopyvObject::Particle(solution.clone()),
+                    ) {
+                        self.error_modal = Some(format!("Save error: {e}"));
+                    } else {
+                        self.particle.view.solution = Some(solution);
+                        self.particle.view.loaded_path = Some(save_path);
+                        self.mode = PaneMode::View;
+                        self.pending_refresh = true;
+                    }
+                }
+                Err(e) => {
+                    self.error_modal = Some(e);
+                }
+            }
+        }
+
+        // Poll field solve completion.
+        if let Some(outcome) = self.field.check_solve_complete() {
+            match outcome {
+                Ok((solution, name)) => {
+                    let save_path = project.fields_dir().join(format!("{name}.pyv"));
+                    if let Err(e) = geopyv_dev::io::save(
+                        &save_path,
+                        &geopyv_dev::io::GeopyvObject::Field(solution.clone()),
+                    ) {
+                        self.error_modal = Some(format!("Save error: {e}"));
+                    } else {
+                        self.field.view.solution = Some(solution);
+                        self.field.view.loaded_path = Some(save_path);
+                        self.mode = PaneMode::View;
+                        self.pending_refresh = true;
+                    }
+                }
+                Err(e) => {
+                    self.error_modal = Some(e);
+                }
+            }
+        }
 
         // Snapshot cheap values before panel closures borrow self.
         let selected_path: Option<PathBuf> = self
@@ -274,6 +421,15 @@ impl MainWindow {
             .map(|e| e.path.clone());
         let selected_index = self.left.selected;
         let templates_dir = project.templates_dir();
+        let images = project.list_images();
+        let templates = project.list_templates();
+        let subsets_dir = project.subsets_dir();
+        let meshes_dir = project.meshes_dir();
+        let sequences_dir = project.sequences_dir();
+        let sequences = project.list_sequences();
+        let particles_dir = project.particles_dir();
+        let fields_dir = project.fields_dir();
+        let out_dir = project.out_dir();
 
         egui::TopBottomPanel::top("tab_bar")
             .exact_height(32.0)
@@ -289,21 +445,135 @@ impl MainWindow {
                 self.show_left_pane(ui, project);
             });
 
+        let mut right_subset_spawn: Option<SubsetSpawnParams> = None;
+        let mut right_mesh_spawn: Option<MeshSpawnParams> = None;
+        let mut right_sequence_spawn: Option<SequenceSpawnParams> = None;
+        let mut right_particle_spawn: Option<ParticleSpawnParams> = None;
+        let mut right_field_spawn: Option<FieldSpawnParams> = None;
         egui::SidePanel::right("right_pane")
             .resizable(true)
             .default_width(260.0)
             .width_range(180.0..=500.0)
             .show(ctx, |ui| {
-                self.show_right_pane(ui, selected_path.as_deref(), selected_index, &templates_dir);
+                (
+                    right_subset_spawn,
+                    right_mesh_spawn,
+                    right_sequence_spawn,
+                    right_particle_spawn,
+                    right_field_spawn,
+                ) = self.show_right_pane(
+                    ui,
+                    selected_path.as_deref(),
+                    selected_index,
+                    &templates_dir,
+                    &images,
+                    &templates,
+                    &sequences,
+                    &out_dir,
+                );
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.show_central(ui, selected_path.as_deref());
+            self.show_central(ui, selected_path.as_deref(), &images);
         });
+
+        // Handle Run from subset form.
+        if let Some(params) = right_subset_spawn {
+            let dest = subsets_dir.join(format!("{}.pyv", params.name));
+            if dest.exists() {
+                self.subset.new_form.form_error =
+                    Some(format!("\"{}\" already exists — choose a different name", params.name));
+            } else {
+                self.subset.spawn_solve(params);
+            }
+        }
+
+        // Handle Run from mesh form.
+        if let Some(params) = right_mesh_spawn {
+            let dest = project.meshes_dir().join(format!("{}.pyv", params.name));
+            if dest.exists() {
+                self.mesh.new_form.form_error =
+                    Some(format!("\"{}\" already exists — choose a different name", params.name));
+            } else {
+                self.mesh.spawn_solve(params);
+            }
+        }
+
+        // Handle Run from sequence form.
+        if let Some(mut params) = right_sequence_spawn {
+            let seq_dest = sequences_dir.join(format!("{}.pyv", params.name));
+            if seq_dest.exists() {
+                self.sequence.new_form.form_error =
+                    Some(format!("\"{}\" already exists — choose a different name", params.name));
+            } else {
+                let mesh_subdir = meshes_dir.join(&params.name);
+                if let Err(e) = std::fs::create_dir_all(&mesh_subdir) {
+                    self.sequence.new_form.form_error =
+                        Some(format!("Could not create Meshes subfolder: {e}"));
+                } else {
+                    params.mesh_subdir = mesh_subdir;
+                    params.sequences_dir = sequences_dir.clone();
+                    self.sequence.spawn_solve(params);
+                }
+            }
+        }
+
+        // Handle Run from particle form.
+        if let Some(mut params) = right_particle_spawn {
+            let dest = particles_dir.join(format!("{}.pyv", params.name));
+            if dest.exists() {
+                self.particle.new_form.form_error = Some(format!(
+                    "\"{}\" already exists — choose a different name",
+                    params.name
+                ));
+            } else {
+                params.particles_dir = particles_dir.clone();
+                self.particle.spawn_solve(params);
+            }
+        }
+
+        // Handle Run from field form.
+        if let Some(mut params) = right_field_spawn {
+            let dest = fields_dir.join(format!("{}.pyv", params.name));
+            if dest.exists() {
+                self.field.new_form.form_error = Some(format!(
+                    "\"{}\" already exists — choose a different name",
+                    params.name
+                ));
+            } else {
+                params.fields_dir = fields_dir.clone();
+                self.field.spawn_solve(params);
+            }
+        }
 
         if self.pending_refresh {
             self.pending_refresh = false;
             self.left.refresh(self.active_tab, project, true);
+        }
+
+        // Error modal.
+        self.show_error_modal(ctx);
+    }
+
+    fn show_error_modal(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.error_modal.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Error")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(&msg);
+                ui.add_space(8.0);
+                if ui.button("OK").clicked() {
+                    self.error_modal = None;
+                }
+            });
+        if !open {
+            self.error_modal = None;
         }
     }
 
@@ -450,7 +720,12 @@ impl MainWindow {
     // Central panel — image viewer (Images tab) + status bar
     // -----------------------------------------------------------------------
 
-    fn show_central(&mut self, ui: &mut egui::Ui, selected_path: Option<&std::path::Path>) {
+    fn show_central(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected_path: Option<&std::path::Path>,
+        images: &[PathBuf],
+    ) {
         let tab = self.active_tab;
         let available = ui.available_rect_before_wrap();
         let status_h = 22.0;
@@ -525,21 +800,84 @@ impl MainWindow {
                 None
             }
 
-            _ => {
+            (Tab::Subsets, _) => {
+                let mode = self.mode;
+                let cache = &mut self.texture_cache;
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} viewer — session {}",
-                                tab.label(),
-                                viewer_session(tab)
-                            ))
-                            .size(14.0)
-                            .color(ui.visuals().weak_text_color()),
-                        );
-                    });
-                });
-                None
+                    self.subset.show_central(
+                        ui,
+                        viewer_rect,
+                        mode,
+                        selected_path,
+                        images,
+                        cache,
+                    )
+                })
+                .inner
+            }
+
+            (Tab::Meshes, _) => {
+                let mode = self.mode;
+                let cache = &mut self.texture_cache;
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
+                    self.mesh.show_central(
+                        ui,
+                        viewer_rect,
+                        mode,
+                        selected_path,
+                        images,
+                        cache,
+                    )
+                })
+                .inner
+            }
+
+            (Tab::Sequences, _) => {
+                let mode = self.mode;
+                let cache = &mut self.texture_cache;
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
+                    self.sequence.show_central(
+                        ui,
+                        viewer_rect,
+                        mode,
+                        selected_path,
+                        images,
+                        cache,
+                    )
+                })
+                .inner
+            }
+
+            (Tab::Particles, _) => {
+                let mode = self.mode;
+                let cache = &mut self.texture_cache;
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
+                    self.particle.show_central(
+                        ui,
+                        viewer_rect,
+                        mode,
+                        selected_path,
+                        images,
+                        cache,
+                    )
+                })
+                .inner
+            }
+
+            (Tab::Fields, _) => {
+                let mode = self.mode;
+                let cache = &mut self.texture_cache;
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
+                    self.field.show_central(
+                        ui,
+                        viewer_rect,
+                        mode,
+                        selected_path,
+                        images,
+                        cache,
+                    )
+                })
+                .inner
             }
         };
 
@@ -577,6 +915,16 @@ impl MainWindow {
         selected_path: Option<&std::path::Path>,
         selected_index: Option<usize>,
         templates_dir: &std::path::Path,
+        images: &[PathBuf],
+        templates: &[PathBuf],
+        sequences: &[PathBuf],
+        out_dir: &std::path::Path,
+    ) -> (
+        Option<SubsetSpawnParams>,
+        Option<MeshSpawnParams>,
+        Option<SequenceSpawnParams>,
+        Option<ParticleSpawnParams>,
+        Option<FieldSpawnParams>,
     ) {
         let tab = self.active_tab;
         let mode = self.mode;
@@ -587,13 +935,23 @@ impl MainWindow {
             .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     if ui.button("Save").clicked() {
-                        // Wired in session 15.
+                        if tab == Tab::Fields {
+                            self.field.action_save(out_dir, selected_path);
+                        }
                     }
                     if ui.button("Save As\u{2026}").clicked() {
-                        // Wired in session 15.
+                        if tab == Tab::Fields {
+                            self.field.action_save_as(selected_path);
+                        }
                     }
                 });
             });
+
+        let mut subset_spawn: Option<SubsetSpawnParams> = None;
+        let mut mesh_spawn: Option<MeshSpawnParams> = None;
+        let mut sequence_spawn: Option<SequenceSpawnParams> = None;
+        let mut particle_spawn: Option<ParticleSpawnParams> = None;
+        let mut field_spawn: Option<FieldSpawnParams> = None;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -616,27 +974,40 @@ impl MainWindow {
                     (Tab::Templates, PaneMode::New, _) => {
                         self.show_right_template_new(ui, templates_dir);
                     }
-                    _ => {
-                        let label = match mode {
-                            PaneMode::View => format!(
-                                "{} view — session {}",
-                                tab.label(),
-                                viewer_session(tab)
-                            ),
-                            PaneMode::New => format!(
-                                "{} form — session {}",
-                                tab.label(),
-                                form_session(tab)
-                            ),
-                        };
-                        ui.label(
-                            egui::RichText::new(label)
-                                .size(13.0)
-                                .color(ui.visuals().weak_text_color()),
-                        );
+                    (Tab::Subsets, PaneMode::View, _) => {
+                        self.subset.show_right_view(ui, selected_path);
+                    }
+                    (Tab::Subsets, PaneMode::New, _) => {
+                        subset_spawn = self.subset.show_right_new(ui, images, templates);
+                    }
+                    (Tab::Meshes, PaneMode::View, _) => {
+                        self.mesh.show_right_view(ui, selected_path);
+                    }
+                    (Tab::Meshes, PaneMode::New, _) => {
+                        mesh_spawn = self.mesh.show_right_new(ui, images, templates);
+                    }
+                    (Tab::Sequences, PaneMode::View, _) => {
+                        self.sequence.show_right_view(ui, selected_path);
+                    }
+                    (Tab::Sequences, PaneMode::New, _) => {
+                        sequence_spawn = self.sequence.show_right_new(ui, images, templates);
+                    }
+                    (Tab::Particles, PaneMode::View, _) => {
+                        self.particle.show_right_view(ui, selected_path);
+                    }
+                    (Tab::Particles, PaneMode::New, _) => {
+                        particle_spawn = self.particle.show_right_new(ui, images, sequences);
+                    }
+                    (Tab::Fields, PaneMode::View, _) => {
+                        self.field.show_right_view(ui, selected_path, out_dir);
+                    }
+                    (Tab::Fields, PaneMode::New, _) => {
+                        field_spawn = self.field.show_right_new(ui, images, sequences);
                     }
                 }
             });
+
+        (subset_spawn, mesh_spawn, sequence_spawn, particle_spawn, field_spawn)
     }
 
     fn show_right_image_meta(
@@ -947,26 +1318,3 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(2.0);
 }
 
-fn viewer_session(tab: Tab) -> u8 {
-    match tab {
-        Tab::Images => 5,
-        Tab::Templates => 7,
-        Tab::Subsets => 8,
-        Tab::Meshes => 10,
-        Tab::Sequences => 12,
-        Tab::Particles => 13,
-        Tab::Fields => 15,
-    }
-}
-
-fn form_session(tab: Tab) -> u8 {
-    match tab {
-        Tab::Images => 5,
-        Tab::Templates => 7,
-        Tab::Subsets => 8,
-        Tab::Meshes => 9,
-        Tab::Sequences => 11,
-        Tab::Particles => 13,
-        Tab::Fields => 14,
-    }
-}

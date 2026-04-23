@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use ndarray::Array1;
 use numpy::{IntoPyArray, PyReadonlyArray2};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -17,7 +18,7 @@ use geopyv_dev::{
     sequence::{self, Sequence, SequenceMeshConfig, SequenceSolveConfig},
 };
 
-use crate::{py_mesh::PyMeshSolution, Error};
+use crate::{py_mesh::PyMeshSolution, py_templates::{PyCircle, PySquare}, Error};
 
 // ---------------------------------------------------------------------------
 // SequenceSolution class
@@ -131,8 +132,8 @@ impl PySequence {
     ///
     /// Parameters
     /// ----------
-    /// template_coords : numpy.ndarray, shape (n_px, 2), float64
-    ///     Subset template pixel offsets.
+    /// template : Circle or Square
+    ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Initial ``[x, y]`` seed coordinate near low-deformation region.
     /// seed_warp : list[float]
@@ -165,7 +166,7 @@ impl PySequence {
     /// Returns
     /// -------
     /// SequenceSolution
-    #[pyo3(signature = (template_coords, seed_coord, seed_warp,
+    #[pyo3(signature = (template, seed_coord, seed_warp,
                          max_norm=1e-5, max_iterations=50, subset_order=1,
                          tolerance=0.75, method="icgn",
                          adaptive_iterations=0, alpha=0.5,
@@ -174,7 +175,7 @@ impl PySequence {
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
-        template_coords: PyReadonlyArray2<f64>,
+        template: &Bound<'_, PyAny>,
         seed_coord: [f64; 2],
         seed_warp: Vec<f64>,
         max_norm: f64,
@@ -195,6 +196,13 @@ impl PySequence {
         } else {
             SolveMethod::Icgn
         };
+        let template_coords = if let Ok(circle) = template.extract::<PyRef<'_, PyCircle>>() {
+            circle.inner.coords.clone()
+        } else if let Ok(square) = template.extract::<PyRef<'_, PySquare>>() {
+            square.inner.coords.clone()
+        } else {
+            return Err(PyTypeError::new_err("template must be a Circle or Square"));
+        };
         let cfg = SequenceSolveConfig {
             mesh_cfg: SolveConfig {
                 max_norm,
@@ -203,7 +211,7 @@ impl PySequence {
                 tolerance,
                 method: solve_method,
             },
-            template_coords: template_coords.as_array().to_owned(),
+            template_coords,
             seed_coord,
             seed_warp,
             adaptive_iterations,

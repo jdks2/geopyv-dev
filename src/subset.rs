@@ -1,8 +1,6 @@
-//! Subset DIC solver module.
+//! Subset module for geopyv-dev.
 //!
-//! Translates `geopyv/subset.py` and `geopyv/_subset.cpp` into a single Rust
-//! module. The Python/C++ split was an implementation detail; both the data
-//! types and the computational logic live here.
+//! Performs DIC/PIV algorithms on pixel patches. 
 //!
 //! # Solvers
 //!
@@ -20,14 +18,13 @@
 //! | 1     | 6          | `[u, v, u_x, v_x, u_y, v_y]` |
 //! | 2     | 12         | `[u, v, u_x, v_x, u_y, v_y, u_xx, v_xx, u_xy, v_xy, u_yy, v_yy]` |
 //!
-//! # Coordinate convention (preserved from Python)
+//! # Coordinate convention 
 //!
 //! `coord[0]` and `coord[1]` are the two components of the subset centre, in
 //! the same order as `template.coords` columns. `f_coords[:,0]` and
 //! `f_coords[:,1]` are the two coordinate components of each subset pixel.
 //! `bspline_eval` uses `coords[:,0]` as the QCQT column index and
-//! `coords[:,1]` as the QCQT row index — matching `_intensity` in
-//! `_subset.cpp` exactly.
+//! `coords[:,1]` as the QCQT row index (i.e. intensities).
 //!
 //! # Tolerance tiers (per plan)
 //! - Tier B  rtol = 1e-8   intensity interpolation (same B-spline as image)
@@ -35,8 +32,10 @@
 
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 use ndarray::{Array1, Array2, ArrayView2};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-use crate::Error;
+use crate::{templates::TemplateShape, Error};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -79,8 +78,30 @@ pub struct Subset {
     pub sigma_intensity: f64,
 }
 
+/// Serialisable summary of the template used in a [`SubsetSolution`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateSummary {
+    pub shape: TemplateShape,
+    /// Radius (Circle) or half-side-length (Square) in pixels.
+    pub size: usize,
+    /// Number of active pixels in the template.
+    pub n_px: usize,
+}
+
+/// Serialisable result of a single-coordinate, single image-pair DIC solve.
+///
+/// Saved as [`crate::io::GeopyvObject::Subset`] to a `.pyv` file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubsetSolution {
+    pub coord: [f64; 2],
+    pub template: TemplateSummary,
+    pub ref_image: PathBuf,
+    pub target_image: PathBuf,
+    pub result: SolveResult,
+}
+
 /// Output of a DIC solve ([`Subset::solve_icgn`] / [`Subset::solve_fagn`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolveResult {
     /// Final warp parameter vector (6 or 12 elements).
     pub p: Vec<f64>,

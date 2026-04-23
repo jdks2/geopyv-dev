@@ -91,6 +91,8 @@ pub struct ImageViewer {
     /// Path for which zoom/offset currently apply.
     last_path: Option<PathBuf>,
     grey: Option<GreyPixels>,
+    /// The coordinate converter from the most recent show() call.
+    last_coord: Option<ImageCoord>,
 }
 
 impl ImageViewer {
@@ -101,6 +103,7 @@ impl ImageViewer {
             needs_fit: true,
             last_path: None,
             grey: None,
+            last_coord: None,
         }
     }
 
@@ -182,13 +185,14 @@ impl ImageViewer {
         let img_origin = (canvas_center + self.offset).to_vec2() - img_size * 0.5;
         let img_rect = egui::Rect::from_min_size(img_origin.to_pos2(), img_size);
 
-        // Build coordinate converter (used by draw overlay).
+        // Build coordinate converter (used by draw overlay and external callers).
         let coord = ImageCoord {
             canvas_center,
             offset: self.offset,
             zoom: self.zoom,
             img_size: img_natural,
         };
+        self.last_coord = Some(coord);
 
         // Paint dark background + image.
         ui.painter()
@@ -227,6 +231,11 @@ impl ImageViewer {
         }
 
         None
+    }
+
+    /// Returns the coordinate converter from the most recent show() call.
+    pub fn last_coord(&self) -> Option<ImageCoord> {
+        self.last_coord
     }
 
     /// Natural image dimensions if loaded.

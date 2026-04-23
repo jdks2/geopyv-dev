@@ -1,9 +1,15 @@
 mod app;
+mod colormap;
 mod draw;
+mod field_tab;
 mod image_viewer;
 mod main_window;
+mod mesh_tab;
+mod particle_tab;
 mod project;
 mod recent;
+mod sequence_tab;
+mod subset_tab;
 mod template;
 
 fn main() -> eframe::Result {
