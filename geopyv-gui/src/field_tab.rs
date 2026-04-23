@@ -202,10 +202,6 @@ impl NewFieldForm {
         self.last_boundary_len = usize::MAX;
     }
 
-    pub fn grid_count(&self) -> usize {
-        self.cached_grid.len()
-    }
-
     pub fn can_run(&self, sequences: &[PathBuf]) -> bool {
         let name_ok = !self.name.trim().is_empty()
             && !self.name.contains('/')

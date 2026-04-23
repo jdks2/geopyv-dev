@@ -144,10 +144,6 @@ impl Project {
         self.root.join("Images/Data")
     }
 
-    pub fn images_calibration_dir(&self) -> PathBuf {
-        self.root.join("Images/Calibration")
-    }
-
     pub fn templates_dir(&self) -> PathBuf {
         self.root.join("Templates")
     }
@@ -237,39 +233,6 @@ impl Project {
         list_files_with_exts(&self.fields_dir(), &["pyv"])
     }
 
-    // -----------------------------------------------------------------------
-    // Path helpers used by solve sessions
-    // -----------------------------------------------------------------------
-
-    /// Returns the path for a named `.pyv` file in `subdir`, e.g.
-    /// `project.pyv_path("Subsets", "my_subset")` → `.../Subsets/my_subset.pyv`.
-    pub fn pyv_path(&self, subdir: &str, name: &str) -> PathBuf {
-        self.root.join(subdir).join(format!("{name}.pyv"))
-    }
-
-    /// Returns the path for a per-frame mesh file inside a sequence subfolder.
-    pub fn frame_pyv_path(&self, sequence_name: &str, frame: usize) -> PathBuf {
-        self.root
-            .join("Meshes")
-            .join(sequence_name)
-            .join(format!("frame_{frame:03}.pyv"))
-    }
-
-    /// Creates the sequence mesh subfolder if it does not exist.
-    pub fn ensure_sequence_mesh_dir(&self, sequence_name: &str) -> Result<PathBuf, ProjectError> {
-        let dir = self.root.join("Meshes").join(sequence_name);
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir)
-    }
-
-    // -----------------------------------------------------------------------
-    // Persistence
-    // -----------------------------------------------------------------------
-
-    /// Persist any in-memory changes to `project.json`.
-    pub fn save_meta(&self) -> Result<(), ProjectError> {
-        write_meta(&self.root, &self.meta)
-    }
 }
 
 // ---------------------------------------------------------------------------

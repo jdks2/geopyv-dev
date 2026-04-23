@@ -203,31 +203,6 @@ impl MeshViewState {
         }
     }
 
-    /// Returns cached per-node scalar values, recomputing if the plot type changed.
-    fn get_nodal_values(&mut self) -> Option<&[f64]> {
-        let sol = self.solution.as_ref()?;
-        if self.nodal_cache.as_ref().map(|(t, _)| *t) != Some(self.plot_type) {
-            let vals = extract_nodal_values(sol, self.plot_type);
-            self.nodal_cache = Some((self.plot_type, vals));
-        }
-        self.nodal_cache.as_ref().map(|(_, v)| v.as_slice())
-    }
-
-    /// Compute (vmin, vmax) for the current plot, respecting range mode.
-    fn vmin_vmax(&mut self) -> (f64, f64) {
-        match self.range_mode {
-            RangeMode::Manual => (self.range_min, self.range_max),
-            RangeMode::Auto => {
-                if let Some(vals) = self.get_nodal_values() {
-                    let mn = vals.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let mx = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    (mn, mx)
-                } else {
-                    (0.0, 1.0)
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

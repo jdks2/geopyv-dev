@@ -114,15 +114,9 @@ impl NewSubsetForm {
 // View mode state
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubsetPlotType {
-    ConvergenceHistory,
-}
-
 pub struct SubsetViewState {
     pub loaded_path: Option<PathBuf>,
     pub solution: Option<SubsetSolution>,
-    pub plot_type: SubsetPlotType,
 }
 
 impl SubsetViewState {
@@ -130,7 +124,6 @@ impl SubsetViewState {
         Self {
             loaded_path: None,
             solution: None,
-            plot_type: SubsetPlotType::ConvergenceHistory,
         }
     }
 }

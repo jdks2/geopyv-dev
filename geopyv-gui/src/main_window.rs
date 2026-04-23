@@ -431,6 +431,14 @@ impl MainWindow {
         let fields_dir = project.fields_dir();
         let out_dir = project.out_dir();
 
+        // Ctrl+S — trigger Save for the active tab.
+        let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
+        if ctrl_s {
+            if self.active_tab == Tab::Fields {
+                self.field.action_save(&out_dir, selected_path.as_deref());
+            }
+        }
+
         egui::TopBottomPanel::top("tab_bar")
             .exact_height(32.0)
             .show(ctx, |ui| {
@@ -1236,10 +1244,6 @@ impl MainWindow {
         self.left.refresh(Tab::Images, project, true);
     }
 
-    /// Force file-list refresh after an external save.
-    pub fn refresh_file_list(&mut self, project: &Project) {
-        self.left.refresh(self.active_tab, project, true);
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -20,10 +20,6 @@ impl TextureCache {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.map.clear();
-    }
-
     pub fn get_or_load(
         &mut self,
         path: &Path,
@@ -105,10 +101,6 @@ impl ImageViewer {
             grey: None,
             last_coord: None,
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.needs_fit = true;
     }
 
     /// Renders the image inside `ui`'s available rect.
