@@ -8,15 +8,13 @@ import geopyv_dev as gp
 # Setup.
 ref = gp.Image(filepath="images/comp/compression_0.jpg")
 tar = gp.Image(filepath="images/comp/compression_1.jpg")
-template = gp.Circle(radius=50)
+template = gp.Template("circle", size=50)
 
 # Subset instantiation.
 subset = gp.Subset(
     coord=[500.0, 500.0],
     template=template,
     f_img=ref,
-    template_size=template.size,
-    template_shape=template.shape,
     f_img_path=ref.filepath,
 )
 
@@ -25,12 +23,11 @@ print(subset)
 print(f"  n_px={subset.n_px}, sssig={subset.sssig:.4f}")
 subset.inspect()
 
-# Subset solving (ICGN).
-result = subset.solve_icgn(g_img=tar, p_0=[0.0] * 6)
+# Subset solving via unified solve() dispatcher.
+result = subset.solve(g_img=tar, p_0=[0.0] * 6, algorithm="icgn")
 print(f"  C_ZNCC={result['c_zncc']:.4f}, converged={result['converged']}, "
       f"iterations={result['iterations']}")
 subset.convergence()
-print(f"p={result['p']:.4f}")
 # ---------------------------------------------------------------------------
 # Mesh test
 # ---------------------------------------------------------------------------

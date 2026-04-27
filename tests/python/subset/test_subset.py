@@ -13,12 +13,13 @@ in the geopyv-dev venv.
 """
 
 import os
+import warnings
 
 import cv2
 import numpy as np
 import pytest
 
-from geopyv_dev import Image, Subset
+from geopyv_dev import Image, Subset, Template
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -71,20 +72,6 @@ def _preprocess(filepath):
     return cv2.GaussianBlur(gs, (5, 5), sigmaX=1.1, sigmaY=1.1)
 
 
-def make_circle_coords(radius):
-    """Replicate Circle(radius).coords exactly (row-major, np.where order)."""
-    size = 2 * radius + 1
-    x, y = np.meshgrid(range(size), range(size))
-    x, y = x - radius, y - radius
-    dist = np.sqrt(x**2 + y**2)
-    x_s, y_s = np.where(dist <= radius)
-    n_px = x_s.shape[0]
-    coords = np.empty((n_px, 2), order="F")
-    coords[:, 0] = (x_s - radius).astype(float)
-    coords[:, 1] = (y_s - radius).astype(float)
-    return coords
-
-
 # ---------------------------------------------------------------------------
 # Module-scope fixtures
 # ---------------------------------------------------------------------------
@@ -103,13 +90,13 @@ def tar_img():
 
 
 @pytest.fixture(scope="module")
-def tmpl_coords():
-    return make_circle_coords(RADIUS)
+def tmpl():
+    return Template("circle", size=RADIUS)
 
 
 @pytest.fixture(scope="module")
-def ref_subset(ref_img, tmpl_coords):
-    return Subset(COORD, tmpl_coords, ref_img.qcqt)
+def ref_subset(ref_img, tmpl):
+    return Subset(COORD, tmpl, ref_img)
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +112,17 @@ class TestSubsetConstruction:
         assert ref_subset.coord[0] == pytest.approx(COORD[0], rel=1e-12)
         assert ref_subset.coord[1] == pytest.approx(COORD[1], rel=1e-12)
 
+    def test_template_shape(self, ref_subset):
+        assert ref_subset.template_shape == "circle"
+
+    def test_template_size(self, ref_subset):
+        assert ref_subset.template_size == RADIUS
+
     def test_f_coords_shape(self, ref_subset):
         assert ref_subset.f_coords.shape == (GOLDEN_N_PX, 2)
 
     def test_f_coords_range(self, ref_subset):
-        """f_coords[:,0] spans [coord[0]-radius, coord[0]+radius]."""
+        """f_coords[:,0] (x) spans [coord[0]-radius, coord[0]+radius]."""
         fc = ref_subset.f_coords
         assert float(fc[:, 0].min()) == pytest.approx(COORD[0] - RADIUS, rel=1e-12)
         assert float(fc[:, 0].max()) == pytest.approx(COORD[0] + RADIUS, rel=1e-12)
@@ -181,12 +174,6 @@ class TestSubsetConstruction:
         assert "Subset" in r
         assert "n_px" in r
 
-    def test_empty_template_raises(self, ref_img):
-        """Empty template_coords → InvalidInput error."""
-        empty = np.zeros((0, 2), dtype=np.float64)
-        with pytest.raises(Exception):
-            Subset(COORD, empty, ref_img.qcqt)
-
 
 # ---------------------------------------------------------------------------
 # ICGN solver (Tier C: rtol=1e-5)
@@ -195,64 +182,64 @@ class TestSubsetConstruction:
 
 class TestSolveICGN:
     def test_returns_dict(self, ref_subset, tar_img):
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert isinstance(r, dict)
         for key in ("p", "c_zncc", "c_znssd", "iterations", "converged", "history"):
             assert key in r
 
     def test_converges_order1(self, ref_subset, tar_img):
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1, max_norm=1e-3, max_iterations=50)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1, max_norm=1e-3, max_iterations=50)
         assert r["converged"], f"ICGN order-1 did not converge: {r}"
 
     def test_zncc_order1(self, ref_subset, tar_img):
         """Tier C: ZNCC ≈ 0.999987."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert r["c_zncc"] == pytest.approx(GOLDEN_ICGN_O1_ZNCC, rel=1e-5)
 
     def test_iterations_order1(self, ref_subset, tar_img):
         """ICGN order-1 converges in exactly 3 iterations for this pair."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert r["iterations"] == GOLDEN_ICGN_O1_ITERS
 
     def test_p_order1(self, ref_subset, tar_img):
         """Tier C: warp displacement components match golden values."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         p = r["p"]
         for i, (got, exp) in enumerate(zip(p, GOLDEN_ICGN_O1_P)):
             assert got == pytest.approx(exp, rel=1e-5), f"p[{i}]: {got} != {exp}"
 
     def test_znssd_range(self, ref_subset, tar_img):
         """ZNSSD ∈ [0, 4]."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert 0.0 <= r["c_znssd"] <= 4.0
 
     def test_zncc_from_znssd(self, ref_subset, tar_img):
         """ZNCC = 1 - ZNSSD/2."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert r["c_zncc"] == pytest.approx(1.0 - r["c_znssd"] / 2.0, rel=1e-12)
 
     def test_history_length(self, ref_subset, tar_img):
         """history has one entry per iteration."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert len(r["history"]) == r["iterations"]
 
     def test_converges_order2(self, ref_subset, tar_img):
         """ICGN order-2 also converges on this pair."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_2)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_2)
         assert r["converged"]
         assert r["c_zncc"] > 0.999
 
     def test_p_length_order1(self, ref_subset, tar_img):
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1)
         assert len(r["p"]) == 6
 
     def test_p_length_order2(self, ref_subset, tar_img):
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_2)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_2)
         assert len(r["p"]) == 12
 
     def test_max_iterations_respected(self, ref_subset, tar_img):
         """Capping at 1 iteration gives no convergence but returns a result."""
-        r = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1, max_norm=1e-20, max_iterations=1)
+        r = ref_subset.solve_icgn(tar_img, P_ZERO_1, max_norm=1e-20, max_iterations=1)
         assert r["iterations"] == 1
         assert not r["converged"]
 
@@ -264,65 +251,65 @@ class TestSolveICGN:
 
 class TestSolveFAGN:
     def test_returns_dict(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert isinstance(r, dict)
         for key in ("p", "c_zncc", "c_znssd", "iterations", "converged", "history"):
             assert key in r
 
     def test_converges_order1(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert r["converged"], f"FAGN order-1 did not converge: {r}"
 
     def test_zncc_order1(self, ref_subset, tar_img):
         """Tier C: ZNCC ≈ 0.999987."""
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert r["c_zncc"] == pytest.approx(GOLDEN_FAGN_O1_ZNCC, rel=1e-5)
 
     def test_iterations_order1(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert r["iterations"] == GOLDEN_FAGN_O1_ITERS
 
     def test_p_order1(self, ref_subset, tar_img):
         """Tier C: warp displacement components match golden values."""
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         p = r["p"]
         for i, (got, exp) in enumerate(zip(p, GOLDEN_FAGN_O1_P)):
             assert got == pytest.approx(exp, rel=1e-5), f"p[{i}]: {got} != {exp}"
 
     def test_znssd_range(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert 0.0 <= r["c_znssd"] <= 4.0
 
     def test_zncc_from_znssd(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert r["c_zncc"] == pytest.approx(1.0 - r["c_znssd"] / 2.0, rel=1e-12)
 
     def test_history_length(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert len(r["history"]) == r["iterations"]
 
     def test_converges_order2(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_2)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_2)
         assert r["converged"]
         assert r["c_zncc"] > 0.999
 
     def test_p_length_order1(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert len(r["p"]) == 6
 
     def test_p_length_order2(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_2)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_2)
         assert len(r["p"]) == 12
 
     def test_preconditioned_converges(self, ref_subset, tar_img):
         """FAGN converges from a close initial guess."""
         p_0 = [0.01, 0.02, 0.0, 0.0, 0.0, 0.0]
-        r = ref_subset.solve_fagn(tar_img.qcqt, p_0)
+        r = ref_subset.solve_fagn(tar_img, p_0)
         assert r["converged"]
         assert r["c_zncc"] > 0.999
 
     def test_max_iterations_respected(self, ref_subset, tar_img):
-        r = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1, max_norm=1e-20, max_iterations=1)
+        r = ref_subset.solve_fagn(tar_img, P_ZERO_1, max_norm=1e-20, max_iterations=1)
         assert r["iterations"] == 1
         assert not r["converged"]
 
@@ -335,13 +322,63 @@ class TestSolveFAGN:
 class TestSolverConsistency:
     def test_icgn_fagn_zncc_close(self, ref_subset, tar_img):
         """ICGN and FAGN converge to the same ZNCC score (< 1e-4 difference)."""
-        ri = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
-        rf = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        ri = ref_subset.solve_icgn(tar_img, P_ZERO_1)
+        rf = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert abs(ri["c_zncc"] - rf["c_zncc"]) < 1e-4
 
     def test_icgn_fagn_displacement_close(self, ref_subset, tar_img):
         """ICGN and FAGN displacements agree to within 1e-3 pixels."""
-        ri = ref_subset.solve_icgn(tar_img.qcqt, P_ZERO_1)
-        rf = ref_subset.solve_fagn(tar_img.qcqt, P_ZERO_1)
+        ri = ref_subset.solve_icgn(tar_img, P_ZERO_1)
+        rf = ref_subset.solve_fagn(tar_img, P_ZERO_1)
         assert abs(ri["p"][0] - rf["p"][0]) < 1e-3, f"u: {ri['p'][0]} vs {rf['p'][0]}"
         assert abs(ri["p"][1] - rf["p"][1]) < 1e-3, f"v: {ri['p'][1]} vs {rf['p'][1]}"
+
+
+# ---------------------------------------------------------------------------
+# Unified solve() dispatcher
+# ---------------------------------------------------------------------------
+
+
+class TestSolveDispatcher:
+    def test_icgn_algorithm(self, ref_subset, tar_img):
+        """solve(algorithm='icgn') matches direct solve_icgn."""
+        ri = ref_subset.solve(tar_img, P_ZERO_1, algorithm="icgn")
+        assert ri["converged"]
+        assert ri["c_zncc"] == pytest.approx(GOLDEN_ICGN_O1_ZNCC, rel=1e-5)
+
+    def test_fagn_algorithm(self, ref_subset, tar_img):
+        """solve(algorithm='fagn') matches direct solve_fagn."""
+        rf = ref_subset.solve(tar_img, P_ZERO_1, algorithm="fagn")
+        assert rf["converged"]
+        assert rf["c_zncc"] == pytest.approx(GOLDEN_FAGN_O1_ZNCC, rel=1e-5)
+
+    def test_default_algorithm_is_icgn(self, ref_subset, tar_img):
+        """solve() with no algorithm argument defaults to ICGN."""
+        r_default = ref_subset.solve(tar_img, P_ZERO_1)
+        r_icgn = ref_subset.solve(tar_img, P_ZERO_1, algorithm="icgn")
+        assert r_default["c_zncc"] == pytest.approx(r_icgn["c_zncc"], rel=1e-12)
+
+    def test_unknown_algorithm_warns_and_falls_back(self, ref_subset, tar_img):
+        """Unknown algorithm emits UserWarning and falls back to ICGN."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            r = ref_subset.solve(tar_img, P_ZERO_1, algorithm="unknown_algo")
+        assert len(w) == 1
+        assert issubclass(w[0].category, UserWarning)
+        assert "unknown_algo" in str(w[0].message).lower()
+        # Result should be identical to ICGN
+        r_icgn = ref_subset.solve(tar_img, P_ZERO_1, algorithm="icgn")
+        assert r["c_zncc"] == pytest.approx(r_icgn["c_zncc"], rel=1e-12)
+
+    def test_case_insensitive(self, ref_subset, tar_img):
+        """Algorithm string is case-insensitive."""
+        r1 = ref_subset.solve(tar_img, P_ZERO_1, algorithm="ICGN")
+        r2 = ref_subset.solve(tar_img, P_ZERO_1, algorithm="icgn")
+        assert r1["c_zncc"] == pytest.approx(r2["c_zncc"], rel=1e-12)
+
+    def test_kwargs_forwarded(self, ref_subset, tar_img):
+        """max_norm and max_iterations are forwarded to the solver."""
+        r = ref_subset.solve(tar_img, P_ZERO_1, algorithm="icgn",
+                             max_norm=1e-20, max_iterations=1)
+        assert r["iterations"] == 1
+        assert not r["converged"]

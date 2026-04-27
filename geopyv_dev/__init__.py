@@ -22,6 +22,7 @@ from .wrappers import (
 )
 
 
+
 # ---------------------------------------------------------------------------
 # Auto-wrap helpers
 # ---------------------------------------------------------------------------
@@ -70,6 +71,35 @@ class Subset:
 
     def __repr__(self):
         return repr(self._inner)
+
+    def solve(self, g_img, p_0, algorithm="icgn", **kwargs):
+        """Run the DIC solver.
+
+        Parameters
+        ----------
+        g_img : Image
+            Target image.
+        p_0 : list[float]
+            Initial warp vector.
+        algorithm : str, optional
+            ``"icgn"`` (default) or ``"fagn"``. Unknown values fall back to
+            ICGN with a warning.
+        **kwargs
+            Forwarded to the underlying solver (``max_norm``, ``max_iterations``).
+        """
+        import warnings
+        algorithm = algorithm.lower()
+        if algorithm == "icgn":
+            return self._inner.solve_icgn(g_img, p_0, **kwargs)
+        elif algorithm == "fagn":
+            return self._inner.solve_fagn(g_img, p_0, **kwargs)
+        else:
+            warnings.warn(
+                f"Unknown algorithm '{algorithm}'; falling back to 'icgn'.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return self._inner.solve_icgn(g_img, p_0, **kwargs)
 
     def solve_icgn(self, *args, **kwargs):
         return self._inner.solve_icgn(*args, **kwargs)

@@ -19,7 +19,7 @@ use geopyv_dev::mesh::{
     self, Mesh, MeshSolution, SolveConfig, SolveMethod,
 };
 
-use crate::{py_image::PyImage, py_templates::{PyCircle, PySquare}, Error};
+use crate::{py_image::PyImage, py_templates::PyTemplate, Error};
 
 // ---------------------------------------------------------------------------
 // Mesh class
@@ -79,7 +79,7 @@ impl PyMesh {
     ///     Reference image (pre-computed B-spline data).
     /// g_img : Image
     ///     Target image.
-    /// template : Circle or Square
+    /// template : Template
     ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Image coordinate ``[x, y]`` near a region of low deformation.
@@ -125,14 +125,13 @@ impl PyMesh {
         };
         let f_path = f_img.filepath.clone();
         let g_path = g_img.filepath.clone();
-        let sol = if let Ok(circle) = template.extract::<PyRef<'_, PyCircle>>() {
-            self.inner.solve(&f_img.inner, &g_img.inner, &circle.inner.coords, seed_coord, &seed_warp, &cfg)
-        } else if let Ok(square) = template.extract::<PyRef<'_, PySquare>>() {
-            self.inner.solve(&f_img.inner, &g_img.inner, &square.inner.coords, seed_coord, &seed_warp, &cfg)
-        } else {
-            return Err(PyTypeError::new_err("template must be a Circle or Square"));
-        }
-        .map_err(Error::from)?;
+        let tmpl = template
+            .extract::<PyRef<'_, PyTemplate>>()
+            .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
+        let sol = self
+            .inner
+            .solve(&f_img.inner, &g_img.inner, &tmpl.inner.coords, seed_coord, &seed_warp, &cfg)
+            .map_err(Error::from)?;
         Ok(PyMeshSolution { inner: sol, f_img_path: f_path, g_img_path: g_path })
     }
 

@@ -4,17 +4,11 @@
 //! relative to a subset centre are active, and an optional subset mask that
 //! can zero out pixels covered by a binary image mask.
 //!
-//! # Coordinate convention (preserved from Python)
+//! # Coordinate convention
 //!
-//! **Circle**: `coords[:, 0]` = row-offset (y), `coords[:, 1]` = col-offset (x).
-//! This matches NumPy's `np.where` row/col return order.
-//!
-//! **Square**: `coords[:, 0]` = x-offset, `coords[:, 1]` = y-offset.
-//! This matches NumPy's `np.meshgrid` / `np.ravel` convention.
-//!
-//! After `mask_update`, `coords` is always in `[row-offset, col-offset]` order
-//! regardless of the original shape (matching `np.argwhere` row/col order).
-//! This is a quirk of the Python implementation that is preserved here.
+//! Both `Circle` and `Square` use `coords[:, 0]` = x-offset, `coords[:, 1]` = y-offset,
+//! matching the `bspline_eval(x, y, ...)` and `bspline_grad(x, y, ...)` call convention.
+//! This is also preserved after `mask_update`.
 
 use ndarray::{s, Array2, ArrayView2};
 
@@ -62,9 +56,10 @@ impl Template {
         let side = 2 * size + 1;
 
         // Compute coords and subset_mask in one pass.
-        // Row-major scan (matching np.where row/col order):
-        //   coords[:, 0] = row_index - size  (y-offset)
-        //   coords[:, 1] = col_index - size  (x-offset)
+        // Row-major scan:
+        //   coords[:, 0] = x-offset (col - size)
+        //   coords[:, 1] = y-offset (row - size)
+        // Matches Square and bspline_eval(x, y) convention.
         let mut coord_rows: Vec<[f64; 2]> = Vec::new();
         let mut subset_mask = Array2::<i32>::ones((side, side));
 
@@ -74,7 +69,7 @@ impl Template {
                 let y_val = row as i64 - size as i64; // y varies along rows
                 let dist = ((x_val * x_val + y_val * y_val) as f64).sqrt();
                 if dist <= size as f64 {
-                    coord_rows.push([y_val as f64, x_val as f64]);
+                    coord_rows.push([x_val as f64, y_val as f64]);
                 } else {
                     subset_mask[[row, col]] = 0;
                 }
@@ -192,14 +187,14 @@ impl Template {
         let sm = self.subset_mask.clone();
 
         // Collect active coords: positions where local_padded AND subset_mask are both non-zero.
-        // Output uses np.argwhere convention: [row_offset, col_offset] = [y, x].
+        // Output uses [x-offset, y-offset] convention matching bspline_eval(x, y).
         let mut new_coords: Vec<[f64; 2]> = Vec::new();
         for row in 0..side {
             for col in 0..side {
                 if local_padded[[row, col]] != 0 && sm[[row, col]] != 0 {
-                    let row_off = row as isize - self.size as isize;
-                    let col_off = col as isize - self.size as isize;
-                    new_coords.push([row_off as f64, col_off as f64]);
+                    let x_off = col as isize - self.size as isize;
+                    let y_off = row as isize - self.size as isize;
+                    new_coords.push([x_off as f64, y_off as f64]);
                 }
             }
         }
@@ -227,19 +222,19 @@ mod tests {
 
     #[test]
     fn circle_5_first_coord() {
-        // Row-major scan: first included pixel is at row=0, col=5 → [y=-5, x=0].
+        // Row-major scan: first included pixel is at row=0, col=5 → [x=0, y=-5].
         let t = Template::circle(5).unwrap();
-        assert_eq!(t.coords[[0, 0]], -5.0); // row-offset = y
-        assert_eq!(t.coords[[0, 1]], 0.0);  // col-offset = x
+        assert_eq!(t.coords[[0, 0]], 0.0);  // x-offset
+        assert_eq!(t.coords[[0, 1]], -5.0); // y-offset
     }
 
     #[test]
     fn circle_5_last_coord() {
-        // Last included pixel is at row=10, col=5 → [y=5, x=0].
+        // Last included pixel is at row=10, col=5 → [x=0, y=5].
         let t = Template::circle(5).unwrap();
         let n = t.n_px;
-        assert_eq!(t.coords[[n - 1, 0]], 5.0);
-        assert_eq!(t.coords[[n - 1, 1]], 0.0);
+        assert_eq!(t.coords[[n - 1, 0]], 0.0);
+        assert_eq!(t.coords[[n - 1, 1]], 5.0);
     }
 
     #[test]

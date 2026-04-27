@@ -35,10 +35,11 @@ def inspect_subset(subset, show=True, block=True, save=False, **kwargs):
 
     f_img_path = getattr(subset, 'f_img_path', None)
     template_size = getattr(subset, 'template_size', None)
+    template_shape = getattr(subset, 'template_shape', None)
     if template_size is None:
         template_size = int(np.ceil(np.sqrt(len(f) / np.pi)))
 
-    # Build display image
+    # Build display image (square crop centred on subset)
     if f_img_path is not None:
         import cv2
         img = cv2.imread(f_img_path, cv2.IMREAD_COLOR)
@@ -47,7 +48,7 @@ def inspect_subset(subset, show=True, block=True, save=False, **kwargs):
         r = template_size
         x0, x1 = max(0, int(round(x)) - r), min(img_gs.shape[1], int(round(x)) + r + 1)
         y0, y1 = max(0, int(round(y)) - r), min(img_gs.shape[0], int(round(y)) + r + 1)
-        display = img_gs[y0:y1, x0:x1]
+        display = img_gs[y0:y1, x0:x1].astype(float)
     else:
         xi = f_coords[:, 0]
         yi = f_coords[:, 1]
@@ -63,6 +64,15 @@ def inspect_subset(subset, show=True, block=True, save=False, **kwargs):
             iy = int(round(float(yi[k]))) - y_min
             if 0 <= iy < h and 0 <= ix < w:
                 display[iy, ix] = float(f[k])
+
+    # For circular templates, mask pixels outside the circle with NaN
+    if template_shape == "circle":
+        h, w = display.shape
+        cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+        row_idx, col_idx = np.ogrid[:h, :w]
+        outside = (row_idx - cy) ** 2 + (col_idx - cx) ** 2 > template_size ** 2
+        display = display.copy()
+        display[outside] = np.nan
 
     imshow_kwargs = {"cmap": "gist_gray"}
     imshow_kwargs.update(kwargs)

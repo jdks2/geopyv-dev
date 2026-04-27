@@ -142,6 +142,8 @@ mod tests {
             seed_node: 0,
             mesh_order: 1,
             subset_order: 1,
+            iterations: ndarray::array![0u32, 0, 0],
+            norms: ndarray::array![0.0_f64, 0.0, 0.0],
         }
     }
 

@@ -18,7 +18,7 @@ use geopyv_dev::{
     sequence::{self, Sequence, SequenceMeshConfig, SequenceSolveConfig},
 };
 
-use crate::{py_mesh::PyMeshSolution, py_templates::{PyCircle, PySquare}, Error};
+use crate::{py_mesh::PyMeshSolution, py_templates::PyTemplate, Error};
 
 // ---------------------------------------------------------------------------
 // SequenceSolution class
@@ -132,7 +132,7 @@ impl PySequence {
     ///
     /// Parameters
     /// ----------
-    /// template : Circle or Square
+    /// template : Template
     ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Initial ``[x, y]`` seed coordinate near low-deformation region.
@@ -196,13 +196,10 @@ impl PySequence {
         } else {
             SolveMethod::Icgn
         };
-        let template_coords = if let Ok(circle) = template.extract::<PyRef<'_, PyCircle>>() {
-            circle.inner.coords.clone()
-        } else if let Ok(square) = template.extract::<PyRef<'_, PySquare>>() {
-            square.inner.coords.clone()
-        } else {
-            return Err(PyTypeError::new_err("template must be a Circle or Square"));
-        };
+        let tmpl = template
+            .extract::<PyRef<'_, PyTemplate>>()
+            .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
+        let template_coords = tmpl.inner.coords.clone();
         let cfg = SequenceSolveConfig {
             mesh_cfg: SolveConfig {
                 max_norm,

@@ -936,10 +936,10 @@ mod tests {
 
     /// Tier C: ICGN order-1 converges on the real DIC test pair.
     ///
-    /// Golden values from Phase 1 fixtures (Python numpy reimplementation):
+    /// Golden values (x-first coordinate convention):
     ///   iterations = 3
     ///   ZNCC ≈ 0.999987  (Tier C: rtol = 1e-5)
-    ///   p ≈ [0.03413, 0.03531, 9.8e-5, -9.1e-5, 2.9e-5, -8.1e-5]
+    ///   p ≈ [0.03420, 0.03583, 1.2e-4, -7.5e-5, 2.6e-5, -7.3e-5]
     #[test]
     fn test_solve_icgn_order1_golden() {
         let ref_path = test_image_path("ref.jpg");
@@ -957,18 +957,18 @@ mod tests {
         let tmpl = circle_coords_25();
         let subset = Subset::new(coord, &tmpl, &ref_img.qcqt).unwrap();
 
-        // Verify reference quantities match Phase 1 golden values
+        // Verify reference quantities match golden values (x-first coordinate convention)
         assert_eq!(subset.n_px(), 1961, "n_px mismatch");
         assert!(
-            (subset.f_m - 70.8558139299).abs() < 1e-4,
+            (subset.f_m - 70.8561329162).abs() < 1e-4,
             "f_m = {}", subset.f_m
         );
         assert!(
-            (subset.delta_f - 3179.3809800153).abs() < 0.01,
+            (subset.delta_f - 3179.4465451209).abs() < 0.01,
             "delta_f = {}", subset.delta_f
         );
         assert!(
-            (subset.sssig - 420037.875).abs() < 1.0,
+            (subset.sssig - 420066.064).abs() < 1.0,
             "sssig = {}", subset.sssig
         );
 
@@ -984,22 +984,22 @@ mod tests {
             (result.c_zncc - 0.999987).abs() < 1e-4,
             "ZNCC = {} (expected ~0.999987)", result.c_zncc
         );
-        // Displacement: p[0] ≈ 0.034134, p[1] ≈ 0.035315
+        // Displacement: p[0] ≈ 0.034201, p[1] ≈ 0.035834
         assert!(
-            (result.p[0] - 0.034134).abs() < 1e-4,
-            "p[0] = {} (expected ~0.034134)", result.p[0]
+            (result.p[0] - 0.034201).abs() < 1e-4,
+            "p[0] = {} (expected ~0.034201)", result.p[0]
         );
         assert!(
-            (result.p[1] - 0.035315).abs() < 1e-4,
-            "p[1] = {} (expected ~0.035315)", result.p[1]
+            (result.p[1] - 0.035834).abs() < 1e-4,
+            "p[1] = {} (expected ~0.035834)", result.p[1]
         );
     }
 
     /// Tier C: FAGN order-1 converges on the real DIC test pair.
     ///
-    /// Golden values from Phase 1 fixtures:
+    /// Golden values (x-first coordinate convention):
     ///   iterations = 3, ZNCC ≈ 0.999987
-    ///   p ≈ [0.033676, 0.034566, 9.6e-5, -8.6e-5, 2.6e-5, -7.3e-5]
+    ///   p ≈ [0.033741, 0.035105, 1.2e-4, -7.1e-5, 2.3e-5, -6.6e-5]
     #[test]
     fn test_solve_fagn_order1_golden() {
         let ref_path = test_image_path("ref.jpg");
@@ -1028,12 +1028,12 @@ mod tests {
             "ZNCC = {} (expected ~0.999987)", result.c_zncc
         );
         assert!(
-            (result.p[0] - 0.033676).abs() < 1e-4,
-            "p[0] = {} (expected ~0.033676)", result.p[0]
+            (result.p[0] - 0.033741).abs() < 1e-4,
+            "p[0] = {} (expected ~0.033741)", result.p[0]
         );
         assert!(
-            (result.p[1] - 0.034566).abs() < 1e-4,
-            "p[1] = {} (expected ~0.034566)", result.p[1]
+            (result.p[1] - 0.035105).abs() < 1e-4,
+            "p[1] = {} (expected ~0.035105)", result.p[1]
         );
     }
 
@@ -1096,4 +1096,5 @@ mod tests {
             "ZNCC = {} (expected > 0.999)", result.c_zncc
         );
     }
+
 }
