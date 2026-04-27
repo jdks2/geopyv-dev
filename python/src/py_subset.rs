@@ -1,8 +1,4 @@
 //! PyO3 wrapper for `geopyv_dev::subset`.
-//!
-//! Exposes `Subset` as a Python class with ICGN and FAGN solver methods.
-//! The constructor accepts a subset centre coordinate, template pixel offsets,
-//! and the reference image QCQT; it precomputes all reference quantities.
 
 use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::exceptions::PyTypeError;
@@ -13,7 +9,7 @@ use geopyv_dev::subset::Subset;
 
 use crate::{
     py_image::PyImage,
-    py_templates::{PyCircle, PySquare},
+    py_templates::PyTemplate,
     Error,
 };
 
@@ -26,16 +22,22 @@ use crate::{
 /// Parameters
 /// ----------
 /// coord : array_like of shape (2,)
-///     Subset centre coordinate ``[coord0, coord1]``.
-/// template : Circle or Square
+///     Subset centre coordinate ``[x, y]``.
+/// template : Template
 ///     Template object whose pixel offsets define the subset shape.
 /// f_img : Image
 ///     Reference image (pre-computed B-spline data).
+/// f_img_path : str, optional
+///     Path of the reference image, stored for serialisation.
 ///
 /// Attributes
 /// ----------
 /// coord : list[float]
-///     Subset centre ``[coord0, coord1]``.
+///     Subset centre ``[x, y]``.
+/// template_shape : str
+///     ``"circle"`` or ``"square"``.
+/// template_size : int
+///     Radius or half-side-length of the template.
 /// n_px : int
 ///     Number of pixels in the subset.
 /// f_coords : numpy.ndarray, shape (n_px, 2)
@@ -56,38 +58,56 @@ use crate::{
 pub struct PySubset {
     inner: Subset,
     pub(crate) f_img_path: Option<String>,
-    pub(crate) template_size: Option<usize>,
-    pub(crate) template_shape: Option<String>,
+    pub(crate) template_size: usize,
+    pub(crate) template_shape: String,
     solve_result: Option<pyo3::PyObject>,
 }
 
 #[pymethods]
 impl PySubset {
     #[new]
-    #[pyo3(signature = (coord, template, f_img, f_img_path=None, template_size=None, template_shape=None))]
+    #[pyo3(signature = (coord, template, f_img, f_img_path=None))]
     fn new(
         coord: [f64; 2],
         template: &Bound<'_, PyAny>,
         f_img: PyRef<'_, PyImage>,
         f_img_path: Option<String>,
-        template_size: Option<usize>,
-        template_shape: Option<String>,
     ) -> PyResult<Self> {
-        let s = if let Ok(circle) = template.extract::<PyRef<'_, PyCircle>>() {
-            Subset::new(coord, &circle.inner.coords, &f_img.inner.qcqt)
-        } else if let Ok(square) = template.extract::<PyRef<'_, PySquare>>() {
-            Subset::new(coord, &square.inner.coords, &f_img.inner.qcqt)
-        } else {
-            return Err(PyTypeError::new_err("template must be a Circle or Square"));
-        }
-        .map_err(Error::from)?;
-        Ok(PySubset { inner: s, f_img_path, template_size, template_shape, solve_result: None })
+        let tmpl = template
+            .extract::<PyRef<'_, PyTemplate>>()
+            .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
+        let template_shape = match tmpl.inner.shape {
+            geopyv_dev::templates::TemplateShape::Circle => "circle",
+            geopyv_dev::templates::TemplateShape::Square => "square",
+        }.to_string();
+        let template_size = tmpl.inner.size;
+        let s = Subset::new(coord, &tmpl.inner.coords, &f_img.inner.qcqt)
+            .map_err(Error::from)?;
+        Ok(PySubset {
+            inner: s,
+            f_img_path,
+            template_size,
+            template_shape,
+            solve_result: None,
+        })
     }
 
-    /// Subset centre ``[coord0, coord1]``.
+    /// Subset centre ``[x, y]``.
     #[getter]
     fn coord(&self) -> [f64; 2] {
         self.inner.coord
+    }
+
+    /// ``"circle"`` or ``"square"``.
+    #[getter]
+    fn template_shape(&self) -> &str {
+        &self.template_shape
+    }
+
+    /// Radius (circle) or half-side-length (square) in pixels.
+    #[getter]
+    fn template_size(&self) -> usize {
+        self.template_size
     }
 
     /// Number of pixels.
@@ -206,18 +226,6 @@ impl PySubset {
         self.f_img_path.clone()
     }
 
-    /// Template size (radius in pixels), or ``None``.
-    #[getter]
-    fn template_size(&self) -> Option<usize> {
-        self.template_size
-    }
-
-    /// Template shape (e.g. "circle" or "square"), or ``None``.
-    #[getter]
-    fn template_shape(&self) -> Option<String> {
-        self.template_shape.clone()
-    }
-
     /// Solve result dict from the last solve call, or ``None``.
     #[getter]
     fn solve_result<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyDict>> {
@@ -249,7 +257,6 @@ fn result_to_dict<'py>(
     d.set_item("c_znssd", result.c_znssd)?;
     d.set_item("iterations", result.iterations)?;
     d.set_item("converged", result.converged)?;
-    // history: list of (iter, norm, zncc, znssd)
     let history: Vec<(usize, f64, f64, f64)> = result.history;
     d.set_item("history", history)?;
     Ok(d)

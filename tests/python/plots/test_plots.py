@@ -9,7 +9,7 @@ from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 
 from geopyv_dev import (
-    Image, Subset, Mesh, Circle,
+    Image, Subset, Mesh, Template,
     Field, FieldSolution,
     Particle, ParticleSolution,
     field_distribute_particles,
@@ -49,17 +49,8 @@ def _preprocess(fp):
     return cv2.GaussianBlur(gs, (5, 5), sigmaX=1.1, sigmaY=1.1)
 
 
-def make_circle_coords(radius):
-    size = 2 * radius + 1
-    x, y = np.meshgrid(range(size), range(size))
-    x, y = x - radius, y - radius
-    dist = np.sqrt(x**2 + y**2)
-    x_s, y_s = np.where(dist <= radius)
-    n_px = x_s.shape[0]
-    coords = np.empty((n_px, 2), order="F")
-    coords[:, 0] = (x_s - radius).astype(float)
-    coords[:, 1] = (y_s - radius).astype(float)
-    return coords
+def make_circle_template(radius):
+    return Template("circle", size=radius)
 
 
 def square_roi(x0, y0, x1, y1):
@@ -86,20 +77,16 @@ def tar_img():
 
 
 @pytest.fixture(scope="module")
-def tmpl_coords():
-    return make_circle_coords(RADIUS)
-
-
-@pytest.fixture(scope="module")
-def solved_subset(ref_img, tar_img, tmpl_coords):
-    s = Subset(COORD, tmpl_coords, ref_img.qcqt)
-    s.solve_icgn(tar_img.qcqt, [0.0] * 6)
+def solved_subset(ref_img, tar_img):
+    tmpl = make_circle_template(RADIUS)
+    s = Subset(COORD, tmpl, ref_img)
+    s.solve_icgn(tar_img, [0.0] * 6)
     return s
 
 
 @pytest.fixture(scope="module")
 def solved_mesh(ref_img, tar_img):
-    tmpl = make_circle_coords(20)
+    tmpl = make_circle_template(20)
     borders, segments, curves = square_roi(150.0, 150.0, 250.0, 250.0)
     mesh = Mesh(borders, segments, curves, size_lower=20.0, size_upper=40.0, target_nodes=15)
     sol = mesh.solve(ref_img, tar_img, tmpl, [200.0, 200.0], [0.0] * 6,

@@ -18,9 +18,10 @@ from geopyv_dev import (
     Sequence,
     SequenceSolution,
     MeshSolution,
-    Circle,
+    Template,
     sequence_deformation_preconditioning,
 )
+from geopyv_dev.wrappers import SequenceSolutionWrapper, MeshWrapper
 
 # ---------------------------------------------------------------------------
 # Synthetic mesh — unit square with two order-1 triangles
@@ -379,11 +380,10 @@ def test_sequence_solve_one_pair_returns_solution():
     )
 
     # Template: circle of radius 10 pixels.
-    template = Circle(10)
-    template_coords = template.coords
+    template = Template("circle", size=10)
 
     sol = seq.solve(
-        template_coords=template_coords,
+        template=template,
         seed_coord=[cx, cy],
         seed_warp=[0.0] * 6,
         max_norm=1e-3,
@@ -395,7 +395,7 @@ def test_sequence_solve_one_pair_returns_solution():
         border=20,
     )
 
-    assert isinstance(sol, SequenceSolution)
+    assert isinstance(sol, SequenceSolutionWrapper)
 
 
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
@@ -425,9 +425,9 @@ def test_sequence_solve_one_pair_result_shape():
         target_nodes=15,
     )
 
-    template = Circle(10)
+    template = Template("circle", size=10)
     sol = seq.solve(
-        template_coords=template.coords,
+        template=template,
         seed_coord=[cx, cy],
         seed_warp=[0.0] * 6,
         max_norm=1e-3,
@@ -439,7 +439,7 @@ def test_sequence_solve_one_pair_result_shape():
     )
 
     assert len(sol.mesh_solutions) == 1
-    assert isinstance(sol.mesh_solutions[0], MeshSolution)
+    assert isinstance(sol.mesh_solutions[0], MeshWrapper)
 
 
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
@@ -469,9 +469,9 @@ def test_sequence_solution_repr():
         target_nodes=15,
     )
 
-    template = Circle(10)
+    template = Template("circle", size=10)
     sol = seq.solve(
-        template_coords=template.coords,
+        template=template,
         seed_coord=[cx, cy],
         seed_warp=[0.0] * 6,
         max_norm=1e-3,

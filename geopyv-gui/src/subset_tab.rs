@@ -316,7 +316,7 @@ impl SubsetTabState {
             None
         };
 
-        // Overlay crosshair for view mode at subset coordinate.
+        // Overlay crosshair + template outline for view mode.
         if mode == crate::main_window::PaneMode::View {
             if let (Some(sol), Some(coord)) = (
                 self.view.solution.as_ref(),
@@ -328,6 +328,13 @@ impl SubsetTabState {
                 ));
                 if viewer_rect.contains(screen_pt) {
                     paint_crosshair_x(ui.painter(), screen_pt);
+                    let screen_radius = sol.template.size as f32 * coord.zoom;
+                    paint_template_outline(
+                        ui.painter(),
+                        screen_pt,
+                        screen_radius,
+                        &sol.template.shape,
+                    );
                 }
             }
         }
@@ -1015,6 +1022,28 @@ fn paint_crosshair_x(painter: &egui::Painter, center: egui::Pos2) {
     let s = egui::Stroke::new(2.0, POINT_COLOR);
     painter.line_segment([center - egui::vec2(d, d), center + egui::vec2(d, d)], s);
     painter.line_segment([center - egui::vec2(d, -d), center + egui::vec2(d, -d)], s);
+}
+
+fn paint_template_outline(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    screen_radius: f32,
+    shape: &TemplateShape,
+) {
+    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 200, 0, 200));
+    match shape {
+        TemplateShape::Circle => {
+            painter.circle_stroke(center, screen_radius, stroke);
+        }
+        TemplateShape::Square => {
+            let half = screen_radius;
+            let rect = egui::Rect::from_center_size(
+                center,
+                egui::vec2(half * 2.0, half * 2.0),
+            );
+            painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Middle);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

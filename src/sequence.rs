@@ -617,6 +617,8 @@ mod tests {
             seed_node: 0,
             mesh_order: 1,
             subset_order: 1,
+            iterations: Array1::zeros(n),
+            norms: Array1::zeros(n),
         }
     }
 

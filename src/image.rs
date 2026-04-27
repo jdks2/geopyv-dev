@@ -1,8 +1,6 @@
+//! Image module for geopyv-dev.
+//! 
 //! Image loading and bi-quintic B-spline precomputation.
-//!
-//! Translates `geopyv/image.py` and `geopyv/_image.cpp` into a single Rust
-//! module. The Python/C++ split was an implementation detail; here both the
-//! coefficient computation and the QCQT blocked-matrix product live together.
 //!
 //! # Memory note (architectural candidate)
 //!
@@ -103,9 +101,10 @@ pub(crate) fn get_c(image_gs: &Array2<f64>, border: usize) -> Array2<f64> {
     let ifft_cols = planner.plan_fft_inverse(pad_cols);
     fft_cols.process(&mut kernel_x);
 
+    // Row pass — parallel: each row is an independent FFT deconvolution.
+    // fft_cols / ifft_cols are Arc<dyn Fft> and are Send + Sync.
     let scale_cols = 1.0 / pad_cols as f64;
-    for i in 0..pad_rows {
-        let row = &mut c_flat[i * pad_cols..(i + 1) * pad_cols];
+    c_flat.par_chunks_exact_mut(pad_cols).for_each(|row| {
         fft_cols.process(row);
         for (v, kv) in row.iter_mut().zip(kernel_x.iter()) {
             *v /= *kv;
@@ -114,27 +113,40 @@ pub(crate) fn get_c(image_gs: &Array2<f64>, border: usize) -> Array2<f64> {
         for v in row.iter_mut() {
             *v *= scale_cols;
         }
+    });
+
+    // Transpose c_flat from row-major (pad_rows × pad_cols) to column-major
+    // (pad_cols × pad_rows) so each column becomes a contiguous slice.
+    // This eliminates the stride-16KB cache misses in the column pass.
+    let mut c_t = vec![Complex::new(0.0, 0.0); pad_rows * pad_cols];
+    for i in 0..pad_rows {
+        for j in 0..pad_cols {
+            c_t[j * pad_rows + i] = c_flat[i * pad_cols + j];
+        }
     }
 
-    // --- Column-by-column deconvolution ---
+    // Column pass — parallel: each "row" of c_t is one original column, now contiguous.
     let mut kernel_y = build_kernel(&k, pad_rows);
-    let fft_rows = planner.plan_fft_forward(pad_rows);
+    let fft_rows  = planner.plan_fft_forward(pad_rows);
     let ifft_rows = planner.plan_fft_inverse(pad_rows);
     fft_rows.process(&mut kernel_y);
 
     let scale_rows = 1.0 / pad_rows as f64;
-    let mut col_buf = vec![Complex::new(0.0, 0.0); pad_rows];
-    for j in 0..pad_cols {
-        for (i, v) in col_buf.iter_mut().enumerate() {
-            *v = c_flat[i * pad_cols + j];
-        }
-        fft_rows.process(&mut col_buf);
-        for (v, kv) in col_buf.iter_mut().zip(kernel_y.iter()) {
+    c_t.par_chunks_exact_mut(pad_rows).for_each(|col| {
+        fft_rows.process(col);
+        for (v, kv) in col.iter_mut().zip(kernel_y.iter()) {
             *v /= *kv;
         }
-        ifft_rows.process(&mut col_buf);
-        for (i, v) in col_buf.iter().enumerate() {
-            c_flat[i * pad_cols + j] = *v * scale_rows;
+        ifft_rows.process(col);
+        for v in col.iter_mut() {
+            *v *= scale_rows;
+        }
+    });
+
+    // Transpose back to row-major.
+    for i in 0..pad_rows {
+        for j in 0..pad_cols {
+            c_flat[i * pad_cols + j] = c_t[j * pad_rows + i];
         }
     }
 
@@ -156,39 +168,30 @@ pub(crate) fn get_qcqt(image_gs: &Array2<f64>, c: &Array2<f64>, border: usize) -
     let q = q_matrix();
     let qt = q.transpose();
 
-    // Compute each row-band of 6 output rows in parallel.
-    let row_vecs: Vec<Vec<f64>> = (0..rows)
-        .into_par_iter()
-        .map(|i| {
-            // Output for pixel row i: 6 × (cols*6) values, stored row-major.
-            let mut data = vec![0.0f64; 6 * cols * 6];
+    // Pre-allocate the full output buffer and write each row-band directly in
+    // parallel. Eliminates the intermediate Vec<Vec<f64>> and the serial copy.
+    // q and qt are SMatrix (Copy), captured by value into each thread's stack frame.
+    // c is &Array2 (Sync), shared immutably across threads.
+    let out_cols = cols * 6;
+    let mut flat = vec![0.0f64; rows * 6 * out_cols];
+
+    flat.par_chunks_exact_mut(6 * out_cols)
+        .enumerate()
+        .for_each(|(i, chunk)| {
             for j in 0..cols {
                 let ir = i + border - 2;
                 let ic = j + border - 2;
                 let c_view = c.slice(s![ir..ir + 6, ic..ic + 6]);
-                let c_mat = view_to_mat6(c_view);
+                let c_mat  = view_to_mat6(c_view);
                 let result = q * c_mat * qt;
                 for dr in 0..6_usize {
                     for dc in 0..6_usize {
-                        data[dr * (cols * 6) + j * 6 + dc] = result[(dr, dc)];
+                        chunk[dr * out_cols + j * 6 + dc] = result[(dr, dc)];
                     }
                 }
             }
-            data
-        })
-        .collect();
+        });
 
-    // Assemble into the (rows*6) × (cols*6) output array.
-    let out_cols = cols * 6;
-    let mut flat = vec![0.0f64; rows * 6 * out_cols];
-    for (i, row_data) in row_vecs.into_iter().enumerate() {
-        for dr in 0..6_usize {
-            let src_start = dr * out_cols;
-            let dst_start = (i * 6 + dr) * out_cols;
-            flat[dst_start..dst_start + out_cols]
-                .copy_from_slice(&row_data[src_start..src_start + out_cols]);
-        }
-    }
     Array2::from_shape_vec((rows * 6, out_cols), flat).expect("shape mismatch in get_qcqt")
 }
 

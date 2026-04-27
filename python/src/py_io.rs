@@ -56,6 +56,12 @@ pub fn load(py: Python<'_>, path: &str) -> PyResult<PyObject> {
         GeopyvObject::Mesh(m) => Ok(PyMeshSolution { inner: m, f_img_path: None, g_img_path: None }.into_py(py)),
         GeopyvObject::Field(f) => Ok(PyFieldSolution { inner: f, image_0_path: None }.into_py(py)),
         GeopyvObject::Sequence(s) => Ok(PySequenceSolution { inner: s }.into_py(py)),
+        GeopyvObject::Subset(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "loading Subset objects is not yet supported via Python",
+        )),
+        GeopyvObject::Particle(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "loading Particle objects is not yet supported via Python",
+        )),
     }
 }
 
