@@ -10,7 +10,6 @@ use crate::particle_tab::{ParticleSpawnParams, ParticleTabState};
 use crate::project::Project;
 use crate::sequence_tab::{SequenceSpawnParams, SequenceTabState};
 use crate::subset_tab::{SubsetSpawnParams, SubsetTabState};
-use crate::template::{shape_label, render_template_preview, TemplateConfig, TemplateShape};
 
 // ---------------------------------------------------------------------------
 // Tab
@@ -19,7 +18,6 @@ use crate::template::{shape_label, render_template_preview, TemplateConfig, Temp
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Images,
-    Templates,
     Subsets,
     Meshes,
     Sequences,
@@ -30,7 +28,6 @@ pub enum Tab {
 impl Tab {
     const ALL: &'static [Tab] = &[
         Tab::Images,
-        Tab::Templates,
         Tab::Subsets,
         Tab::Meshes,
         Tab::Sequences,
@@ -41,7 +38,6 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Images => "Images",
-            Tab::Templates => "Templates",
             Tab::Subsets => "Subsets",
             Tab::Meshes => "Meshes",
             Tab::Sequences => "Sequences",
@@ -118,12 +114,6 @@ impl LeftPaneState {
                 })
                 .collect(),
 
-            Tab::Templates => project
-                .list_templates()
-                .into_iter()
-                .map(file_entry_stem)
-                .collect(),
-
             Tab::Subsets => project
                 .list_subsets()
                 .into_iter()
@@ -190,61 +180,6 @@ impl MiddlePaneState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Right pane state
-// ---------------------------------------------------------------------------
-
-pub struct NewTemplateForm {
-    pub name: String,
-    pub shape: TemplateShape,
-    pub size_text: String,
-    pub size: u32,
-    pub error: Option<String>,
-}
-
-impl Default for NewTemplateForm {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            shape: TemplateShape::Circle,
-            size_text: "20".to_string(),
-            size: 20,
-            error: None,
-        }
-    }
-}
-
-pub struct TemplateTabState {
-    /// Template currently shown in view mode, keyed by its path.
-    pub loaded: Option<(PathBuf, TemplateConfig)>,
-    pub new_form: NewTemplateForm,
-}
-
-impl TemplateTabState {
-    fn new() -> Self {
-        Self {
-            loaded: None,
-            new_form: NewTemplateForm::default(),
-        }
-    }
-}
-
-pub struct RightPaneState {
-    pub template: TemplateTabState,
-}
-
-impl RightPaneState {
-    fn new() -> Self {
-        Self {
-            template: TemplateTabState::new(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PaneMode re-exported for subset_tab.rs
-// ---------------------------------------------------------------------------
-// (already defined above — just ensuring it is pub)
 
 
 // ---------------------------------------------------------------------------
@@ -256,7 +191,6 @@ pub struct MainWindow {
     pub mode: PaneMode,
     pub left: LeftPaneState,
     pub middle: MiddlePaneState,
-    pub right: RightPaneState,
     pub subset: SubsetTabState,
     pub mesh: MeshTabState,
     pub sequence: SequenceTabState,
@@ -274,7 +208,6 @@ impl MainWindow {
             mode: PaneMode::View,
             left: LeftPaneState::new(),
             middle: MiddlePaneState::new(),
-            right: RightPaneState::new(),
             subset: SubsetTabState::new(),
             mesh: MeshTabState::new(),
             sequence: SequenceTabState::new(),
@@ -420,9 +353,7 @@ impl MainWindow {
             .and_then(|i| self.left.entries.get(i))
             .map(|e| e.path.clone());
         let selected_index = self.left.selected;
-        let templates_dir = project.templates_dir();
         let images = project.list_images();
-        let templates = project.list_templates();
         let subsets_dir = project.subsets_dir();
         let meshes_dir = project.meshes_dir();
         let sequences_dir = project.sequences_dir();
@@ -473,9 +404,7 @@ impl MainWindow {
                     ui,
                     selected_path.as_deref(),
                     selected_index,
-                    &templates_dir,
                     &images,
-                    &templates,
                     &sequences,
                     &out_dir,
                 );
@@ -774,40 +703,6 @@ impl MainWindow {
                 });
                 None
             }
-            (Tab::Templates, _) => {
-                let preview: Option<(TemplateShape, u32)> = match self.mode {
-                    PaneMode::New => {
-                        let f = &self.right.template.new_form;
-                        Some((f.shape.clone(), f.size))
-                    }
-                    PaneMode::View => self
-                        .right
-                        .template
-                        .loaded
-                        .as_ref()
-                        .map(|(_, t)| (t.shape.clone(), t.size)),
-                };
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
-                    match preview {
-                        Some((ref shape, size)) => {
-                            render_template_preview(ui.painter(), viewer_rect, shape, size);
-                        }
-                        None => {
-                            ui.painter()
-                                .rect_filled(viewer_rect, 0.0, egui::Color32::from_rgb(15, 15, 15));
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Select or create a template")
-                                        .size(14.0)
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            });
-                        }
-                    }
-                });
-                None
-            }
-
             (Tab::Subsets, _) => {
                 let mode = self.mode;
                 let cache = &mut self.texture_cache;
@@ -922,9 +817,7 @@ impl MainWindow {
         ui: &mut egui::Ui,
         selected_path: Option<&std::path::Path>,
         selected_index: Option<usize>,
-        templates_dir: &std::path::Path,
         images: &[PathBuf],
-        templates: &[PathBuf],
         sequences: &[PathBuf],
         out_dir: &std::path::Path,
     ) -> (
@@ -976,29 +869,23 @@ impl MainWindow {
                                 .color(ui.visuals().weak_text_color()),
                         );
                     }
-                    (Tab::Templates, PaneMode::View, _) => {
-                        self.show_right_template_view(ui, selected_path);
-                    }
-                    (Tab::Templates, PaneMode::New, _) => {
-                        self.show_right_template_new(ui, templates_dir);
-                    }
                     (Tab::Subsets, PaneMode::View, _) => {
                         self.subset.show_right_view(ui, selected_path);
                     }
                     (Tab::Subsets, PaneMode::New, _) => {
-                        subset_spawn = self.subset.show_right_new(ui, images, templates);
+                        subset_spawn = self.subset.show_right_new(ui, images);
                     }
                     (Tab::Meshes, PaneMode::View, _) => {
                         self.mesh.show_right_view(ui, selected_path);
                     }
                     (Tab::Meshes, PaneMode::New, _) => {
-                        mesh_spawn = self.mesh.show_right_new(ui, images, templates);
+                        mesh_spawn = self.mesh.show_right_new(ui, images);
                     }
                     (Tab::Sequences, PaneMode::View, _) => {
                         self.sequence.show_right_view(ui, selected_path);
                     }
                     (Tab::Sequences, PaneMode::New, _) => {
-                        sequence_spawn = self.sequence.show_right_new(ui, images, templates);
+                        sequence_spawn = self.sequence.show_right_new(ui, images);
                     }
                     (Tab::Particles, PaneMode::View, _) => {
                         self.particle.show_right_view(ui, selected_path);
@@ -1054,170 +941,6 @@ impl MainWindow {
                 .unwrap_or_else(|| "\u{2014}".to_string()),
         );
         meta_row(ui, "Format", &extension);
-    }
-
-    // -----------------------------------------------------------------------
-    // Templates tab — view mode
-    // -----------------------------------------------------------------------
-
-    fn show_right_template_view(
-        &mut self,
-        ui: &mut egui::Ui,
-        selected_path: Option<&std::path::Path>,
-    ) {
-        // Lazy-load (or clear) the template when the selected path changes.
-        let cached_path = self.right.template.loaded.as_ref().map(|(p, _)| p.as_path());
-        if cached_path != selected_path {
-            self.right.template.loaded = selected_path.and_then(|path| {
-                TemplateConfig::load(path).ok().map(|t| (path.to_path_buf(), t))
-            });
-        }
-
-        if let Some((_, tmpl)) = &self.right.template.loaded {
-            let n_px = tmpl.n_px();
-            let shape_str = shape_label(&tmpl.shape).to_string();
-            let size_str = format!("{} px", tmpl.size);
-            let n_px_str = format!("{n_px}");
-            let name = tmpl.name.clone();
-            meta_row(ui, "Name", &name);
-            meta_row(ui, "Shape", &shape_str);
-            meta_row(ui, "Size", &size_str);
-            meta_row(ui, "n_px", &n_px_str);
-        } else {
-            ui.label(
-                egui::RichText::new("No template selected")
-                    .size(13.0)
-                    .color(ui.visuals().weak_text_color()),
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Templates tab — new mode
-    // -----------------------------------------------------------------------
-
-    fn show_right_template_new(
-        &mut self,
-        ui: &mut egui::Ui,
-        templates_dir: &std::path::Path,
-    ) {
-        // Collect any save intent within a block to release the form borrow
-        // before we mutate other self fields.
-        let save_intent: Option<TemplateConfig> = {
-            let form = &mut self.right.template.new_form;
-
-            egui::Grid::new("template_new_grid")
-                .num_columns(2)
-                .spacing([8.0, 6.0])
-                .min_col_width(60.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("Name:")
-                            .size(12.0)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut form.name)
-                            .desired_width(150.0),
-                    );
-                    ui.end_row();
-
-                    ui.label(
-                        egui::RichText::new("Shape:")
-                            .size(12.0)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut form.shape, TemplateShape::Circle, "Circle");
-                        ui.radio_value(&mut form.shape, TemplateShape::Square, "Square");
-                    });
-                    ui.end_row();
-
-                    ui.label(
-                        egui::RichText::new("Size (px):")
-                            .size(12.0)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut form.size_text)
-                            .desired_width(80.0),
-                    );
-                    if resp.changed() {
-                        let s = form.size_text.trim().to_string();
-                        if s.is_empty() {
-                            form.error = None;
-                        } else {
-                            match s.parse::<u32>() {
-                                Ok(0) => form.error = Some("Size must be ≥ 1".to_string()),
-                                Ok(v) => {
-                                    form.size = v;
-                                    form.error = None;
-                                }
-                                Err(_) => {
-                                    form.error = Some("Enter a positive integer".to_string())
-                                }
-                            }
-                        }
-                    }
-                    ui.end_row();
-                });
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            if let Some(err) = &form.error.clone() {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(err)
-                        .size(12.0)
-                        .color(ui.visuals().error_fg_color),
-                );
-                ui.add_space(4.0);
-            }
-
-            let name = form.name.trim().to_string();
-            let name_ok = !name.is_empty()
-                && !name.contains('/')
-                && !name.contains('\\')
-                && !name.contains('\0');
-            let size_ok = !form.size_text.trim().is_empty()
-                && form.size > 0
-                && form.error.is_none();
-            let can_save = name_ok && size_ok;
-
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                if ui
-                    .add_enabled(can_save, egui::Button::new("Save"))
-                    .clicked()
-                {
-                    Some(TemplateConfig {
-                        name,
-                        shape: form.shape.clone(),
-                        size: form.size,
-                    })
-                } else {
-                    None
-                }
-            })
-            .inner
-        }; // form borrow ends here
-
-        if let Some(config) = save_intent {
-            let dest_path = templates_dir.join(format!("{}.json", config.name));
-            match config.save(templates_dir) {
-                Ok(_) => {
-                    self.right.template.loaded = Some((dest_path, config));
-                    self.right.template.new_form = NewTemplateForm::default();
-                    self.mode = PaneMode::View;
-                    self.pending_refresh = true;
-                }
-                Err(e) => {
-                    self.right.template.new_form.error = Some(e);
-                }
-            }
-        }
     }
 
     // -----------------------------------------------------------------------

@@ -12,7 +12,6 @@ use geopyv_dev::templates::{Template, TemplateShape};
 
 use crate::draw::ActiveDrawMode;
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
-use crate::template::TemplateConfig;
 
 // ---------------------------------------------------------------------------
 // Solver configuration enums
@@ -76,7 +75,10 @@ pub struct NewSubsetForm {
     pub name: String,
     pub ref_idx: Option<usize>,
     pub target_idx: Option<usize>,
-    pub template_idx: Option<usize>,
+    pub template_shape: TemplateShape,
+    pub template_size_text: String,
+    pub template_size: u32,
+    pub template_size_error: Option<String>,
     pub solver: SolverConfig,
     pub draw: crate::draw::DrawState,
     pub form_error: Option<String>,
@@ -88,7 +90,10 @@ impl Default for NewSubsetForm {
             name: String::new(),
             ref_idx: None,
             target_idx: None,
-            template_idx: None,
+            template_shape: TemplateShape::Circle,
+            template_size_text: "20".to_string(),
+            template_size: 20,
+            template_size_error: None,
             solver: SolverConfig::default(),
             draw: crate::draw::DrawState::new(),
             form_error: None,
@@ -97,16 +102,18 @@ impl Default for NewSubsetForm {
 }
 
 impl NewSubsetForm {
-    fn can_run(&self, images: &[PathBuf], templates: &[PathBuf]) -> bool {
+    fn can_run(&self, images: &[PathBuf]) -> bool {
         let name_ok = !self.name.trim().is_empty()
             && !self.name.contains('/')
             && !self.name.contains('\\');
         let ref_ok = self.ref_idx.map(|i| i < images.len()).unwrap_or(false);
         let tar_ok = self.target_idx.map(|i| i < images.len()).unwrap_or(false);
-        let tmpl_ok = self.template_idx.map(|i| i < templates.len()).unwrap_or(false);
+        let template_ok = !self.template_size_text.trim().is_empty()
+            && self.template_size > 0
+            && self.template_size_error.is_none();
         let coord_ok = self.draw.point_ok();
         let solver_ok = self.solver.is_valid();
-        name_ok && ref_ok && tar_ok && tmpl_ok && coord_ok && solver_ok
+        name_ok && ref_ok && tar_ok && template_ok && coord_ok && solver_ok
     }
 }
 
@@ -160,7 +167,8 @@ pub struct SubsetSpawnParams {
     pub name: String,
     pub ref_path: PathBuf,
     pub target_path: PathBuf,
-    pub template_path: PathBuf,
+    pub template_shape: TemplateShape,
+    pub template_size: u32,
     pub coord: [f64; 2],
     pub method: SolveMethod,
     pub order: SubsetOrder,
@@ -531,7 +539,6 @@ impl SubsetTabState {
         &mut self,
         ui: &mut egui::Ui,
         images: &[PathBuf],
-        templates: &[PathBuf],
     ) -> Option<SubsetSpawnParams> {
         let solving = self.is_solving();
 
@@ -607,33 +614,71 @@ impl SubsetTabState {
                         }
                     });
                 ui.end_row();
+            });
 
-                // Template
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Template section.
+        section_header(ui, "Template");
+        ui.add_space(4.0);
+
+        egui::Grid::new("subset_template_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .min_col_width(72.0)
+            .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Template:")
+                    egui::RichText::new("Shape:")
                         .size(12.0)
                         .color(ui.visuals().weak_text_color()),
                 );
-                let tmpl_label = form
-                    .template_idx
-                    .and_then(|i| templates.get(i))
-                    .and_then(|p| p.file_stem())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "—".to_string());
-                egui::ComboBox::from_id_salt("subset_tmpl")
-                    .selected_text(&tmpl_label)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for (i, p) in templates.iter().enumerate() {
-                            let name = p
-                                .file_stem()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            ui.selectable_value(&mut form.template_idx, Some(i), name);
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut form.template_shape, TemplateShape::Circle, "Circle");
+                    ui.radio_value(&mut form.template_shape, TemplateShape::Square, "Square");
+                });
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Size (px):")
+                        .size(12.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut form.template_size_text).desired_width(80.0),
+                );
+                if resp.changed() {
+                    let s = form.template_size_text.trim().to_string();
+                    if s.is_empty() {
+                        form.template_size_error = None;
+                    } else {
+                        match s.parse::<u32>() {
+                            Ok(0) => {
+                                form.template_size_error = Some("Size must be \u{2265} 1".to_string())
+                            }
+                            Ok(v) => {
+                                form.template_size = v;
+                                form.template_size_error = None;
+                            }
+                            Err(_) => {
+                                form.template_size_error =
+                                    Some("Enter a positive integer".to_string())
+                            }
                         }
-                    });
+                    }
+                }
                 ui.end_row();
             });
+
+        if let Some(err) = &form.template_size_error.clone() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .size(11.0)
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -794,7 +839,7 @@ impl SubsetTabState {
         }
 
         // Run button.
-        let can_run = form.can_run(images, templates);
+        let can_run = form.can_run(images);
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             if ui
@@ -804,12 +849,12 @@ impl SubsetTabState {
                 let pt = form.draw.point.unwrap();
                 let ref_path = images[form.ref_idx.unwrap()].clone();
                 let target_path = images[form.target_idx.unwrap()].clone();
-                let template_path = templates[form.template_idx.unwrap()].clone();
                 spawn = Some(SubsetSpawnParams {
                     name: form.name.trim().to_string(),
                     ref_path,
                     target_path,
-                    template_path,
+                    template_shape: form.template_shape.clone(),
+                    template_size: form.template_size,
                     coord: [pt.x as f64, pt.y as f64],
                     method: form.solver.method,
                     order: form.solver.order,
@@ -898,19 +943,10 @@ fn run_solve(
     state: Arc<Mutex<SubsetSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    // Load template config.
-    let tmpl_config = match TemplateConfig::load(&params.template_path) {
-        Ok(c) => c,
-        Err(e) => {
-            set_error(&state, format!("Template load error: {e}"));
-            return;
-        }
-    };
-
     // Build template pixel offsets.
-    let template = match tmpl_config.shape {
-        TemplateShape::Circle => Template::circle(tmpl_config.size as usize),
-        TemplateShape::Square => Template::square(tmpl_config.size as usize),
+    let template = match params.template_shape {
+        TemplateShape::Circle => Template::circle(params.template_size as usize),
+        TemplateShape::Square => Template::square(params.template_size as usize),
     };
     let template = match template {
         Ok(t) => t,
@@ -989,8 +1025,8 @@ fn run_solve(
             let solution = SubsetSolution {
                 coord: params.coord,
                 template: TemplateSummary {
-                    shape: tmpl_config.shape,
-                    size: tmpl_config.size as usize,
+                    shape: params.template_shape,
+                    size: params.template_size as usize,
                     n_px: subset.n_px(),
                 },
                 ref_image: params.ref_path,

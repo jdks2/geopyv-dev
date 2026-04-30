@@ -15,13 +15,13 @@
 //!   functions so they can be called by `adaptive_remesh` logic without a
 //!   `Mesh` borrow.
 
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    geometry::triangulation::{self, TriMesh},
+    geometry::triangulation,
     image::Image,
     subset::{Subset, SolveResult},
     Error,
@@ -69,6 +69,10 @@ pub struct MeshSolution {
     pub iterations: Array1<u32>,
     /// Per-node final ∆norm values `(N,)`.
     pub norms: Array1<f64>,
+    /// Reference image file path (carried through serialisation).
+    pub f_img_path: Option<String>,
+    /// Target image file path (carried through serialisation).
+    pub g_img_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +113,7 @@ pub enum SolveMethod {
 
 /// Mesh-level DIC solver.
 ///
-/// Construct via [`Mesh::from_trimesh`].
+/// Construct via [`Mesh::generate`].
 pub struct Mesh {
     nodes: Array2<f64>,
     elements: Array2<usize>,
@@ -119,18 +123,6 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    /// Construct a `Mesh` from a [`TriMesh`] (output of
-    /// [`triangulation::generate_mesh`]).
-    pub fn from_trimesh(tm: TriMesh) -> Self {
-        Mesh {
-            nodes: tm.nodes,
-            elements: tm.elements,
-            boundary: tm.boundary,
-            exclusions: tm.exclusions,
-            mesh_order: 1, // TriMesh order-1 layout; order-2 is implicit via ncols==6
-        }
-    }
-
     /// Reconstruct a `Mesh` topology from a previous [`MeshSolution`].
     ///
     /// Used by the sequence solver in `sync` mode to reuse the node/element
@@ -206,8 +198,10 @@ impl Mesh {
             w
         };
 
-        let mut solved = vec![false; n_nodes]; // -1 (stored) ↔ true, 0 ↔ false
+        let mut stored = vec![false; n_nodes];    // result has been written
+        let mut propagated = vec![false; n_nodes]; // node has been used as source
         let mut c_zncc = Array1::<f64>::zeros(n_nodes);
+        let mut queue: BinaryHeap<(u64, usize)> = BinaryHeap::new();
         let mut p = Array2::<f64>::zeros((n_nodes, p_len));
         let mut displacements = Array2::<f64>::zeros((n_nodes, 2));
         let mut iterations = Array1::<u32>::zeros(n_nodes);
@@ -230,7 +224,9 @@ impl Mesh {
             cfg,
         )?;
         store_result(seed_node, &seed_result, &mut c_zncc, &mut p, &mut displacements, &mut iterations, &mut norms);
-        solved[seed_node] = true;
+        stored[seed_node] = true;
+        propagated[seed_node] = true;
+        queue.push((c_zncc[seed_node].to_bits(), seed_node));
 
         // --- Seed neighbours.
         let seed_p: Vec<f64> = p.row(seed_node).to_vec();
@@ -240,18 +236,21 @@ impl Mesh {
             &subsets,
             g_img,
             cfg,
-            &mut solved,
+            &mut stored,
             &mut c_zncc,
+            &mut queue,
             &mut p,
             &mut displacements,
             &mut iterations,
             &mut norms,
         )?;
 
-        // --- Reliability-guided queue: highest-C_ZNCC first.
-        // Priority queue of (solved, C_ZNCC×scale, node_idx) — max-heap.
-        while let Some(cur_idx) = next_queue_node(&solved, c_zncc.view()) {
-            solved[cur_idx] = true; // mark as propagated
+        // --- Reliability-guided queue: highest-C_ZNCC first (priority queue, lazy deletion).
+        while let Some((_, cur_idx)) = queue.pop() {
+            if propagated[cur_idx] {
+                continue; // stale entry
+            }
+            propagated[cur_idx] = true;
             let p_0: Vec<f64> = p.row(cur_idx).to_vec();
             self.solve_neighbours_from(
                 cur_idx,
@@ -259,8 +258,9 @@ impl Mesh {
                 &subsets,
                 g_img,
                 cfg,
-                &mut solved,
+                &mut stored,
                 &mut c_zncc,
+                &mut queue,
                 &mut p,
                 &mut displacements,
                 &mut iterations,
@@ -273,7 +273,7 @@ impl Mesh {
             &subsets,
             g_img,
             cfg,
-            &mut solved,
+            &mut stored,
             &mut c_zncc,
             &mut p,
             &mut displacements,
@@ -308,6 +308,8 @@ impl Mesh {
             subset_order: cfg.subset_order as u8,
             iterations,
             norms,
+            f_img_path: None,
+            g_img_path: None,
         })
     }
 
@@ -341,8 +343,9 @@ impl Mesh {
         subsets: &[Subset],
         g_img: &Image,
         cfg: &SolveConfig,
-        solved: &mut Vec<bool>,
+        stored: &mut Vec<bool>,
         c_zncc: &mut Array1<f64>,
+        queue: &mut BinaryHeap<(u64, usize)>,
         p: &mut Array2<f64>,
         displacements: &mut Array2<f64>,
         iterations: &mut Array1<u32>,
@@ -350,14 +353,15 @@ impl Mesh {
     ) -> Result<(), Error> {
         let neighbours = connectivity(&self.elements, self.mesh_order, cur_idx, false);
         for &nb_idx in &neighbours {
-            if solved[nb_idx] {
+            if stored[nb_idx] {
                 continue;
             }
             // Attempt 1: use current p_0 as-is (nearest-neighbour preconditioning).
             let r1 = self.solve_one(&subsets[nb_idx], g_img, p_0, cfg)?;
             if r1.c_zncc >= cfg.tolerance {
                 store_result(nb_idx, &r1, c_zncc, p, displacements, iterations, norms);
-                solved[nb_idx] = true;
+                stored[nb_idx] = true;
+                queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
                 continue;
             }
             // Attempt 2: projected preconditioning (Taylor expansion from cur_idx).
@@ -365,14 +369,16 @@ impl Mesh {
             let r2 = self.solve_one(&subsets[nb_idx], g_img, &p_proj, cfg)?;
             if r2.c_zncc >= cfg.tolerance {
                 store_result(nb_idx, &r2, c_zncc, p, displacements, iterations, norms);
-                solved[nb_idx] = true;
+                stored[nb_idx] = true;
+                queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
                 continue;
             }
             // Attempt 3: zero initial guess.
             let zeros = vec![0.0f64; p_0.len()];
             let r3 = self.solve_one(&subsets[nb_idx], g_img, &zeros, cfg)?;
             store_result(nb_idx, &r3, c_zncc, p, displacements, iterations, norms);
-            solved[nb_idx] = true;
+            stored[nb_idx] = true;
+            queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
         }
         Ok(())
     }
@@ -475,32 +481,23 @@ impl Mesh {
         Ok(())
     }
 
-    /// Compatibility check: reject mesh if any element has det(J) ≤ −1 (fold-over).
+    /// Compatibility check: reject mesh if any element has det(F) ≤ 0 (fold-over).
     fn check_compatibility(&self, warps: &Array2<f64>) -> Result<(), Error> {
         for e in 0..warps.nrows() {
-            // du/dx = warps[e,2]; dv/dy = warps[e,5]
-            if warps[[e, 2]] < -1.0 || warps[[e, 5]] < -1.0 {
+            let j00 = 1.0 + warps[[e, 2]]; // 1 + du/dx
+            let j01 =       warps[[e, 3]]; //     dv/dx
+            let j10 =       warps[[e, 4]]; //     du/dy
+            let j11 = 1.0 + warps[[e, 5]]; // 1 + dv/dy
+            let det = j00 * j11 - j01 * j10;
+            if det <= 0.0 {
                 let cx = self.nodes.slice(s![.., 0]).mean().unwrap_or(0.0);
                 let cy = self.nodes.slice(s![.., 1]).mean().unwrap_or(0.0);
                 return Err(Error::InvalidInput(format!(
-                    "mesh compatibility violated at element {e} near ({cx:.1},{cy:.1})"
+                    "mesh compatibility violated at element {e} near ({cx:.1},{cy:.1}): det(J)={det:.4}"
                 )));
             }
         }
         Ok(())
-    }
-
-    /// Adaptive remesh using element strain-area products.
-    ///
-    /// Mirrors `Mesh._adaptive_mesh`:
-    ///   `D[e] = |du/dx + dv/dy| * |area[e]|`
-    ///   `areas_new[e] = areas[e] * clip(D[e]/mean(D), α, 1/α)^-2`
-    pub fn adaptive_target_areas(
-        warps: &Array2<f64>,
-        areas: &Array1<f64>,
-        alpha: f64,
-    ) -> Array1<f64> {
-        adaptive_target_areas(warps, areas, alpha)
     }
 
     // -----------------------------------------------------------------------
@@ -924,12 +921,11 @@ fn r_stats(
         .map(|i| r_calc([displacements[[i, 0]], displacements[[i, 1]]]))
         .collect();
     let mut r_ids: HashSet<usize> = HashSet::new();
-    let step = if mesh_order == 2 { 2 } else { 1 };
     for e in 0..elements.nrows() {
         // Collect all neighbourhood nodes from corners of this element.
         let mut local: HashSet<usize> = HashSet::new();
-        for k in (0..3).step_by(1) {
-            let corner = elements[[e, k * step.min(elements.ncols() - 1)]];
+        for k in 0..3 {
+            let corner = elements[[e, k]];
             for nb in connectivity(elements, mesh_order, corner, true) {
                 local.insert(nb);
             }
@@ -951,33 +947,6 @@ fn r_stats(
         }
     }
     (r, r_ids)
-}
-
-/// Adaptive target areas from shear-strain × area products.
-///
-/// `D[e] = |warps[e,3] + warps[e,4]| * |areas[e]|`  (warps[3]=dv/dx, warps[4]=du/dy)
-/// `target[e] = areas[e] * clip(D[e] / mean(D), alpha, 1/alpha)^-2`
-pub fn adaptive_target_areas(
-    warps: &Array2<f64>,
-    areas: &Array1<f64>,
-    alpha: f64,
-) -> Array1<f64> {
-    let n = warps.nrows();
-    let d: Vec<f64> = (0..n)
-        .map(|e| (warps[[e, 3]] + warps[[e, 4]]).abs() * areas[e].abs())
-        .collect();
-    let d_mean: f64 = d.iter().sum::<f64>() / n as f64;
-    let inv_alpha = 1.0 / alpha;
-    (0..n)
-        .map(|e| {
-            let ratio = if d_mean > 0.0 {
-                (d[e] / d_mean).clamp(alpha, inv_alpha)
-            } else {
-                1.0
-            };
-            areas[e] * ratio.powi(-2)
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,8 +973,8 @@ fn project_warp(
         p_proj[1] += 0.5 * p[7] * dx * dx + p[9] * dx * dy + 0.5 * p[11] * dy * dy;
         p_proj[2] = p[2] + p[6] * dx + p[8] * dy;
         p_proj[3] = p[3] + p[7] * dx + p[9] * dy;
-        p_proj[4] = p[4] + p[8] * dy + p[10] * dy;
-        p_proj[5] = p[5] + p[9] * dy + p[11] * dy;
+        p_proj[4] = p[4] + p[8] * dx + p[10] * dy;
+        p_proj[5] = p[5] + p[9] * dx + p[11] * dy;
     }
     p_proj
 }
@@ -1030,32 +999,6 @@ fn store_result(
     norms[idx] = result.history.last().map(|h| h.1).unwrap_or(0.0);
 }
 
-/// Pick the next node to propagate from: highest `C_ZNCC × solved_flag`.
-/// Returns `None` when all nodes have been propagated (`solved[i] = true`
-/// after marking, or not yet solved but also not yet queued).
-///
-/// In practice we want the max over nodes that have been solved-but-not-propagated
-/// (i.e. `solved[i] == false` but have been stored by `solve_neighbours_from`).
-/// This mirrors `np.argmax(solved * C_ZNCC)` in the Python where `solved` starts at
-/// 0 and flips to 1 when stored.
-/// Pick the next node to propagate from: the unsolved node with highest C_ZNCC.
-/// A node is "ready to propagate" if it has c_zncc > 0 but hasn't been marked
-/// as propagated yet. Returns `None` when no such node exists.
-fn next_queue_node(solved: &[bool], c_zncc: ArrayView1<f64>) -> Option<usize> {
-    let mut best_idx = None;
-    let mut best_val = 0.0_f64; // strictly > 0 required to be "stored"
-    for (i, &is_propagated) in solved.iter().enumerate() {
-        if is_propagated {
-            continue;
-        }
-        let cv = c_zncc[i];
-        if cv > best_val {
-            best_val = cv;
-            best_idx = Some(i);
-        }
-    }
-    best_idx
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1322,31 +1265,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // adaptive_target_areas
+    // project_warp
     // -----------------------------------------------------------------------
 
     #[test]
-    fn adaptive_target_areas_uniform_shear_unchanged() {
-        // Uniform shear strain → D/mean(D) = 1 for all elements → clamp(1, α, 1/α) = 1 → target = area.
-        let warps = array![[0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                           [0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]];
-        let areas: Array1<f64> = array![2.0, 3.0];
-        let target = adaptive_target_areas(&warps, &areas, 0.5);
-        // D[0] = |0.5+0.5| * 2 = 2; D[1] = |0.5+0.5| * 3 = 3; mean = 2.5
-        // ratio[0] = clamp(2/2.5=0.8, 0.5, 2) = 0.8; target[0] = 2 * 0.8^-2 = 3.125
-        // ratio[1] = clamp(3/2.5=1.2, 0.5, 2) = 1.2; target[1] = 3 * 1.2^-2 = 2.083...
-        assert!((target[0] - 2.0 * 0.8f64.powi(-2)).abs() < 1e-10);
-        assert!((target[1] - 3.0 * 1.2f64.powi(-2)).abs() < 1e-10);
+    fn project_warp_second_order_terms() {
+        // u = x*y: du/dy=1, d2u/dxdy=1, all others zero.
+        // Shift by dx=2, dy=3. Expected du/dy_new = 1 + 1*2 + 0*3 = 3.
+        let mut p = vec![0.0f64; 12];
+        p[4] = 1.0; // du/dy
+        p[8] = 1.0; // d2u/dxdy
+        let nodes = array![[0.0, 0.0], [2.0, 3.0]];
+        let p_proj = project_warp(&p, &nodes, 0, 1);
+        assert!((p_proj[4] - 3.0).abs() < 1e-12, "du/dy projected: {}", p_proj[4]);
     }
 
-    #[test]
-    fn adaptive_target_areas_zero_shear_stays_original() {
-        // Zero shear → D_mean = 0 → ratio = 1 → target = area.
-        let warps = Array2::<f64>::zeros((3, 12));
-        let areas: Array1<f64> = array![1.0, 2.0, 3.0];
-        let target = adaptive_target_areas(&warps, &areas, 0.5);
-        for (t, a) in target.iter().zip(areas.iter()) {
-            assert!((t - a).abs() < 1e-12);
-        }
-    }
 }

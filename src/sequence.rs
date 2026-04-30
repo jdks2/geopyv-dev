@@ -27,6 +27,7 @@
 //! - `load` / `save_by_reference` file management
 //! - `SequenceResults.regenerate` — high-level deserialization; deferred to io.rs
 //! - GUI selectors (`gp.gui.selectors.coordinate.CoordinateSelector`)
+//! - Adaptive remeshing — deferred; use `adaptive_iterations=0`
 
 use std::path::PathBuf;
 
@@ -34,9 +35,8 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    geometry::triangulation,
     image::Image,
-    mesh::{adaptive_target_areas, Mesh, MeshSolution, SolveConfig},
+    mesh::{Mesh, MeshSolution, SolveConfig},
     particle::{MeshData, Particle},
     Error,
 };
@@ -74,10 +74,6 @@ pub struct SequenceSolveConfig {
     pub seed_coord: [f64; 2],
     /// Initial seed warp vector (length ≤ 12, zero-padded to 12 internally).
     pub seed_warp: Vec<f64>,
-    /// Number of adaptive-remesh iterations per pair.
-    pub adaptive_iterations: usize,
-    /// Adaptivity control parameter α (must be in (0, 1)).
-    pub alpha: f64,
     /// Apply particle-based warp preconditioning between pairs.
     pub guide: bool,
     /// Advance reference image after each successful solve (cumulative mode).
@@ -97,8 +93,6 @@ impl Default for SequenceSolveConfig {
             template_coords: Array2::zeros((0, 2)),
             seed_coord: [0.0, 0.0],
             seed_warp: vec![0.0; 12],
-            adaptive_iterations: 0,
-            alpha: 0.5,
             guide: true,
             sequential: false,
             sync: true,
@@ -211,12 +205,6 @@ impl Sequence {
         'outer: loop {
             // --- Build mesh for this pair. ----------------------------------
             // In sync mode, reuse previous pair's geometry when available.
-            let adaptive_iters = if cfg.sync && sync_sol.is_some() {
-                0 // geometry is fixed; adaptive remesh would change node count
-            } else {
-                cfg.adaptive_iterations
-            };
-
             let mesh = match (cfg.sync, &sync_sol) {
                 (true, Some(prev)) => Mesh::from_solution(prev),
                 _ => self.generate_mesh()?,
@@ -232,18 +220,14 @@ impl Sequence {
                 cfg.mesh_cfg.clone()
             };
 
-            // --- Solve this pair (with optional adaptive remesh). -----------
-            let pair_result = solve_pair_adaptive(
-                mesh,
+            // --- Solve this pair. ------------------------------------------
+            let pair_result = mesh.solve(
                 &f_img,
                 &g_img,
                 &cfg.template_coords,
                 seed_coord,
                 &seed_warp,
                 &pair_cfg,
-                adaptive_iters,
-                cfg.alpha,
-                &self.mesh_cfg,
             );
 
             let mesh_sol = match pair_result {
@@ -349,50 +333,6 @@ impl Sequence {
             self.mesh_cfg.mesh_order,
         )
     }
-}
-
-// ---------------------------------------------------------------------------
-// solve_pair_adaptive — free function
-// ---------------------------------------------------------------------------
-
-/// Run the DIC solver for one image pair with optional adaptive remesh.
-///
-/// On each iteration: solve the current mesh; compute adaptive target areas;
-/// regenerate via CDT; repeat.
-#[allow(clippy::too_many_arguments)]
-fn solve_pair_adaptive(
-    mesh: Mesh,
-    f_img: &Image,
-    g_img: &Image,
-    template_coords: &Array2<f64>,
-    seed_coord: [f64; 2],
-    seed_warp: &[f64],
-    cfg: &SolveConfig,
-    adaptive_iterations: usize,
-    alpha: f64,
-    mesh_cfg: &SequenceMeshConfig,
-) -> Result<MeshSolution, Error> {
-    let mut current_mesh = mesh;
-    let mut sol = current_mesh.solve(f_img, g_img, template_coords, seed_coord, seed_warp, cfg)?;
-
-    for _ in 0..adaptive_iterations {
-        let target_areas = adaptive_target_areas(&sol.warps, &sol.areas, alpha);
-        let new_trimesh = triangulation::adaptive_remesh(
-            sol.nodes.view(),
-            sol.elements.view(),
-            target_areas.view(),
-            mesh_cfg.borders.view(),
-            mesh_cfg.segments.view(),
-            &mesh_cfg.curves,
-            mesh_cfg.size_lower,
-            mesh_cfg.target_nodes,
-            mesh_cfg.mesh_order,
-        )?;
-        current_mesh = Mesh::from_trimesh(new_trimesh);
-        sol = current_mesh.solve(f_img, g_img, template_coords, seed_coord, seed_warp, cfg)?;
-    }
-
-    Ok(sol)
 }
 
 // ---------------------------------------------------------------------------
@@ -619,6 +559,8 @@ mod tests {
             subset_order: 1,
             iterations: Array1::zeros(n),
             norms: Array1::zeros(n),
+            f_img_path: None,
+            g_img_path: None,
         }
     }
 

@@ -53,7 +53,7 @@ pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
 pub fn load(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     let obj = io::load(path).map_err(Error::from)?;
     match obj {
-        GeopyvObject::Mesh(m) => Ok(PyMeshSolution { inner: m, f_img_path: None, g_img_path: None }.into_py(py)),
+        GeopyvObject::Mesh(m) => Ok(PyMeshSolution { inner: m }.into_py(py)),
         GeopyvObject::Field(f) => Ok(PyFieldSolution { inner: f, image_0_path: None }.into_py(py)),
         GeopyvObject::Sequence(s) => Ok(PySequenceSolution { inner: s }.into_py(py)),
         GeopyvObject::Subset(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(

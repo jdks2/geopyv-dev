@@ -2,36 +2,36 @@ import glob
 import numpy as np
 import geopyv_dev as gp
 
-# ---------------------------------------------------------------------------
-# Subset test
-# ---------------------------------------------------------------------------
-# Setup.
+# # ---------------------------------------------------------------------------
+# # Subset test
+# # ---------------------------------------------------------------------------
+# # Setup.
 ref = gp.Image(filepath="images/comp/compression_0.jpg")
 tar = gp.Image(filepath="images/comp/compression_1.jpg")
 template = gp.Template("circle", size=50)
-
-# Subset instantiation.
-subset = gp.Subset(
-    coord=[500.0, 500.0],
-    template=template,
-    f_img=ref,
-    f_img_path=ref.filepath,
-)
-
-# Subset inspection.
-print(subset)
-print(f"  n_px={subset.n_px}, sssig={subset.sssig:.4f}")
-subset.inspect()
-
-# Subset solving via unified solve() dispatcher.
-result = subset.solve(g_img=tar, p_0=[0.0] * 6, algorithm="icgn")
-print(f"  C_ZNCC={result['c_zncc']:.4f}, converged={result['converged']}, "
-      f"iterations={result['iterations']}")
-subset.convergence()
-# ---------------------------------------------------------------------------
-# Mesh test
-# ---------------------------------------------------------------------------
-# ROI definition (boundary polygon → borders/segments/curves arrays).
+# 
+# # Subset instantiation.
+# subset = gp.Subset(
+#     coord=[500.0, 500.0],
+#     template=template,
+#     f_img=ref,
+#     f_img_path=ref.filepath,
+# )
+# 
+# # Subset inspection.
+# print(subset)
+# print(f"  n_px={subset.n_px}, sssig={subset.sssig:.4f}")
+# subset.inspect()
+# 
+# # Subset solving via unified solve() dispatcher.
+# result = subset.solve(g_img=tar, p_0=[0.0] * 6, algorithm="icgn")
+# print(f"  C_ZNCC={result['c_zncc']:.4f}, converged={result['converged']}, "
+#       f"iterations={result['iterations']}")
+# subset.convergence()
+# # ---------------------------------------------------------------------------
+# # Mesh test
+# # ---------------------------------------------------------------------------
+# # ROI definition (boundary polygon → borders/segments/curves arrays).
 boundary_nodes = np.array(
     [[200.0, 200.0], [200.0, 800.0], [800.0, 800.0], [800.0, 200.0]]
 )
@@ -82,7 +82,7 @@ mesh_sol = gp.load("mesh.pyv")
 print(f"Loaded: {mesh_sol}")
 
 # Mesh plots.
-mesh_sol.inspect()
+mesh_sol.inspect(alpha = 0.5)
 mesh_sol.inspect(show_areas=True)
 mesh_sol.convergence()
 mesh_sol.convergence(quantity="iterations")

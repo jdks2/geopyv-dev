@@ -38,7 +38,7 @@ impl PySequenceSolution {
         self.inner
             .mesh_solutions
             .iter()
-            .map(|s| PyMeshSolution { inner: s.clone(), f_img_path: None, g_img_path: None })
+            .map(|s| PyMeshSolution { inner: s.clone() })
             .collect()
     }
 
@@ -148,10 +148,6 @@ impl PySequence {
     ///     Minimum acceptable C_ZNCC. Default 0.75.
     /// method : str, optional
     ///     ``"icgn"`` (default) or ``"fagn"``.
-    /// adaptive_iterations : int, optional
-    ///     Adaptive remesh iterations per pair. Default 0.
-    /// alpha : float, optional
-    ///     Adaptive sizing control parameter α ∈ (0, 1). Default 0.5.
     /// guide : bool, optional
     ///     Particle-based warp preconditioning between pairs. Default ``True``.
     /// sequential : bool, optional
@@ -169,7 +165,6 @@ impl PySequence {
     #[pyo3(signature = (template, seed_coord, seed_warp,
                          max_norm=1e-5, max_iterations=50, subset_order=1,
                          tolerance=0.75, method="icgn",
-                         adaptive_iterations=0, alpha=0.5,
                          guide=true, sequential=false, sync=true,
                          override_=false, border=20))]
     #[allow(clippy::too_many_arguments)]
@@ -183,8 +178,6 @@ impl PySequence {
         subset_order: usize,
         tolerance: f64,
         method: &str,
-        adaptive_iterations: usize,
-        alpha: f64,
         guide: bool,
         sequential: bool,
         sync: bool,
@@ -211,8 +204,6 @@ impl PySequence {
             template_coords,
             seed_coord,
             seed_warp,
-            adaptive_iterations,
-            alpha,
             guide,
             sequential,
             sync,

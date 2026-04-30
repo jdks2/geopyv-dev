@@ -94,7 +94,6 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, show=True, block=True,
     f_img_path = getattr(mesh, 'f_img_path', None)
 
     fig, ax = plt.subplots()
-
     imshow_kwargs = {"cmap": "gist_gray"}
     imshow_kwargs.update(kwargs)
     _imshow_or_blank(ax, f_img_path, **imshow_kwargs)

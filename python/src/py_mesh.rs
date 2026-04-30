@@ -128,11 +128,13 @@ impl PyMesh {
         let tmpl = template
             .extract::<PyRef<'_, PyTemplate>>()
             .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
-        let sol = self
+        let mut sol = self
             .inner
             .solve(&f_img.inner, &g_img.inner, &tmpl.inner.coords, seed_coord, &seed_warp, &cfg)
             .map_err(Error::from)?;
-        Ok(PyMeshSolution { inner: sol, f_img_path: f_path, g_img_path: g_path })
+        sol.f_img_path = f_path;
+        sol.g_img_path = g_path;
+        Ok(PyMeshSolution { inner: sol })
     }
 
     /// Node coordinates, shape ``(N, 2)``.
@@ -188,8 +190,6 @@ impl PyMesh {
 #[pyclass(name = "MeshSolution")]
 pub struct PyMeshSolution {
     pub(crate) inner: MeshSolution,
-    pub(crate) f_img_path: Option<String>,
-    pub(crate) g_img_path: Option<String>,
 }
 
 #[pymethods]
@@ -240,9 +240,9 @@ impl PyMeshSolution {
                 subset_order,
                 iterations: Array1::<u32>::zeros(n_nodes),
                 norms: Array1::<f64>::zeros(n_nodes),
+                f_img_path,
+                g_img_path,
             },
-            f_img_path,
-            g_img_path,
         }
     }
 
@@ -326,13 +326,13 @@ impl PyMeshSolution {
     /// Reference image file path, or ``None``.
     #[getter]
     fn f_img_path(&self) -> Option<String> {
-        self.f_img_path.clone()
+        self.inner.f_img_path.clone()
     }
 
     /// Target image file path, or ``None``.
     #[getter]
     fn g_img_path(&self) -> Option<String> {
-        self.g_img_path.clone()
+        self.inner.g_img_path.clone()
     }
 
     /// Per-node iteration counts ``(N,)``.
@@ -576,33 +576,6 @@ fn mesh_r_calc(displacement: [f64; 2]) -> f64 {
     mesh::r_calc(displacement)
 }
 
-/// Compute adaptive target areas from shear-strain × area products.
-///
-/// ``D[e] = |warps[e,3] + warps[e,4]| * |areas[e]|``
-///
-/// ``target[e] = areas[e] * clip(D[e] / mean(D), alpha, 1/alpha)^-2``
-///
-/// Parameters
-/// ----------
-/// warps : numpy.ndarray, shape (M, 12), float64
-/// areas : numpy.ndarray, shape (M,), float64
-/// alpha : float
-///
-/// Returns
-/// -------
-/// numpy.ndarray, shape (M,), float64
-#[pyfunction]
-fn mesh_adaptive_target_areas<'py>(
-    py: Python<'py>,
-    warps: PyReadonlyArray2<f64>,
-    areas: PyReadonlyArray1<f64>,
-    alpha: f64,
-) -> Bound<'py, PyArray1<f64>> {
-    let w = warps.as_array().to_owned();
-    let a = areas.as_array().to_owned();
-    mesh::adaptive_target_areas(&w, &a, alpha).into_pyarray_bound(py)
-}
-
 // ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
@@ -618,6 +591,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mesh_corr, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_flow_calc, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_r_calc, m)?)?;
-    m.add_function(wrap_pyfunction!(mesh_adaptive_target_areas, m)?)?;
     Ok(())
 }

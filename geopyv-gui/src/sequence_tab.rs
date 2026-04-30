@@ -7,10 +7,9 @@ use eframe::egui;
 use ndarray::Array2;
 
 use geopyv_dev::geometry::meshing::define_roi;
-use geopyv_dev::geometry::triangulation;
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::mesh::{adaptive_target_areas, Mesh, MeshSolution, SolveConfig};
+use geopyv_dev::mesh::{Mesh, MeshSolution, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::sequence::{deformation_preconditioning, SequenceSolution};
 use geopyv_dev::templates::{Template, TemplateShape};
@@ -23,7 +22,6 @@ use crate::mesh_tab::{
     render_mesh_overlay, MeshGenConfig, MeshOrder, MeshPlotType, RangeMode,
 };
 use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
-use crate::template::TemplateConfig;
 
 // ---------------------------------------------------------------------------
 // Reference mode
@@ -41,10 +39,6 @@ pub enum ReferenceMode {
 // ---------------------------------------------------------------------------
 
 pub struct SequenceOptions {
-    pub adaptive_iters_text: String,
-    pub adaptive_iters: usize,
-    pub alpha_text: String,
-    pub alpha: f64,
     pub guide: bool,
     pub sequential: bool,
     pub sync: bool,
@@ -57,10 +51,6 @@ pub struct SequenceOptions {
 impl Default for SequenceOptions {
     fn default() -> Self {
         Self {
-            adaptive_iters_text: "3".to_string(),
-            adaptive_iters: 3,
-            alpha_text: "0.5".to_string(),
-            alpha: 0.5,
             guide: true,
             sequential: true,
             sync: true,
@@ -82,7 +72,10 @@ pub struct NewSequenceForm {
     pub start_idx: Option<usize>,
     pub end_text: String,
     pub end_idx: Option<usize>,
-    pub template_idx: Option<usize>,
+    pub template_shape: TemplateShape,
+    pub template_size_text: String,
+    pub template_size: u32,
+    pub template_size_error: Option<String>,
     pub gen_cfg: MeshGenConfig,
     pub solver: SolverConfig,
     pub seq_opts: SequenceOptions,
@@ -98,7 +91,10 @@ impl Default for NewSequenceForm {
             start_idx: None,
             end_text: String::new(),
             end_idx: None,
-            template_idx: None,
+            template_shape: TemplateShape::Circle,
+            template_size_text: "20".to_string(),
+            template_size: 20,
+            template_size_error: None,
             gen_cfg: MeshGenConfig::default(),
             solver: SolverConfig::default(),
             seq_opts: SequenceOptions::default(),
@@ -109,7 +105,7 @@ impl Default for NewSequenceForm {
 }
 
 impl NewSequenceForm {
-    fn can_run(&self, images: &[PathBuf], templates: &[PathBuf]) -> bool {
+    fn can_run(&self, images: &[PathBuf]) -> bool {
         let name_ok = !self.name.trim().is_empty()
             && !self.name.contains('/')
             && !self.name.contains('\\');
@@ -117,10 +113,12 @@ impl NewSequenceForm {
             (Some(s), Some(e)) => s < images.len() && e < images.len() && e > s,
             _ => false,
         };
-        let tmpl_ok = self.template_idx.map(|i| i < templates.len()).unwrap_or(false);
+        let template_ok = !self.template_size_text.trim().is_empty()
+            && self.template_size > 0
+            && self.template_size_error.is_none();
         name_ok
             && range_ok
-            && tmpl_ok
+            && template_ok
             && self.draw.boundary_ok()
             && !self.draw.has_self_intersection()
             && self.draw.seed_ok()
@@ -212,7 +210,8 @@ impl SequenceSolveState {
 pub struct SequenceSpawnParams {
     pub name: String,
     pub image_paths: Vec<PathBuf>,
-    pub template_path: PathBuf,
+    pub template_shape: TemplateShape,
+    pub template_size: u32,
     pub boundary: Vec<[f64; 2]>,
     pub exclusions: Vec<Vec<[f64; 2]>>,
     pub seed: [f64; 2],
@@ -225,8 +224,6 @@ pub struct SequenceSpawnParams {
     pub max_norm: f64,
     pub max_iterations: usize,
     pub zncc_tol: f64,
-    pub adaptive_iters: usize,
-    pub alpha: f64,
     pub guide: bool,
     pub sequential: bool,
     pub sync: bool,
@@ -929,7 +926,6 @@ impl SequenceTabState {
         &mut self,
         ui: &mut egui::Ui,
         images: &[PathBuf],
-        templates: &[PathBuf],
     ) -> Option<SequenceSpawnParams> {
         if self.is_solving() {
             let (progress, message) = {
@@ -990,28 +986,64 @@ impl SequenceTabState {
                 ui.label(lbl("Name:"));
                 ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(150.0));
                 ui.end_row();
+            });
 
-                ui.label(lbl("Template:"));
-                let tmpl_label = form
-                    .template_idx
-                    .and_then(|i| templates.get(i))
-                    .and_then(|p| p.file_stem())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                egui::ComboBox::from_id_salt("seq_tmpl")
-                    .selected_text(&tmpl_label)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for (i, p) in templates.iter().enumerate() {
-                            let name = p
-                                .file_stem()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            ui.selectable_value(&mut form.template_idx, Some(i), name);
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Template section.
+        section_header(ui, "Template");
+        ui.add_space(4.0);
+
+        egui::Grid::new("seq_template_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .min_col_width(72.0)
+            .show(ui, |ui| {
+                ui.label(lbl("Shape:"));
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut form.template_shape, TemplateShape::Circle, "Circle");
+                    ui.radio_value(&mut form.template_shape, TemplateShape::Square, "Square");
+                });
+                ui.end_row();
+
+                ui.label(lbl("Size (px):"));
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut form.template_size_text).desired_width(80.0),
+                );
+                if resp.changed() {
+                    let s = form.template_size_text.trim().to_string();
+                    if s.is_empty() {
+                        form.template_size_error = None;
+                    } else {
+                        match s.parse::<u32>() {
+                            Ok(0) => {
+                                form.template_size_error =
+                                    Some("Size must be \u{2265} 1".to_string())
+                            }
+                            Ok(v) => {
+                                form.template_size = v;
+                                form.template_size_error = None;
+                            }
+                            Err(_) => {
+                                form.template_size_error =
+                                    Some("Enter a positive integer".to_string())
+                            }
                         }
-                    });
+                    }
+                }
                 ui.end_row();
             });
+
+        if let Some(err) = &form.template_size_error.clone() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .size(11.0)
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
 
         ui.add_space(4.0);
 
@@ -1248,37 +1280,6 @@ impl SequenceTabState {
                 .spacing([8.0, 4.0])
                 .min_col_width(72.0)
                 .show(ui, |ui| {
-                    ui.label(lbl("Adaptive iters:"));
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut o.adaptive_iters_text)
-                            .desired_width(60.0),
-                    );
-                    if r.changed() {
-                        match o.adaptive_iters_text.trim().parse::<usize>() {
-                            Ok(v) => {
-                                o.adaptive_iters = v;
-                                o.parse_error = None;
-                            }
-                            _ => o.parse_error = Some("Must be a non-negative integer".into()),
-                        }
-                    }
-                    ui.end_row();
-
-                    ui.label(lbl("Alpha:"));
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut o.alpha_text).desired_width(60.0),
-                    );
-                    if r.changed() {
-                        match o.alpha_text.trim().parse::<f64>() {
-                            Ok(v) if v > 0.0 && v < 1.0 => {
-                                o.alpha = v;
-                                o.parse_error = None;
-                            }
-                            _ => o.parse_error = Some("Alpha must be in (0, 1)".into()),
-                        }
-                    }
-                    ui.end_row();
-
                     ui.label(lbl("Border (px):"));
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut o.border_text).desired_width(60.0),
@@ -1432,7 +1433,7 @@ impl SequenceTabState {
             ui.add_space(4.0);
         }
 
-        let can_run = form.can_run(images, templates);
+        let can_run = form.can_run(images);
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             if ui
@@ -1461,7 +1462,8 @@ impl SequenceTabState {
                 spawn = Some(SequenceSpawnParams {
                     name: form.name.trim().to_string(),
                     image_paths,
-                    template_path: templates[form.template_idx.unwrap()].clone(),
+                    template_shape: form.template_shape.clone(),
+                    template_size: form.template_size,
                     boundary,
                     exclusions,
                     seed: [seed.x as f64, seed.y as f64],
@@ -1478,8 +1480,6 @@ impl SequenceTabState {
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
-                    adaptive_iters: form.seq_opts.adaptive_iters,
-                    alpha: form.seq_opts.alpha,
                     guide: form.seq_opts.guide,
                     sequential: form.seq_opts.sequential,
                     sync: form.seq_opts.sync,
@@ -1575,18 +1575,11 @@ fn run_solve(
     state: Arc<Mutex<SequenceSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    // Load template.
-    set_progress(&state, 0.02, "Loading template\u{2026}");
-    let tmpl_config = match TemplateConfig::load(&params.template_path) {
-        Ok(c) => c,
-        Err(e) => {
-            set_error(&state, format!("Template load error: {e}"));
-            return;
-        }
-    };
-    let template = match tmpl_config.shape {
-        TemplateShape::Circle => Template::circle(tmpl_config.size as usize),
-        TemplateShape::Square => Template::square(tmpl_config.size as usize),
+    // Build template.
+    set_progress(&state, 0.02, "Building template\u{2026}");
+    let template = match params.template_shape {
+        TemplateShape::Circle => Template::circle(params.template_size as usize),
+        TemplateShape::Square => Template::square(params.template_size as usize),
     };
     let template = match template {
         Ok(t) => t,
@@ -1724,24 +1717,14 @@ fn run_solve(
             mesh_cfg.clone()
         };
 
-        // Solve this pair (with optional adaptive remesh).
-        let pair_result = solve_pair_adaptive(
-            mesh,
+        // Solve this pair.
+        let pair_result = mesh.solve(
             &f_img,
             &g_img,
             &template.coords,
             seed_coord,
             &seed_warp,
             &pair_cfg,
-            params.adaptive_iters,
-            params.alpha,
-            roi.borders.view(),
-            roi.segments.view(),
-            &roi.curves,
-            params.size_lower,
-            params.size_upper,
-            params.target_nodes,
-            params.mesh_order,
         );
 
         let mesh_sol = match pair_result {
@@ -1877,51 +1860,6 @@ fn save_frames_and_sequence(
         s.result = Some(Ok(sol.clone()));
         s.running = false;
     }
-}
-
-/// Solve one image pair with optional adaptive remesh iterations.
-#[allow(clippy::too_many_arguments)]
-fn solve_pair_adaptive(
-    mesh: Mesh,
-    f_img: &Image,
-    g_img: &Image,
-    template_coords: &ndarray::Array2<f64>,
-    seed_coord: [f64; 2],
-    seed_warp: &[f64],
-    cfg: &SolveConfig,
-    adaptive_iters: usize,
-    alpha: f64,
-    borders: ndarray::ArrayView2<f64>,
-    segments: ndarray::ArrayView2<i32>,
-    curves: &[Vec<i32>],
-    size_lower: f64,
-    _size_upper: f64,
-    target_nodes: usize,
-    mesh_order: u8,
-) -> Result<MeshSolution, geopyv_dev::Error> {
-    let mut current_mesh = mesh;
-    let mut sol =
-        current_mesh.solve(f_img, g_img, template_coords, seed_coord, seed_warp, cfg)?;
-
-    for _ in 0..adaptive_iters {
-        let target_areas = adaptive_target_areas(&sol.warps, &sol.areas, alpha);
-        let new_trimesh = triangulation::adaptive_remesh(
-            sol.nodes.view(),
-            sol.elements.view(),
-            target_areas.view(),
-            borders,
-            segments,
-            curves,
-            size_lower,
-            target_nodes,
-            mesh_order,
-        )?;
-        current_mesh = Mesh::from_trimesh(new_trimesh);
-        sol =
-            current_mesh.solve(f_img, g_img, template_coords, seed_coord, seed_warp, cfg)?;
-    }
-
-    Ok(sol)
 }
 
 // ---------------------------------------------------------------------------

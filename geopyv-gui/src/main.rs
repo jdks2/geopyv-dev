@@ -10,7 +10,6 @@ mod project;
 mod recent;
 mod sequence_tab;
 mod subset_tab;
-mod template;
 
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {

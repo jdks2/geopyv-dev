@@ -65,7 +65,6 @@ pub struct ProjectMeta {
 const SUBDIRS: &[&str] = &[
     "Images/Data",
     "Images/Calibration",
-    "Templates",
     "Subsets",
     "Meshes",
     "Sequences",
@@ -144,10 +143,6 @@ impl Project {
         self.root.join("Images/Data")
     }
 
-    pub fn templates_dir(&self) -> PathBuf {
-        self.root.join("Templates")
-    }
-
     pub fn subsets_dir(&self) -> PathBuf {
         self.root.join("Subsets")
     }
@@ -179,11 +174,6 @@ impl Project {
     /// Sorted lexicographic list of image files in `/Images/Data/`.
     pub fn list_images(&self) -> Vec<PathBuf> {
         list_files_with_exts(&self.images_data_dir(), &["jpg", "jpeg", "png", "tif", "tiff"])
-    }
-
-    /// Sorted list of template `.json` files in `/Templates/`.
-    pub fn list_templates(&self) -> Vec<PathBuf> {
-        list_files_with_exts(&self.templates_dir(), &["json"])
     }
 
     /// Sorted list of `.pyv` files in `/Subsets/`.

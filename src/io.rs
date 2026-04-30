@@ -144,6 +144,8 @@ mod tests {
             subset_order: 1,
             iterations: ndarray::array![0u32, 0, 0],
             norms: ndarray::array![0.0_f64, 0.0, 0.0],
+            f_img_path: None,
+            g_img_path: None,
         }
     }
 

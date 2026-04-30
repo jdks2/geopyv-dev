@@ -16,7 +16,6 @@ use crate::colormap::{self, ColormapType};
 use crate::draw::{ActiveDrawMode, ImageCoord};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
 use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
-use crate::template::TemplateConfig;
 
 // ---------------------------------------------------------------------------
 // Mesh generation config
@@ -121,7 +120,10 @@ pub struct NewMeshForm {
     pub name: String,
     pub ref_idx: Option<usize>,
     pub target_idx: Option<usize>,
-    pub template_idx: Option<usize>,
+    pub template_shape: TemplateShape,
+    pub template_size_text: String,
+    pub template_size: u32,
+    pub template_size_error: Option<String>,
     pub gen_cfg: MeshGenConfig,
     pub solver: SolverConfig,
     pub draw: crate::draw::DrawState,
@@ -134,7 +136,10 @@ impl Default for NewMeshForm {
             name: String::new(),
             ref_idx: None,
             target_idx: None,
-            template_idx: None,
+            template_shape: TemplateShape::Circle,
+            template_size_text: "20".to_string(),
+            template_size: 20,
+            template_size_error: None,
             gen_cfg: MeshGenConfig::default(),
             solver: SolverConfig::default(),
             draw: crate::draw::DrawState::new(),
@@ -144,17 +149,19 @@ impl Default for NewMeshForm {
 }
 
 impl NewMeshForm {
-    fn can_run(&self, images: &[PathBuf], templates: &[PathBuf]) -> bool {
+    fn can_run(&self, images: &[PathBuf]) -> bool {
         let name_ok = !self.name.trim().is_empty()
             && !self.name.contains('/')
             && !self.name.contains('\\');
         let ref_ok = self.ref_idx.map(|i| i < images.len()).unwrap_or(false);
         let tar_ok = self.target_idx.map(|i| i < images.len()).unwrap_or(false);
-        let tmpl_ok = self.template_idx.map(|i| i < templates.len()).unwrap_or(false);
+        let template_ok = !self.template_size_text.trim().is_empty()
+            && self.template_size > 0
+            && self.template_size_error.is_none();
         name_ok
             && ref_ok
             && tar_ok
-            && tmpl_ok
+            && template_ok
             && self.draw.boundary_ok()
             && !self.draw.has_self_intersection()
             && self.draw.seed_ok()
@@ -237,7 +244,8 @@ pub struct MeshSpawnParams {
     pub name: String,
     pub ref_path: PathBuf,
     pub target_path: PathBuf,
-    pub template_path: PathBuf,
+    pub template_shape: TemplateShape,
+    pub template_size: u32,
     pub boundary: Vec<[f64; 2]>,
     pub exclusions: Vec<Vec<[f64; 2]>>,
     pub seed: [f64; 2],
@@ -762,7 +770,6 @@ impl MeshTabState {
         &mut self,
         ui: &mut egui::Ui,
         images: &[PathBuf],
-        templates: &[PathBuf],
     ) -> Option<MeshSpawnParams> {
         if self.is_solving() {
             return self.show_solve_progress_panel(ui);
@@ -834,32 +841,72 @@ impl MeshTabState {
                         }
                     });
                 ui.end_row();
+            });
 
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Template section.
+        section_header(ui, "Template");
+        ui.add_space(4.0);
+
+        egui::Grid::new("mesh_template_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .min_col_width(72.0)
+            .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Template:")
+                    egui::RichText::new("Shape:")
                         .size(12.0)
                         .color(ui.visuals().weak_text_color()),
                 );
-                let tmpl_label = form
-                    .template_idx
-                    .and_then(|i| templates.get(i))
-                    .and_then(|p| p.file_stem())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                egui::ComboBox::from_id_salt("mesh_tmpl")
-                    .selected_text(&tmpl_label)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for (i, p) in templates.iter().enumerate() {
-                            let name = p
-                                .file_stem()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            ui.selectable_value(&mut form.template_idx, Some(i), name);
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut form.template_shape, TemplateShape::Circle, "Circle");
+                    ui.radio_value(&mut form.template_shape, TemplateShape::Square, "Square");
+                });
+                ui.end_row();
+
+                ui.label(
+                    egui::RichText::new("Size (px):")
+                        .size(12.0)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut form.template_size_text).desired_width(80.0),
+                );
+                if resp.changed() {
+                    let s = form.template_size_text.trim().to_string();
+                    if s.is_empty() {
+                        form.template_size_error = None;
+                    } else {
+                        match s.parse::<u32>() {
+                            Ok(0) => {
+                                form.template_size_error =
+                                    Some("Size must be \u{2265} 1".to_string())
+                            }
+                            Ok(v) => {
+                                form.template_size = v;
+                                form.template_size_error = None;
+                            }
+                            Err(_) => {
+                                form.template_size_error =
+                                    Some("Enter a positive integer".to_string())
+                            }
                         }
-                    });
+                    }
+                }
                 ui.end_row();
             });
+
+        if let Some(err) = &form.template_size_error.clone() {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .size(11.0)
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -1139,7 +1186,7 @@ impl MeshTabState {
             ui.add_space(4.0);
         }
 
-        let can_run = form.can_run(images, templates);
+        let can_run = form.can_run(images);
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             if ui
@@ -1166,7 +1213,8 @@ impl MeshTabState {
                     name: form.name.trim().to_string(),
                     ref_path: images[form.ref_idx.unwrap()].clone(),
                     target_path: images[form.target_idx.unwrap()].clone(),
-                    template_path: templates[form.template_idx.unwrap()].clone(),
+                    template_shape: form.template_shape.clone(),
+                    template_size: form.template_size,
                     boundary,
                     exclusions,
                     seed: [seed.x as f64, seed.y as f64],
@@ -1263,17 +1311,10 @@ fn run_solve(
     state: Arc<Mutex<MeshSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    set_progress(&state, 0.05, "Loading template\u{2026}");
-    let tmpl_config = match TemplateConfig::load(&params.template_path) {
-        Ok(c) => c,
-        Err(e) => {
-            set_error(&state, format!("Template load error: {e}"));
-            return;
-        }
-    };
-    let template = match tmpl_config.shape {
-        TemplateShape::Circle => Template::circle(tmpl_config.size as usize),
-        TemplateShape::Square => Template::square(tmpl_config.size as usize),
+    set_progress(&state, 0.05, "Building template\u{2026}");
+    let template = match params.template_shape {
+        TemplateShape::Circle => Template::circle(params.template_size as usize),
+        TemplateShape::Square => Template::square(params.template_size as usize),
     };
     let template = match template {
         Ok(t) => t,
@@ -1537,7 +1578,7 @@ pub fn render_mesh_overlay(
     for i in 0..n_nodes {
         mesh.vertices.push(egui::epaint::Vertex {
             pos: positions[i],
-            uv: egui::pos2(1.0, 1.0), // white pixel in the font atlas
+            uv: egui::epaint::WHITE_UV,
             color: colors[i],
         });
     }
