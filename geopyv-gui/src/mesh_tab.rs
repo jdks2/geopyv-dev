@@ -13,7 +13,7 @@ use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::templates::{Template, TemplateShape};
 
 use crate::colormap::{self, ColormapType};
-use crate::draw::{ActiveDrawMode, ImageCoord};
+use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
 use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
 
@@ -113,6 +113,18 @@ pub enum RangeMode {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh view pane
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshViewPane {
+    #[default]
+    Displacements,
+    Strains,
+    Quality,
+}
+
+// ---------------------------------------------------------------------------
 // New mesh form state
 // ---------------------------------------------------------------------------
 
@@ -178,6 +190,7 @@ pub struct MeshViewState {
     pub loaded_path: Option<PathBuf>,
     pub solution: Option<MeshSolution>,
     pub target_image: Option<PathBuf>,
+    pub active_pane: MeshViewPane,
     pub plot_type: MeshPlotType,
     pub colormap: ColormapType,
     pub range_mode: RangeMode,
@@ -197,6 +210,7 @@ impl MeshViewState {
             loaded_path: None,
             solution: None,
             target_image: None,
+            active_pane: MeshViewPane::default(),
             plot_type: MeshPlotType::default(),
             colormap: ColormapType::default(),
             range_mode: RangeMode::Auto,
@@ -350,11 +364,10 @@ impl MeshTabState {
                         if let GeopyvObject::Mesh(m) = obj { Some(m) } else { None }
                     })
                 });
-                // target_image is only available when loaded from the current session.
-                // When opening from disk, target_image remains as previously set.
-                if selected_path != self.view.loaded_path.as_deref() {
-                    self.view.target_image = None;
-                }
+                // Populate target_image from the solution's stored path.
+                self.view.target_image = self.view.solution.as_ref()
+                    .map(|sol| sol.g_img_path.clone())
+                    .filter(|p| !p.as_os_str().is_empty());
             }
         }
 
@@ -388,7 +401,7 @@ impl MeshTabState {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("Select a reference image to begin")
-                            .size(14.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                 });
@@ -418,7 +431,7 @@ impl MeshTabState {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("Select a mesh from the list")
-                            .size(14.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                 });
@@ -508,7 +521,7 @@ impl MeshTabState {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("No target image — re-run solve to enable image underlay")
-                        .size(13.0)
+                        .size(15.0)
                         .color(ui.visuals().weak_text_color()),
                 );
             });
@@ -556,7 +569,7 @@ impl MeshTabState {
                 egui::pos2(bar_rect.min.x, bar_rect.max.y + 6.0),
                 egui::Align2::LEFT_TOP,
                 &message,
-                egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                egui::FontId::new(15.0, egui::FontFamily::Proportional),
                 egui::Color32::from_rgb(200, 200, 200),
             );
         }
@@ -575,100 +588,150 @@ impl MeshTabState {
                     if let GeopyvObject::Mesh(m) = obj { Some(m) } else { None }
                 })
             });
+            self.view.target_image = self.view.solution.as_ref()
+                .map(|sol| sol.g_img_path.clone())
+                .filter(|p| !p.as_os_str().is_empty());
         }
 
         let Some(sol) = self.view.solution.as_ref() else {
             ui.label(
                 egui::RichText::new("No mesh selected")
-                    .size(13.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
             );
             return;
         };
 
-        // Basic metadata.
-        section_header(ui, "Mesh");
+        // ── Input ──────────────────────────────────────────────────────────
+        section_header(ui, "Input");
         meta_row(ui, "Nodes", &sol.nodes.nrows().to_string());
         meta_row(ui, "Elements", &sol.elements.nrows().to_string());
         meta_row(ui, "Mesh order", &sol.mesh_order.to_string());
         meta_row(ui, "Subset order", &sol.subset_order.to_string());
+        let ref_name = sol.f_img_path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "\u{2014}".to_string());
+        let tar_name = sol.g_img_path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "\u{2014}".to_string());
+        meta_row(ui, "Reference", &ref_name);
+        meta_row(ui, "Target", &tar_name);
 
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(6.0);
 
-        // Plot type selector.
-        section_header(ui, "Plot Type");
+        // ── Results ────────────────────────────────────────────────────────
+        section_header(ui, "Results");
+        let n_zncc = sol.c_zncc.len();
+        if n_zncc > 0 {
+            let mean: f64 = sol.c_zncc.iter().sum::<f64>() / n_zncc as f64;
+            let min_zncc: f64 = sol.c_zncc.iter().cloned().fold(f64::INFINITY, f64::min);
+            meta_row(ui, "Mean C_ZNCC", &format!("{mean:.4}"));
+            meta_row(ui, "Min C_ZNCC", &format!("{min_zncc:.4}"));
+            let n_below = sol.c_zncc.iter().filter(|&&v| v < 0.75).count();
+            meta_row(ui, "Below 0.75", &n_below.to_string());
+        }
+        meta_row(ui, "Seed node", &sol.seed_node.to_string());
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // ── Plot ───────────────────────────────────────────────────────────
+        section_header(ui, "Plot");
         ui.add_space(3.0);
 
+        // Sub-tab buttons.
         let old_plot = self.view.plot_type;
-
-        ui.label(
-            egui::RichText::new("── Displacement ──").size(11.0).color(ui.visuals().weak_text_color()),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Ux, "u_x");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Uy, "u_y");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::UMag, "|u|");
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("Displacements")
+                .selected(self.view.active_pane == MeshViewPane::Displacements)).clicked()
+            {
+                self.view.active_pane = MeshViewPane::Displacements;
+                if !matches!(self.view.plot_type, MeshPlotType::Ux | MeshPlotType::Uy | MeshPlotType::UMag) {
+                    self.view.plot_type = MeshPlotType::Ux;
+                    self.view.nodal_cache = None;
+                }
+            }
+            if ui.add(egui::Button::new("Strains")
+                .selected(self.view.active_pane == MeshViewPane::Strains)).clicked()
+            {
+                self.view.active_pane = MeshViewPane::Strains;
+                if !matches!(self.view.plot_type, MeshPlotType::Exx | MeshPlotType::Eyy | MeshPlotType::Exy | MeshPlotType::EVM) {
+                    self.view.plot_type = MeshPlotType::Exx;
+                    self.view.nodal_cache = None;
+                }
+            }
+            if ui.add(egui::Button::new("Quality")
+                .selected(self.view.active_pane == MeshViewPane::Quality)).clicked()
+            {
+                self.view.active_pane = MeshViewPane::Quality;
+                if !matches!(self.view.plot_type, MeshPlotType::CZncc | MeshPlotType::Iterations | MeshPlotType::Norms) {
+                    self.view.plot_type = MeshPlotType::CZncc;
+                    self.view.nodal_cache = None;
+                }
+            }
         });
 
-        ui.add_space(3.0);
-        ui.label(
-            egui::RichText::new("── Strain ──").size(11.0).color(ui.visuals().weak_text_color()),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Exx, "\u{03b5}_xx");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Eyy, "\u{03b5}_yy");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Exy, "\u{03b5}_xy");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::EVM, "\u{03b5}_VM");
-        });
+        ui.add_space(4.0);
 
-        ui.add_space(3.0);
-        ui.label(
-            egui::RichText::new("── Quality ──").size(11.0).color(ui.visuals().weak_text_color()),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::CZncc, "C_ZNCC");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Iterations, "Iterations");
-            ui.radio_value(&mut self.view.plot_type, MeshPlotType::Norms, "Norms");
-        });
+        match self.view.active_pane {
+            MeshViewPane::Displacements => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Ux, "u_x");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Uy, "u_y");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::UMag, "|u|");
+                });
+            }
+            MeshViewPane::Strains => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Exx, "\u{03b5}_xx");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Eyy, "\u{03b5}_yy");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Exy, "\u{03b5}_xy");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::EVM, "\u{03b5}_VM");
+                });
+            }
+            MeshViewPane::Quality => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::CZncc, "C_ZNCC");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Iterations, "Iterations");
+                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Norms, "Norms");
+                });
+            }
+        }
 
         if self.view.plot_type != old_plot {
             self.view.nodal_cache = None;
         }
 
-        ui.add_space(3.0);
-        ui.label(
-            egui::RichText::new("── Geometry ──").size(11.0).color(ui.visuals().weak_text_color()),
-        );
-        ui.checkbox(&mut self.view.show_wireframe, "Show wireframe");
-        ui.checkbox(&mut self.view.show_node_indices, "Show node indices");
-
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.separator();
-        ui.add_space(6.0);
+        ui.add_space(4.0);
 
-        // Colormap selector.
-        section_header(ui, "Colormap");
-        ui.add_space(3.0);
-        let current_label = self.view.colormap.label();
-        egui::ComboBox::from_id_salt("mesh_colormap")
-            .selected_text(current_label)
-            .width(120.0)
-            .show_ui(ui, |ui| {
-                for &cmap in ColormapType::ALL {
-                    ui.selectable_value(&mut self.view.colormap, cmap, cmap.label());
-                }
-            });
-
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        // Range controls.
-        section_header(ui, "Range");
-        ui.add_space(3.0);
+        // Colormap.
         ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Colormap:").size(16.0).color(ui.visuals().weak_text_color()),
+            );
+            let current_label = self.view.colormap.label();
+            egui::ComboBox::from_id_salt("mesh_colormap")
+                .selected_text(current_label)
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for &cmap in ColormapType::ALL {
+                        ui.selectable_value(&mut self.view.colormap, cmap, cmap.label());
+                    }
+                });
+        });
+
+        ui.add_space(4.0);
+
+        // Range.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Range:").size(16.0).color(ui.visuals().weak_text_color()),
+            );
             ui.radio_value(&mut self.view.range_mode, RangeMode::Auto, "Auto");
             ui.radio_value(&mut self.view.range_mode, RangeMode::Manual, "Manual");
         });
@@ -680,7 +743,7 @@ impl MeshTabState {
                 .spacing([6.0, 4.0])
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Min:").size(12.0).color(ui.visuals().weak_text_color()),
+                        egui::RichText::new("Min:").size(16.0).color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.view.range_min_text).desired_width(80.0),
@@ -693,7 +756,7 @@ impl MeshTabState {
                     ui.end_row();
 
                     ui.label(
-                        egui::RichText::new("Max:").size(12.0).color(ui.visuals().weak_text_color()),
+                        egui::RichText::new("Max:").size(16.0).color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.view.range_max_text).desired_width(80.0),
@@ -706,7 +769,6 @@ impl MeshTabState {
                     ui.end_row();
                 });
         } else {
-            // Show auto-computed range for reference.
             let (mn, mx) = {
                 if self.view.nodal_cache.as_ref().map(|(t, _)| *t) != Some(self.view.plot_type) {
                     let vals = extract_nodal_values(sol, self.view.plot_type);
@@ -727,39 +789,15 @@ impl MeshTabState {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(format!("{} \u{2013} {}", format_sci(mn), format_sci(mx)))
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().weak_text_color()),
                 );
             });
         }
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        // Quality summary (below controls).
-        section_header(ui, "Quality");
-        let n = sol.c_zncc.len();
-        if n > 0 {
-            let mean: f64 = sol.c_zncc.iter().sum::<f64>() / n as f64;
-            let min: f64 = sol.c_zncc.iter().cloned().fold(f64::INFINITY, f64::min);
-            meta_row(ui, "Mean C_ZNCC", &format!("{mean:.4}"));
-            meta_row(ui, "Min C_ZNCC", &format!("{min:.4}"));
-            let n_below = sol.c_zncc.iter().filter(|&&v| v < 0.75).count();
-            meta_row(ui, "Below 0.75", &n_below.to_string());
-        }
-        meta_row(ui, "Seed node", &sol.seed_node.to_string());
-
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        // Export buttons (wired in session 15).
-        ui.horizontal(|ui| {
-            ui.add_enabled(false, egui::Button::new("Export PNG").min_size(egui::vec2(80.0, 24.0)));
-            ui.add_space(4.0);
-            ui.add_enabled(false, egui::Button::new("Export CSV").min_size(egui::vec2(80.0, 24.0)));
-        });
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.view.show_wireframe, "Show wireframe");
+        ui.checkbox(&mut self.view.show_node_indices, "Show node indices");
     }
 
     // -----------------------------------------------------------------------
@@ -786,7 +824,7 @@ impl MeshTabState {
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("Name:")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(150.0));
@@ -794,7 +832,7 @@ impl MeshTabState {
 
                 ui.label(
                     egui::RichText::new("Ref image:")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 let ref_label = form
@@ -819,7 +857,7 @@ impl MeshTabState {
 
                 ui.label(
                     egui::RichText::new("Target image:")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 let tar_label = form
@@ -858,7 +896,7 @@ impl MeshTabState {
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("Shape:")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 ui.horizontal(|ui| {
@@ -869,7 +907,7 @@ impl MeshTabState {
 
                 ui.label(
                     egui::RichText::new("Size (px):")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 let resp = ui.add(
@@ -903,7 +941,7 @@ impl MeshTabState {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(err)
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
         }
@@ -925,7 +963,7 @@ impl MeshTabState {
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new("Mesh order:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     ui.horizontal(|ui| {
@@ -936,7 +974,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("Size lower:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -955,7 +993,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("Size upper:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -974,7 +1012,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("Target nodes:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -996,7 +1034,7 @@ impl MeshTabState {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(err)
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().error_fg_color),
                 );
             }
@@ -1019,7 +1057,7 @@ impl MeshTabState {
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new("Method:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     ui.horizontal(|ui| {
@@ -1030,7 +1068,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("Order:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     ui.horizontal(|ui| {
@@ -1041,7 +1079,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("Max norm:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -1060,7 +1098,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("Max iters:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -1079,7 +1117,7 @@ impl MeshTabState {
 
                     ui.label(
                         egui::RichText::new("ZNCC tol:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -1097,7 +1135,7 @@ impl MeshTabState {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(err)
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().error_fg_color),
                 );
             }
@@ -1112,9 +1150,28 @@ impl MeshTabState {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
+            for (label, mode) in [
+                ("Rectangular", DrawShapeMode::Rectangular),
+                ("Circular",    DrawShapeMode::Circular),
+                ("Free",        DrawShapeMode::Free),
+            ] {
+                let resp = ui.selectable_value(&mut form.draw.shape_mode, mode, label);
+                if resp.changed() {
+                    form.draw.reset_in_progress();
+                }
+            }
+            if form.draw.shape_mode == DrawShapeMode::Circular {
+                ui.add_space(8.0);
+                ui.label("Points:");
+                ui.add(egui::DragValue::new(&mut form.draw.circle_n_points).range(6..=200).speed(1.0));
+            }
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
             let b_active = form.draw.mode == Some(ActiveDrawMode::Boundary);
             let btn_b = egui::Button::new(
-                egui::RichText::new(if b_active { "Drawing\u{2026}" } else { "Boundary \u{25b6}" }).size(12.0),
+                egui::RichText::new(if b_active { "Drawing\u{2026}" } else { "Boundary \u{25b6}" }).size(16.0),
             )
             .selected(b_active);
             if ui.add(btn_b).clicked() {
@@ -1123,7 +1180,7 @@ impl MeshTabState {
 
             let e_active = form.draw.mode == Some(ActiveDrawMode::Exclusion);
             let btn_e = egui::Button::new(
-                egui::RichText::new(if e_active { "Drawing\u{2026}" } else { "Exclusion \u{25b6}" }).size(12.0),
+                egui::RichText::new(if e_active { "Drawing\u{2026}" } else { "Exclusion \u{25b6}" }).size(16.0),
             )
             .selected(e_active);
             if ui.add(btn_e).clicked() {
@@ -1132,7 +1189,7 @@ impl MeshTabState {
 
             let s_active = form.draw.mode == Some(ActiveDrawMode::Seed);
             let btn_s = egui::Button::new(
-                egui::RichText::new(if s_active { "Placing\u{2026}" } else { "Seed \u{25b6}" }).size(12.0),
+                egui::RichText::new(if s_active { "Placing\u{2026}" } else { "Seed \u{25b6}" }).size(16.0),
             )
             .selected(s_active);
             if ui.add(btn_s).clicked() {
@@ -1148,12 +1205,12 @@ impl MeshTabState {
             } else {
                 ("boundary \u{2014}", ui.visuals().weak_text_color())
             };
-            ui.label(egui::RichText::new(b_text).size(11.0).color(b_color));
+            ui.label(egui::RichText::new(b_text).size(15.0).color(b_color));
             ui.add_space(8.0);
 
             let exc_n = form.draw.exclusions.len();
             let e_color = if exc_n > 0 { egui::Color32::from_rgb(100, 200, 100) } else { ui.visuals().weak_text_color() };
-            ui.label(egui::RichText::new(format!("exclusions: {exc_n}")).size(11.0).color(e_color));
+            ui.label(egui::RichText::new(format!("exclusions: {exc_n}")).size(15.0).color(e_color));
             ui.add_space(8.0);
 
             let (s_text, s_color) = if form.draw.seed_ok() {
@@ -1161,14 +1218,22 @@ impl MeshTabState {
             } else {
                 ("seed \u{2014}", ui.visuals().weak_text_color())
             };
-            ui.label(egui::RichText::new(s_text).size(11.0).color(s_color));
+            ui.label(egui::RichText::new(s_text).size(15.0).color(s_color));
         });
 
         if form.draw.has_self_intersection() {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new("Self-intersecting polygon")
-                    .size(11.0)
+                    .size(15.0)
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
+        if form.draw.exclusion_out_of_bounds {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Exclusion must be within boundary.")
+                    .size(13.0)
                     .color(ui.visuals().error_fg_color),
             );
         }
@@ -1180,7 +1245,7 @@ impl MeshTabState {
         if let Some(err) = &form.form_error.clone() {
             ui.label(
                 egui::RichText::new(err)
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
             ui.add_space(4.0);
@@ -1194,21 +1259,9 @@ impl MeshTabState {
                 .clicked()
             {
                 let seed = form.draw.seed.unwrap();
-                let boundary: Vec<[f64; 2]> = form
-                    .draw
-                    .boundary
-                    .as_ref()
-                    .unwrap()
-                    .vertices
-                    .iter()
-                    .map(|p| [p.x as f64, p.y as f64])
-                    .collect();
-                let exclusions: Vec<Vec<[f64; 2]>> = form
-                    .draw
-                    .exclusions
-                    .iter()
-                    .map(|ex| ex.vertices.iter().map(|p| [p.x as f64, p.y as f64]).collect())
-                    .collect();
+                let boundary: Vec<[f64; 2]> = form.draw.boundary.as_ref().unwrap().to_nodes();
+                let exclusions: Vec<Vec<[f64; 2]>> =
+                    form.draw.exclusions.iter().map(|r| r.to_nodes()).collect();
                 spawn = Some(MeshSpawnParams {
                     name: form.name.trim().to_string(),
                     ref_path: images[form.ref_idx.unwrap()].clone(),
@@ -1244,13 +1297,13 @@ impl MeshTabState {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Solving mesh\u{2026}")
-                .size(14.0)
+                .size(16.0)
                 .color(ui.visuals().text_color()),
         );
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(&message)
-                .size(12.0)
+                .size(16.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.add_space(8.0);
@@ -1414,6 +1467,8 @@ fn run_solve(
         params.seed,
         &seed_warp,
         &cfg,
+        params.ref_path.clone(),
+        params.target_path.clone(),
     ) {
         Ok(solution) => {
             if let Ok(mut s) = state.lock() {
@@ -1630,18 +1685,20 @@ pub fn render_colorbar(
     cmap: ColormapType,
     label: &str,
 ) {
-    const BAR_W: f32 = 14.0;
-    const BAR_H: f32 = 110.0;
-    const MARGIN: f32 = 10.0;
-    const LABEL_W: f32 = 52.0;
-    const TITLE_H: f32 = 16.0;
+    const BAR_W: f32 = 22.0;
+    const MARGIN: f32 = 12.0;
+    const TITLE_H: f32 = 22.0;
+    const LABEL_W: f32 = 64.0;
+    const LABEL_PAD: f32 = 4.0;
+    const N: usize = 64;
 
+    let bar_h = (viewer_rect.height() - MARGIN * 2.0 - TITLE_H - 20.0).max(40.0);
     let bar_x = viewer_rect.max.x - MARGIN - BAR_W - LABEL_W;
     let bar_y = viewer_rect.min.y + MARGIN + TITLE_H;
 
     let bg_rect = egui::Rect::from_min_max(
         egui::pos2(bar_x - 4.0, viewer_rect.min.y + MARGIN - 2.0),
-        egui::pos2(viewer_rect.max.x - MARGIN + 2.0, bar_y + BAR_H + 14.0),
+        egui::pos2(viewer_rect.max.x - MARGIN + 2.0, bar_y + bar_h + 14.0),
     );
     painter.rect_filled(
         bg_rect,
@@ -1654,13 +1711,12 @@ pub fn render_colorbar(
         egui::pos2(bar_x + BAR_W * 0.5, viewer_rect.min.y + MARGIN + TITLE_H * 0.5),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
         egui::Color32::from_rgb(210, 210, 210),
     );
 
-    // Gradient bar (32 horizontal strips, top = max).
-    const N: usize = 32;
-    let strip_h = BAR_H / N as f32;
+    // Gradient bar (N strips, top = max).
+    let strip_h = bar_h / N as f32;
     for i in 0..N {
         let t = 1.0 - i as f32 / (N - 1) as f32;
         let color = colormap::sample(t, cmap);
@@ -1674,8 +1730,8 @@ pub fn render_colorbar(
 
     // Min / max labels.
     let lc = egui::Color32::from_rgb(220, 220, 220);
-    let font = egui::FontId::new(10.0, egui::FontFamily::Proportional);
-    let lx = bar_x + BAR_W + 3.0;
+    let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let lx = bar_x + BAR_W + LABEL_PAD;
     painter.text(
         egui::pos2(lx, bar_y),
         egui::Align2::LEFT_CENTER,
@@ -1684,7 +1740,7 @@ pub fn render_colorbar(
         lc,
     );
     painter.text(
-        egui::pos2(lx, bar_y + BAR_H),
+        egui::pos2(lx, bar_y + bar_h),
         egui::Align2::LEFT_CENTER,
         format_sci(vmin),
         font,
@@ -1710,7 +1766,7 @@ pub fn format_sci(v: f64) -> String {
 fn section_header(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
-            .size(11.0)
+            .size(15.0)
             .color(ui.visuals().weak_text_color()),
     );
     ui.add_space(2.0);
@@ -1721,10 +1777,10 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(format!("{label}:"))
-                .size(12.0)
+                .size(16.0)
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.label(egui::RichText::new(value).size(13.0));
+        ui.label(egui::RichText::new(value).size(15.0));
     });
     ui.add_space(2.0);
 }

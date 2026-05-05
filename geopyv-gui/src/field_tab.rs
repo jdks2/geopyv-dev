@@ -169,13 +169,13 @@ impl NewFieldForm {
             .draw
             .boundary
             .as_ref()
-            .map(|b| b.vertices.len())
+            .map(|b| b.to_egui_verts().len())
             .unwrap_or(0);
         let exclusions_sig: usize = self
             .draw
             .exclusions
             .iter()
-            .map(|e| e.vertices.len() + 1)
+            .map(|e| e.to_egui_verts().len() + 1)
             .sum();
 
         if boundary_len == self.last_boundary_len
@@ -190,9 +190,10 @@ impl NewFieldForm {
         self.last_spacing = self.spacing;
 
         if let Some(b) = &self.draw.boundary {
+            let b_verts = b.to_egui_verts();
             let exclusion_verts: Vec<Vec<egui::Pos2>> =
-                self.draw.exclusions.iter().map(|e| e.vertices.clone()).collect();
-            self.cached_grid = generate_grid(&b.vertices, &exclusion_verts, self.spacing);
+                self.draw.exclusions.iter().map(|e| e.to_egui_verts()).collect();
+            self.cached_grid = generate_grid(&b_verts, &exclusion_verts, self.spacing);
         } else {
             self.cached_grid = Vec::new();
         }
@@ -417,7 +418,7 @@ impl FieldTabState {
                         ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new("Select a field from the list")
-                                    .size(14.0)
+                                    .size(16.0)
                                     .color(ui.visuals().weak_text_color()),
                             );
                         });
@@ -525,7 +526,7 @@ impl FieldTabState {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("No images in project")
-                            .size(14.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                 });
@@ -566,7 +567,7 @@ impl FieldTabState {
         let Some(sol) = sol_opt else {
             ui.label(
                 egui::RichText::new("No field selected")
-                    .size(13.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
             );
             return;
@@ -773,7 +774,7 @@ impl FieldTabState {
             None => {
                 ui.label(
                     egui::RichText::new("Click a particle on the scatter to select")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
             }
@@ -781,7 +782,7 @@ impl FieldTabState {
                 if let Some(p) = sol.particles.get(idx) {
                     ui.label(
                         egui::RichText::new(format!("Particle {idx}"))
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().text_color()),
                     );
                     ui.add_space(4.0);
@@ -832,13 +833,13 @@ impl FieldTabState {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("Solving field\u{2026}")
-                    .size(14.0)
+                    .size(16.0)
                     .color(ui.visuals().text_color()),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(&message)
-                    .size(12.0)
+                    .size(16.0)
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(8.0);
@@ -933,7 +934,7 @@ impl FieldTabState {
         section_header(ui, "Field Boundary");
         ui.label(
             egui::RichText::new("(independent of mesh boundary)")
-                .size(10.0)
+                .size(16.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.add_space(4.0);
@@ -946,7 +947,7 @@ impl FieldTabState {
                 } else {
                     "Boundary \u{25b6}"
                 })
-                .size(12.0),
+                .size(16.0),
             )
             .selected(boundary_active);
             if ui.add(btn_b).clicked() {
@@ -965,7 +966,7 @@ impl FieldTabState {
                 } else {
                     "Exclusion \u{25b6}"
                 })
-                .size(12.0),
+                .size(16.0),
             )
             .selected(exclusion_active);
             if ui.add_enabled(can_exclusion, btn_e).clicked() {
@@ -981,20 +982,20 @@ impl FieldTabState {
         if form.draw.boundary_ok() {
             ui.label(
                 egui::RichText::new("\u{2713} Boundary drawn")
-                    .size(11.0)
+                    .size(15.0)
                     .color(egui::Color32::from_rgb(80, 200, 80)),
             );
         } else {
             ui.label(
                 egui::RichText::new("No boundary")
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
             );
         }
         if !form.draw.exclusions.is_empty() {
             ui.label(
                 egui::RichText::new(format!("{} exclusion(s)", form.draw.exclusions.len()))
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
             );
         }
@@ -1028,7 +1029,7 @@ impl FieldTabState {
                 ui.end_row();
 
                 ui.label(lbl("Particles:"));
-                ui.label(egui::RichText::new(form.cached_grid.len().to_string()).size(13.0));
+                ui.label(egui::RichText::new(form.cached_grid.len().to_string()).size(15.0));
                 ui.end_row();
             });
 
@@ -1090,7 +1091,7 @@ impl FieldTabState {
         if let Some(err) = &form.form_error.clone() {
             ui.label(
                 egui::RichText::new(err)
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
             ui.add_space(4.0);
@@ -1311,7 +1312,7 @@ fn show_progress_overlay(
             egui::pos2(bar_rect.min.x, bar_rect.max.y + 6.0),
             egui::Align2::LEFT_TOP,
             &message,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            egui::FontId::new(15.0, egui::FontFamily::Proportional),
             egui::Color32::from_rgb(200, 200, 200),
         );
     }
@@ -1548,13 +1549,13 @@ fn export_csv(sol: &FieldSolution, dest: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn lbl(text: &str) -> egui::RichText {
-    egui::RichText::new(text).size(12.0)
+    egui::RichText::new(text).size(16.0)
 }
 
 fn section_header(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
-            .size(11.0)
+            .size(15.0)
             .color(ui.visuals().weak_text_color()),
     );
     ui.add_space(2.0);
@@ -1565,10 +1566,10 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(format!("{label}:"))
-                .size(12.0)
+                .size(16.0)
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.label(egui::RichText::new(value).size(13.0));
+        ui.label(egui::RichText::new(value).size(15.0));
     });
     ui.add_space(2.0);
 }

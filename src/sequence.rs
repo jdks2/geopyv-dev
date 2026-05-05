@@ -29,17 +29,32 @@
 //! - GUI selectors (`gp.gui.selectors.coordinate.CoordinateSelector`)
 //! - Adaptive remeshing — deferred; use `adaptive_iterations=0`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     image::Image,
+    io::{save as io_save, GeopyvObject},
     mesh::{Mesh, MeshSolution, SolveConfig},
     particle::{MeshData, Particle},
     Error,
 };
+
+// ---------------------------------------------------------------------------
+// Filename sort helper
+// ---------------------------------------------------------------------------
+
+/// Extract the last contiguous run of decimal digits from a string and return
+/// it as a `u64`.  Returns 0 if no digits are found.
+fn last_number_in_name(s: &str) -> u64 {
+    s.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .last()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
 
 // ---------------------------------------------------------------------------
 // Mesh-generation configuration
@@ -84,6 +99,11 @@ pub struct SequenceSolveConfig {
     pub override_: bool,
     /// Image border (pixels) for B-spline precomputation. Defaults to 20.
     pub border: usize,
+    /// When `Some(dir)`, save each mesh frame to `{dir}/mesh_{i:04}.pyv`
+    /// immediately after solving; frame is not accumulated in memory.
+    /// When `None` (default), accumulate all solutions in
+    /// `SequenceSolution::mesh_solutions`.
+    pub save: Option<PathBuf>,
 }
 
 impl Default for SequenceSolveConfig {
@@ -98,6 +118,7 @@ impl Default for SequenceSolveConfig {
             sync: true,
             override_: false,
             border: 20,
+            save: None,
         }
     }
 }
@@ -109,9 +130,12 @@ impl Default for SequenceSolveConfig {
 /// Result of [`Sequence::solve`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceSolution {
-    /// Per-pair DIC solutions.  `mesh_solutions[i]` corresponds to the pair
-    /// `(images[i], images[i+1])`.
+    /// Per-pair DIC solutions when solve was called with `save = None`.
+    /// Empty when meshes were saved by reference.
     pub mesh_solutions: Vec<MeshSolution>,
+    /// File paths of per-frame `.pyv` files when solve was called with
+    /// `save = Some(dir)`.  Empty when meshes are held in memory.
+    pub mesh_paths: Vec<PathBuf>,
     /// `true` when all image pairs were solved successfully.
     pub solved: bool,
     /// `true` when a consecutive pair was unsolvable and the sequence was
@@ -174,14 +198,51 @@ impl Sequence {
         self.image_paths.len() - 1
     }
 
+    /// Construct a `Sequence` by scanning a directory for image files.
+    ///
+    /// All `*.jpg`, `*.jpeg`, and `*.png` files (case-insensitive) found in
+    /// `dir` are collected and sorted by the last run of digits in their file
+    /// stem (e.g. `frame_003.jpg` → key 3).  At least 2 images are required.
+    pub fn from_dir(dir: &Path, mesh_cfg: SequenceMeshConfig) -> Result<Self, Error> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| Error::FileNotFound(format!("{}: {e}", dir.display())))?;
+
+        let image_exts = ["jpg", "jpeg", "png"];
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| image_exts.contains(&e.to_lowercase().as_str()))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        paths.sort_by_key(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(last_number_in_name)
+                .unwrap_or(0)
+        });
+
+        Sequence::new(paths, mesh_cfg)
+    }
+
     /// Solve all image pairs.
     ///
-    /// Replicates `Sequence.solve` (minus alive_bar, GUI, geomat sections,
-    /// and save-by-reference disk I/O).
+    /// Replicates `Sequence.solve` (minus alive_bar, GUI, geomat sections).
+    /// When `cfg.save` is `Some(dir)`, each solved mesh is written to
+    /// `{dir}/mesh_{i:04}.pyv` and not held in memory.
     pub fn solve(&self, cfg: &SequenceSolveConfig) -> Result<SequenceSolution, Error> {
         let n_images = self.image_paths.len();
         let mut mesh_solutions: Vec<MeshSolution> = Vec::with_capacity(n_images - 1);
+        let mut mesh_paths: Vec<PathBuf> = Vec::new();
         let mut override_log: Vec<usize> = Vec::new();
+
+        if let Some(ref save_dir) = cfg.save {
+            std::fs::create_dir_all(save_dir)?;
+        }
 
         let mut f_index = 0usize;
         let mut g_index = 1usize;
@@ -228,6 +289,8 @@ impl Sequence {
                 seed_coord,
                 &seed_warp,
                 &pair_cfg,
+                self.image_paths[f_index].clone(),
+                self.image_paths[g_index].clone(),
             );
 
             let mesh_sol = match pair_result {
@@ -249,6 +312,7 @@ impl Sequence {
                         // Consecutive pair truly unsolvable: curtail sequence.
                         return Ok(SequenceSolution {
                             mesh_solutions,
+                            mesh_paths,
                             solved: false,
                             unsolvable: true,
                             override_log,
@@ -269,7 +333,14 @@ impl Sequence {
             if cfg.sync {
                 sync_sol = Some(mesh_sol.clone());
             }
-            mesh_solutions.push(mesh_sol.clone());
+            if let Some(ref save_dir) = cfg.save {
+                let frame_path = save_dir.join(format!("mesh_{:04}.pyv", mesh_paths.len()));
+                io_save(&frame_path, &GeopyvObject::Mesh(mesh_sol.clone()))
+                    .map_err(|e| Error::Io(format!("frame save failed: {e}")))?;
+                mesh_paths.push(frame_path);
+            } else {
+                mesh_solutions.push(mesh_sol.clone());
+            }
 
             // --- Advance target image. ------------------------------------
             g_index += 1;
@@ -312,6 +383,7 @@ impl Sequence {
 
         Ok(SequenceSolution {
             mesh_solutions,
+            mesh_paths,
             solved: all_solved,
             unsolvable: false,
             override_log,
@@ -408,20 +480,11 @@ mod tests {
     use ndarray::{array, Array1};
 
     // -----------------------------------------------------------------------
-    // Sorting: replicate the image-filename sort logic in Rust
+    // Sorting: verify the image-filename sort logic used by from_dir
     // -----------------------------------------------------------------------
 
-    /// Extract the last contiguous run of decimal digits from a name and parse it.
-    fn last_number_in_name(name: &str) -> usize {
-        name.split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .last()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    }
-
     fn sort_image_names(mut names: Vec<&str>) -> Vec<&str> {
-        names.sort_by_key(|n| last_number_in_name(n));
+        names.sort_by_key(|n| super::last_number_in_name(n));
         names
     }
 
@@ -559,8 +622,8 @@ mod tests {
             subset_order: 1,
             iterations: Array1::zeros(n),
             norms: Array1::zeros(n),
-            f_img_path: None,
-            g_img_path: None,
+            f_img_path: PathBuf::new(),
+            g_img_path: PathBuf::new(),
         }
     }
 

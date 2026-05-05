@@ -7,18 +7,24 @@
 
 use std::path::PathBuf;
 
-use ndarray::Array1;
-use numpy::{IntoPyArray, PyReadonlyArray2};
+use ndarray::{Array1, Array2};
+use numpy::IntoPyArray;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use geopyv_dev::{
+    geometry::meshing,
     mesh::{SolveConfig, SolveMethod},
     sequence::{self, Sequence, SequenceMeshConfig, SequenceSolveConfig},
 };
 
-use crate::{py_mesh::PyMeshSolution, py_templates::PyTemplate, Error};
+use crate::{
+    py_geometry::extract_region,
+    py_mesh::PyMeshSolution,
+    py_templates::PyTemplate,
+    Error,
+};
 
 // ---------------------------------------------------------------------------
 // SequenceSolution class
@@ -33,12 +39,24 @@ pub struct PySequenceSolution {
 #[pymethods]
 impl PySequenceSolution {
     /// Per-pair DIC solutions; ``mesh_solutions[i]`` is for pair ``(i, i+1)``.
+    /// Empty when the sequence was solved with ``save`` set to a directory path.
     #[getter]
     fn mesh_solutions(&self) -> Vec<PyMeshSolution> {
         self.inner
             .mesh_solutions
             .iter()
             .map(|s| PyMeshSolution { inner: s.clone() })
+            .collect()
+    }
+
+    /// File paths of per-frame ``.pyv`` files when solved with ``save`` set.
+    /// Empty list when meshes are held in memory.
+    #[getter]
+    fn mesh_paths(&self) -> Vec<String> {
+        self.inner
+            .mesh_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
             .collect()
     }
 
@@ -61,9 +79,10 @@ impl PySequenceSolution {
     }
 
     fn __repr__(&self) -> String {
+        let n = self.inner.mesh_solutions.len() + self.inner.mesh_paths.len();
         format!(
             "SequenceSolution(pairs={}, solved={}, unsolvable={})",
-            self.inner.mesh_solutions.len(),
+            n,
             self.inner.solved,
             self.inner.unsolvable,
         )
@@ -80,18 +99,16 @@ impl PySequenceSolution {
 /// ----------
 /// image_paths : list[str]
 ///     Ordered list of image file paths (≥ 2).
-/// borders : numpy.ndarray, shape (N, 2), float64
-///     Outer boundary polygon vertices.
-/// segments : numpy.ndarray, shape (S, 2), int32
-///     Constraint segment endpoint indices into ``borders``.
-/// curves : list[list[int]]
-///     Grouped constraint curve segment indices.
+/// boundary : CircleRegion, PathRegion, or numpy.ndarray (N, 2)
+///     Boundary region or raw polygon vertices. Raw arrays imply ``boundary_hard=False``.
 /// size_lower : float
 ///     Minimum element edge length.
 /// size_upper : float
 ///     Maximum element edge length.
 /// target_nodes : int
 ///     Target node count for binary-search sizing.
+/// exclusions : list[CircleRegion | PathRegion | numpy.ndarray], optional
+///     Exclusion regions or raw polygon arrays. Default None.
 /// mesh_order : int, optional
 ///     1 (linear) or 2 (quadratic). Default 1.
 #[pyclass(name = "Sequence")]
@@ -102,29 +119,82 @@ pub struct PySequence {
 #[pymethods]
 impl PySequence {
     #[new]
-    #[pyo3(signature = (image_paths, borders, segments, curves,
-                         size_lower, size_upper, target_nodes, mesh_order=1))]
+    #[pyo3(signature = (image_paths, boundary, size_lower, size_upper, target_nodes,
+                         exclusions=None, mesh_order=1))]
     fn new(
         image_paths: Vec<String>,
-        borders: PyReadonlyArray2<f64>,
-        segments: PyReadonlyArray2<i32>,
-        curves: Vec<Vec<i32>>,
+        boundary: &Bound<'_, PyAny>,
         size_lower: f64,
         size_upper: f64,
         target_nodes: usize,
+        exclusions: Option<Vec<Bound<'_, PyAny>>>,
         mesh_order: u8,
     ) -> PyResult<Self> {
+        let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
+        let excl_owned: Vec<Array2<f64>> = exclusions
+            .unwrap_or_default()
+            .iter()
+            .map(|obj| extract_region(obj).map(|(nodes, _)| nodes))
+            .collect::<PyResult<Vec<_>>>()?;
+        let excl_views: Vec<_> = excl_owned.iter().map(|a| a.view()).collect();
+        let roi = meshing::define_roi(boundary_nodes.view(), boundary_hard, &excl_views, None);
         let paths: Vec<PathBuf> = image_paths.into_iter().map(PathBuf::from).collect();
         let mesh_cfg = SequenceMeshConfig {
-            borders: borders.as_array().to_owned(),
-            segments: segments.as_array().to_owned(),
-            curves,
+            borders: roi.borders,
+            segments: roi.segments,
+            curves: roi.curves,
             size_lower,
             size_upper,
             target_nodes,
             mesh_order,
         };
         let seq = Sequence::new(paths, mesh_cfg).map_err(Error::from)?;
+        Ok(PySequence { inner: seq })
+    }
+
+    /// Construct a Sequence by scanning a directory for image files.
+    ///
+    /// Parameters
+    /// ----------
+    /// image_dir : str
+    ///     Directory containing the images.  All ``*.jpg``, ``*.jpeg``, and
+    ///     ``*.png`` files are collected and sorted by trailing integer in
+    ///     their filename stem.
+    /// boundary : CircleRegion, PathRegion, or numpy.ndarray (N, 2)
+    ///     Boundary region.
+    /// size_lower, size_upper, target_nodes, exclusions, mesh_order
+    ///     Same as :meth:`__init__`.
+    #[staticmethod]
+    #[pyo3(signature = (image_dir, boundary, size_lower, size_upper, target_nodes,
+                         exclusions=None, mesh_order=1))]
+    fn from_dir(
+        image_dir: &str,
+        boundary: &Bound<'_, PyAny>,
+        size_lower: f64,
+        size_upper: f64,
+        target_nodes: usize,
+        exclusions: Option<Vec<Bound<'_, PyAny>>>,
+        mesh_order: u8,
+    ) -> PyResult<Self> {
+        let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
+        let excl_owned: Vec<Array2<f64>> = exclusions
+            .unwrap_or_default()
+            .iter()
+            .map(|obj| extract_region(obj).map(|(nodes, _)| nodes))
+            .collect::<PyResult<Vec<_>>>()?;
+        let excl_views: Vec<_> = excl_owned.iter().map(|a| a.view()).collect();
+        let roi = meshing::define_roi(boundary_nodes.view(), boundary_hard, &excl_views, None);
+        let mesh_cfg = SequenceMeshConfig {
+            borders: roi.borders,
+            segments: roi.segments,
+            curves: roi.curves,
+            size_lower,
+            size_upper,
+            target_nodes,
+            mesh_order,
+        };
+        let seq = Sequence::from_dir(std::path::Path::new(image_dir), mesh_cfg)
+            .map_err(Error::from)?;
         Ok(PySequence { inner: seq })
     }
 
@@ -166,7 +236,7 @@ impl PySequence {
                          max_norm=1e-5, max_iterations=50, subset_order=1,
                          tolerance=0.75, method="icgn",
                          guide=true, sequential=false, sync=true,
-                         override_=false, border=20))]
+                         override_=false, border=20, save=None))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
@@ -183,6 +253,7 @@ impl PySequence {
         sync: bool,
         override_: bool,
         border: usize,
+        save: Option<&str>,
     ) -> PyResult<PySequenceSolution> {
         let solve_method = if method == "fagn" {
             SolveMethod::Fagn
@@ -209,6 +280,7 @@ impl PySequence {
             sync,
             override_,
             border,
+            save: save.map(PathBuf::from),
         };
         let sol = self.inner.solve(&cfg).map_err(Error::from)?;
         Ok(PySequenceSolution { inner: sol })

@@ -2,9 +2,8 @@
 
 use ndarray::{Array2, ArrayView2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
 
 use geopyv_dev::geometry::{meshing, region, utilities};
 
@@ -132,25 +131,69 @@ pub fn plot_triangulation<'py>(
 // Region classes
 // ===========================================================================
 
-fn option_from_str(s: &str) -> PyResult<region::RegionOption> {
-    match s {
-        "D" => Ok(region::RegionOption::D),
-        "S" => Ok(region::RegionOption::S),
-        "R" => Ok(region::RegionOption::R),
-        "F" => Ok(region::RegionOption::F),
-        other => Err(PyValueError::new_err(format!(
-            "option must be 'D', 'S', 'R', or 'F'; got '{other}'"
-        ))),
-    }
-}
+macro_rules! impl_region_pymethods {
+    ($ty:ty, $repr_name:literal) => {
+        #[pymethods]
+        impl $ty {
+            #[getter]
+            fn option(&self) -> String {
+                self.inner.option.to_string()
+            }
 
-fn option_to_str(opt: &region::RegionOption) -> &'static str {
-    match opt {
-        region::RegionOption::D => "D",
-        region::RegionOption::S => "S",
-        region::RegionOption::R => "R",
-        region::RegionOption::F => "F",
-    }
+            #[getter]
+            fn hard(&self) -> bool {
+                self.inner.hard
+            }
+
+            #[getter]
+            fn compensate(&self) -> bool {
+                self.inner.compensate
+            }
+
+            #[getter]
+            fn solved(&self) -> bool {
+                self.inner.solved
+            }
+
+            #[getter]
+            fn counter(&self) -> usize {
+                self.inner.counter
+            }
+
+            #[getter]
+            fn current_nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+                self.inner.current_nodes.clone().into_pyarray_bound(py)
+            }
+
+            #[getter]
+            fn current_centre<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+                ndarray::arr1(&self.inner.current_centre).into_pyarray_bound(py)
+            }
+
+            fn store_rigid(&mut self, warp: PyReadonlyArray1<f64>) -> PyResult<()> {
+                let w: Vec<f64> = warp.as_array().to_vec();
+                self.inner.store_rigid(&w).map_err(Error::from)?;
+                Ok(())
+            }
+
+            fn store_flexible(&mut self, warp: PyReadonlyArray2<f64>) -> PyResult<()> {
+                self.inner.store_flexible(warp.as_array()).map_err(Error::from)?;
+                Ok(())
+            }
+
+            fn update(&mut self, filepath: &str) {
+                self.inner.update(filepath);
+            }
+
+            fn __repr__(&self) -> String {
+                format!(
+                    concat!($repr_name, "(n_nodes={}, option='{}')"),
+                    self.inner.current_nodes.nrows(),
+                    self.inner.option,
+                )
+            }
+        }
+    };
 }
 
 /// Circular tracked boundary region.
@@ -180,75 +223,14 @@ impl PyCircleRegion {
         hard: bool,
         compensate: bool,
     ) -> PyResult<Self> {
-        let opt = option_from_str(option)?;
+        let opt: region::RegionOption = option.parse().map_err(Error::from)?;
         let r = region::Region::circle(centre, radius, size, opt, hard, compensate)
             .map_err(Error::from)?;
         Ok(PyCircleRegion { inner: r })
     }
-
-    #[getter]
-    fn option(&self) -> &str {
-        option_to_str(&self.inner.option)
-    }
-
-    #[getter]
-    fn hard(&self) -> bool {
-        self.inner.hard
-    }
-
-    #[getter]
-    fn compensate(&self) -> bool {
-        self.inner.compensate
-    }
-
-    #[getter]
-    fn solved(&self) -> bool {
-        self.inner.solved
-    }
-
-    #[getter]
-    fn counter(&self) -> usize {
-        self.inner.counter
-    }
-
-    #[getter]
-    fn current_nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.current_nodes.clone().into_pyarray_bound(py)
-    }
-
-    #[getter]
-    fn current_centre<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.current_centre.clone().into_pyarray_bound(py)
-    }
-
-    /// Store a rigid-body update. `warp` is a 1-D array with ≥ 5 elements
-    /// ``[u, v, _, du_dx, du_dy, ...]``.
-    fn store_rigid(&mut self, warp: PyReadonlyArray1<f64>) -> PyResult<()> {
-        let w: Vec<f64> = warp.as_array().to_vec();
-        self.inner.store_rigid(&w).map_err(Error::from)?;
-        Ok(())
-    }
-
-    /// Store a flexible update. `warp` is a 2-D array of shape (N, 2).
-    fn store_flexible(&mut self, warp: PyReadonlyArray2<f64>) -> PyResult<()> {
-        let w = warp.as_array().to_owned();
-        self.inner.store_flexible(&w).map_err(Error::from)?;
-        Ok(())
-    }
-
-    /// Update working nodes/centre from history using the frame index in `filepath`.
-    fn update(&mut self, filepath: &str) {
-        self.inner.update(filepath);
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "CircleRegion(n_nodes={}, option='{}')",
-            self.inner.current_nodes.nrows(),
-            option_to_str(&self.inner.option)
-        )
-    }
 }
+
+impl_region_pymethods!(PyCircleRegion, "CircleRegion");
 
 /// Arbitrary-polygon tracked boundary region.
 ///
@@ -279,71 +261,35 @@ impl PyPathRegion {
         compensate: bool,
         radius: f64,
     ) -> PyResult<Self> {
-        let opt = option_from_str(option)?;
+        let opt: region::RegionOption = option.parse().map_err(Error::from)?;
         let n = nodes.as_array().to_owned();
         let r = region::Region::path(centre, n, opt, hard, compensate, radius)
             .map_err(Error::from)?;
         Ok(PyPathRegion { inner: r })
     }
+}
 
-    #[getter]
-    fn option(&self) -> &str {
-        option_to_str(&self.inner.option)
-    }
+impl_region_pymethods!(PyPathRegion, "PathRegion");
 
-    #[getter]
-    fn hard(&self) -> bool {
-        self.inner.hard
-    }
+// ===========================================================================
+// Extraction helpers (pub(crate) — used by py_mesh and py_sequence)
+// ===========================================================================
 
-    #[getter]
-    fn compensate(&self) -> bool {
-        self.inner.compensate
+/// Extract `(nodes, hard)` from a region argument.
+/// Accepts PyCircleRegion, PyPathRegion, or a raw numpy array (hard=false).
+pub(crate) fn extract_region(obj: &Bound<'_, PyAny>) -> PyResult<(Array2<f64>, bool)> {
+    if let Ok(r) = obj.extract::<PyRef<PyCircleRegion>>() {
+        return Ok((r.inner.current_nodes.clone(), r.inner.hard));
     }
-
-    #[getter]
-    fn solved(&self) -> bool {
-        self.inner.solved
+    if let Ok(r) = obj.extract::<PyRef<PyPathRegion>>() {
+        return Ok((r.inner.current_nodes.clone(), r.inner.hard));
     }
-
-    #[getter]
-    fn counter(&self) -> usize {
-        self.inner.counter
+    if let Ok(a) = obj.extract::<PyReadonlyArray2<f64>>() {
+        return Ok((a.as_array().to_owned(), false));
     }
-
-    #[getter]
-    fn current_nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.current_nodes.clone().into_pyarray_bound(py)
-    }
-
-    #[getter]
-    fn current_centre<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.current_centre.clone().into_pyarray_bound(py)
-    }
-
-    fn store_rigid(&mut self, warp: PyReadonlyArray1<f64>) -> PyResult<()> {
-        let w: Vec<f64> = warp.as_array().to_vec();
-        self.inner.store_rigid(&w).map_err(Error::from)?;
-        Ok(())
-    }
-
-    fn store_flexible(&mut self, warp: PyReadonlyArray2<f64>) -> PyResult<()> {
-        let w = warp.as_array().to_owned();
-        self.inner.store_flexible(&w).map_err(Error::from)?;
-        Ok(())
-    }
-
-    fn update(&mut self, filepath: &str) {
-        self.inner.update(filepath);
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "PathRegion(n_nodes={}, option='{}')",
-            self.inner.current_nodes.nrows(),
-            option_to_str(&self.inner.option)
-        )
-    }
+    Err(PyTypeError::new_err(
+        "must be a CircleRegion, PathRegion, or numpy array (N, 2)",
+    ))
 }
 
 // ===========================================================================
@@ -388,55 +334,6 @@ pub fn mask_image<'py>(
     mask.into_pyarray_bound(py)
 }
 
-/// Prepare segment and curve data for the mesh generator.
-///
-/// Parameters
-/// ----------
-/// boundary_nodes : np.ndarray (N, 2)
-/// boundary_hard : bool, optional (default True)
-/// exclusion_nodes : list[np.ndarray], optional
-/// img_shape : (int, int) or None, optional
-///     If supplied, a binary mask is also returned.
-///
-/// Returns
-/// -------
-/// tuple: (borders, segments, curves[, mask])
-///   borders  : np.ndarray (M, 2), float64
-///   segments : np.ndarray (M, 2), int32
-///   curves   : list[list[int]]
-///   mask     : np.ndarray (H, W) uint8  — only present when img_shape given
-#[pyfunction]
-#[pyo3(signature = (boundary_nodes, boundary_hard=true, exclusion_nodes=None, img_shape=None))]
-pub fn define_roi<'py>(
-    py: Python<'py>,
-    boundary_nodes: PyReadonlyArray2<f64>,
-    boundary_hard: bool,
-    exclusion_nodes: Option<Vec<PyReadonlyArray2<f64>>>,
-    img_shape: Option<(usize, usize)>,
-) -> PyResult<PyObject> {
-    let bn = boundary_nodes.as_array();
-    let excl_owned: Vec<Array2<f64>> = exclusion_nodes
-        .unwrap_or_default()
-        .iter()
-        .map(|a| a.as_array().to_owned())
-        .collect();
-    let excl_views: Vec<ArrayView2<f64>> =
-        excl_owned.iter().map(|a: &Array2<f64>| a.view()).collect();
-    let roi = meshing::define_roi(bn, boundary_hard, &excl_views, img_shape);
-
-    use pyo3::IntoPy;
-    let borders_py = roi.borders.into_pyarray_bound(py).into_py(py);
-    let segments_py = roi.segments.into_pyarray_bound(py).into_py(py);
-    let curves_py: PyObject = roi.curves.into_py(py);
-
-    if let Some(mask) = roi.mask {
-        let mask_py: PyObject = mask.into_pyarray_bound(py).into_py(py);
-        Ok(PyTuple::new_bound(py, [borders_py, segments_py, curves_py, mask_py]).into_py(py))
-    } else {
-        Ok(PyTuple::new_bound(py, [borders_py, segments_py, curves_py]).into_py(py))
-    }
-}
-
 // ===========================================================================
 // Module registration
 // ===========================================================================
@@ -455,6 +352,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPathRegion>()?;
     // Meshing functions.
     m.add_function(wrap_pyfunction!(mask_image, m)?)?;
-    m.add_function(wrap_pyfunction!(define_roi, m)?)?;
     Ok(())
 }

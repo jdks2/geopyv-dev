@@ -98,6 +98,19 @@ pub struct SubsetSolution {
     pub ref_image: PathBuf,
     pub target_image: PathBuf,
     pub result: SolveResult,
+    /// Standard deviation of reference intensities: `delta_f / sqrt(n_px)`.
+    #[serde(default)]
+    pub std_dev: f64,
+    /// Sum of squared intensity gradients (quality metric).
+    #[serde(default)]
+    pub sssig: f64,
+    /// Convergence norm threshold used in the solve (for display in convergence plot).
+    #[serde(default = "default_max_norm")]
+    pub max_norm: f64,
+}
+
+fn default_max_norm() -> f64 {
+    1e-3
 }
 
 /// Output of a DIC solve ([`Subset::solve_icgn`] / [`Subset::solve_fagn`]).

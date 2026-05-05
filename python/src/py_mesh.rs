@@ -7,6 +7,7 @@
 //!   `mesh_` to avoid name collisions at the module level.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -15,11 +16,17 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
+use geopyv_dev::geometry::meshing;
 use geopyv_dev::mesh::{
     self, Mesh, MeshSolution, SolveConfig, SolveMethod,
 };
 
-use crate::{py_image::PyImage, py_templates::PyTemplate, Error};
+use crate::{
+    py_geometry::extract_region,
+    py_image::PyImage,
+    py_templates::PyTemplate,
+    Error,
+};
 
 // ---------------------------------------------------------------------------
 // Mesh class
@@ -39,35 +46,46 @@ impl PyMesh {
     ///
     /// Parameters
     /// ----------
-    /// borders : numpy.ndarray, shape (N, 2), float64
-    ///     Outer boundary polygon vertices.
-    /// segments : numpy.ndarray, shape (S, 2), int32
-    ///     Constraint segment endpoint indices into `borders`.
-    /// curves : list[list[int]]
-    ///     Grouped constraint curve indices.
+    /// boundary : CircleRegion, PathRegion, or numpy.ndarray (N, 2)
+    ///     Boundary region or raw polygon vertices. Raw arrays imply ``boundary_hard=False``.
     /// size_lower : float
     ///     Minimum element edge length.
     /// size_upper : float
     ///     Maximum element edge length.
     /// target_nodes : int
     ///     Target node count for binary-search sizing.
+    /// exclusions : list[CircleRegion | PathRegion | numpy.ndarray], optional
+    ///     Exclusion regions or raw polygon arrays. Default None.
     /// mesh_order : int, optional
     ///     1 (linear) or 2 (quadratic). Default 1.
     #[new]
-    #[pyo3(signature = (borders, segments, curves, size_lower, size_upper, target_nodes, mesh_order=1))]
+    #[pyo3(signature = (boundary, size_lower, size_upper, target_nodes, exclusions=None, mesh_order=1))]
     fn new(
-        borders: PyReadonlyArray2<f64>,
-        segments: PyReadonlyArray2<i32>,
-        curves: Vec<Vec<i32>>,
+        boundary: &Bound<'_, PyAny>,
         size_lower: f64,
         size_upper: f64,
         target_nodes: usize,
+        exclusions: Option<Vec<Bound<'_, PyAny>>>,
         mesh_order: u8,
     ) -> PyResult<Self> {
-        let b = borders.as_array();
-        let s = segments.as_array();
-        let m = Mesh::generate(b, s, &curves, size_lower, size_upper, target_nodes, mesh_order)
-            .map_err(Error::from)?;
+        let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
+        let excl_owned: Vec<Array2<f64>> = exclusions
+            .unwrap_or_default()
+            .iter()
+            .map(|obj| extract_region(obj).map(|(nodes, _)| nodes))
+            .collect::<PyResult<Vec<_>>>()?;
+        let excl_views: Vec<_> = excl_owned.iter().map(|a| a.view()).collect();
+        let roi = meshing::define_roi(boundary_nodes.view(), boundary_hard, &excl_views, None);
+        let m = Mesh::generate(
+            roi.borders.view(),
+            roi.segments.view(),
+            &roi.curves,
+            size_lower,
+            size_upper,
+            target_nodes,
+            mesh_order,
+        )
+        .map_err(Error::from)?;
         Ok(PyMesh { inner: m })
     }
 
@@ -123,17 +141,15 @@ impl PyMesh {
             tolerance,
             method: solve_method,
         };
-        let f_path = f_img.filepath.clone();
-        let g_path = g_img.filepath.clone();
+        let f_path = f_img.filepath.as_deref().map(PathBuf::from).unwrap_or_default();
+        let g_path = g_img.filepath.as_deref().map(PathBuf::from).unwrap_or_default();
         let tmpl = template
             .extract::<PyRef<'_, PyTemplate>>()
             .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
-        let mut sol = self
+        let sol = self
             .inner
-            .solve(&f_img.inner, &g_img.inner, &tmpl.inner.coords, seed_coord, &seed_warp, &cfg)
+            .solve(&f_img.inner, &g_img.inner, &tmpl.inner.coords, seed_coord, &seed_warp, &cfg, f_path, g_path)
             .map_err(Error::from)?;
-        sol.f_img_path = f_path;
-        sol.g_img_path = g_path;
         Ok(PyMeshSolution { inner: sol })
     }
 
@@ -240,8 +256,8 @@ impl PyMeshSolution {
                 subset_order,
                 iterations: Array1::<u32>::zeros(n_nodes),
                 norms: Array1::<f64>::zeros(n_nodes),
-                f_img_path,
-                g_img_path,
+                f_img_path: f_img_path.map(PathBuf::from).unwrap_or_default(),
+                g_img_path: g_img_path.map(PathBuf::from).unwrap_or_default(),
             },
         }
     }
@@ -323,16 +339,18 @@ impl PyMeshSolution {
         self.inner.subset_order
     }
 
-    /// Reference image file path, or ``None``.
+    /// Reference image file path, or ``None`` if not set.
     #[getter]
     fn f_img_path(&self) -> Option<String> {
-        self.inner.f_img_path.clone()
+        let s = self.inner.f_img_path.to_string_lossy().into_owned();
+        if s.is_empty() { None } else { Some(s) }
     }
 
-    /// Target image file path, or ``None``.
+    /// Target image file path, or ``None`` if not set.
     #[getter]
     fn g_img_path(&self) -> Option<String> {
-        self.inner.g_img_path.clone()
+        let s = self.inner.g_img_path.to_string_lossy().into_owned();
+        if s.is_empty() { None } else { Some(s) }
     }
 
     /// Per-node iteration counts ``(N,)``.

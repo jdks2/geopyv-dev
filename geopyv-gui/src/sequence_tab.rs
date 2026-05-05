@@ -15,7 +15,7 @@ use geopyv_dev::sequence::{deformation_preconditioning, SequenceSolution};
 use geopyv_dev::templates::{Template, TemplateShape};
 
 use crate::colormap::ColormapType;
-use crate::draw::{ActiveDrawMode, ImageCoord};
+use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
 use crate::mesh_tab::{
     extract_nodal_values, format_sci, mesh_coord_from_bounds, render_colorbar,
@@ -354,7 +354,7 @@ impl SequenceTabState {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("Select start index to preview reference image")
-                            .size(14.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                 });
@@ -384,7 +384,7 @@ impl SequenceTabState {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("Select a sequence from the list")
-                            .size(14.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                 });
@@ -526,7 +526,7 @@ impl SequenceTabState {
                         self.view.current_frame + 1,
                         n_frames
                     ))
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
                 );
                 ui.add_space(10.0);
@@ -576,7 +576,7 @@ impl SequenceTabState {
             None => {
                 ui.label(
                     egui::RichText::new("No sequence selected")
-                        .size(13.0)
+                        .size(15.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 return;
@@ -635,7 +635,7 @@ impl SequenceTabState {
                     self.view.current_frame + 1,
                     n_frames
                 ))
-                .size(12.0),
+                .size(16.0),
             );
             if ui
                 .add(egui::Button::new("\u{25ba}").min_size(egui::vec2(24.0, 22.0)))
@@ -682,7 +682,7 @@ impl SequenceTabState {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new("Speed:")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
                 ui.add(
@@ -719,7 +719,7 @@ impl SequenceTabState {
 
         ui.label(
             egui::RichText::new("\u{2500}\u{2500} Displacement \u{2500}\u{2500}")
-                .size(11.0)
+                .size(15.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.horizontal_wrapped(|ui| {
@@ -731,7 +731,7 @@ impl SequenceTabState {
         ui.add_space(3.0);
         ui.label(
             egui::RichText::new("\u{2500}\u{2500} Strain \u{2500}\u{2500}")
-                .size(11.0)
+                .size(15.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.horizontal_wrapped(|ui| {
@@ -760,7 +760,7 @@ impl SequenceTabState {
         ui.add_space(3.0);
         ui.label(
             egui::RichText::new("\u{2500}\u{2500} Quality \u{2500}\u{2500}")
-                .size(11.0)
+                .size(15.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.horizontal_wrapped(|ui| {
@@ -780,7 +780,7 @@ impl SequenceTabState {
         ui.add_space(3.0);
         ui.label(
             egui::RichText::new("\u{2500}\u{2500} Geometry \u{2500}\u{2500}")
-                .size(11.0)
+                .size(15.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.checkbox(&mut self.view.show_wireframe, "Show wireframe");
@@ -822,7 +822,7 @@ impl SequenceTabState {
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new("Min:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -837,7 +837,7 @@ impl SequenceTabState {
                     ui.end_row();
                     ui.label(
                         egui::RichText::new("Max:")
-                            .size(12.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                     let r = ui.add(
@@ -875,7 +875,7 @@ impl SequenceTabState {
                         format_sci(mn),
                         format_sci(mx)
                     ))
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
                 );
             });
@@ -935,13 +935,13 @@ impl SequenceTabState {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("Solving sequence\u{2026}")
-                    .size(14.0)
+                    .size(16.0)
                     .color(ui.visuals().text_color()),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(&message)
-                    .size(12.0)
+                    .size(16.0)
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(8.0);
@@ -1040,7 +1040,7 @@ impl SequenceTabState {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(err)
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
         }
@@ -1052,7 +1052,7 @@ impl SequenceTabState {
         ui.add_space(3.0);
         ui.label(
             egui::RichText::new(format!("{} images available", images.len()))
-                .size(11.0)
+                .size(15.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.add_space(3.0);
@@ -1088,21 +1088,21 @@ impl SequenceTabState {
                 let n_pairs = n_images - 1;
                 ui.label(
                     egui::RichText::new(format!("{n_images} images \u{2192} {n_pairs} pairs"))
-                        .size(11.0)
+                        .size(15.0)
                         .color(egui::Color32::from_rgb(100, 200, 100)),
                 );
             }
             (Some(_), Some(_)) => {
                 ui.label(
                     egui::RichText::new("End must be > Start")
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().error_fg_color),
                 );
             }
             _ => {
                 ui.label(
                     egui::RichText::new("Enter start and end indices")
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().weak_text_color()),
                 );
             }
@@ -1179,7 +1179,7 @@ impl SequenceTabState {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(err)
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().error_fg_color),
                 );
             }
@@ -1260,7 +1260,7 @@ impl SequenceTabState {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(err)
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().error_fg_color),
                 );
             }
@@ -1309,7 +1309,7 @@ impl SequenceTabState {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(err)
-                        .size(11.0)
+                        .size(15.0)
                         .color(ui.visuals().error_fg_color),
                 );
             }
@@ -1324,6 +1324,25 @@ impl SequenceTabState {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
+            for (label, mode) in [
+                ("Rectangular", DrawShapeMode::Rectangular),
+                ("Circular",    DrawShapeMode::Circular),
+                ("Free",        DrawShapeMode::Free),
+            ] {
+                let resp = ui.selectable_value(&mut form.draw.shape_mode, mode, label);
+                if resp.changed() {
+                    form.draw.reset_in_progress();
+                }
+            }
+            if form.draw.shape_mode == DrawShapeMode::Circular {
+                ui.add_space(8.0);
+                ui.label("Points:");
+                ui.add(egui::DragValue::new(&mut form.draw.circle_n_points).range(6..=200).speed(1.0));
+            }
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
             let b_active = form.draw.mode == Some(ActiveDrawMode::Boundary);
             let btn_b = egui::Button::new(
                 egui::RichText::new(if b_active {
@@ -1331,7 +1350,7 @@ impl SequenceTabState {
                 } else {
                     "Boundary \u{25b6}"
                 })
-                .size(12.0),
+                .size(16.0),
             )
             .selected(b_active);
             if ui.add(btn_b).clicked() {
@@ -1349,7 +1368,7 @@ impl SequenceTabState {
                 } else {
                     "Exclusion \u{25b6}"
                 })
-                .size(12.0),
+                .size(16.0),
             )
             .selected(e_active);
             if ui.add(btn_e).clicked() {
@@ -1367,7 +1386,7 @@ impl SequenceTabState {
                 } else {
                     "Seed \u{25b6}"
                 })
-                .size(12.0),
+                .size(16.0),
             )
             .selected(s_active);
             if ui.add(btn_s).clicked() {
@@ -1387,7 +1406,7 @@ impl SequenceTabState {
             } else {
                 ("boundary \u{2014}", ui.visuals().weak_text_color())
             };
-            ui.label(egui::RichText::new(b_text).size(11.0).color(b_color));
+            ui.label(egui::RichText::new(b_text).size(15.0).color(b_color));
             ui.add_space(8.0);
 
             let exc_n = form.draw.exclusions.len();
@@ -1398,7 +1417,7 @@ impl SequenceTabState {
             };
             ui.label(
                 egui::RichText::new(format!("exclusions: {exc_n}"))
-                    .size(11.0)
+                    .size(15.0)
                     .color(e_color),
             );
             ui.add_space(8.0);
@@ -1408,14 +1427,22 @@ impl SequenceTabState {
             } else {
                 ("seed \u{2014}", ui.visuals().weak_text_color())
             };
-            ui.label(egui::RichText::new(s_text).size(11.0).color(s_color));
+            ui.label(egui::RichText::new(s_text).size(15.0).color(s_color));
         });
 
         if form.draw.has_self_intersection() {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new("Self-intersecting polygon")
-                    .size(11.0)
+                    .size(15.0)
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
+        if form.draw.exclusion_out_of_bounds {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Exclusion must be within boundary.")
+                    .size(13.0)
                     .color(ui.visuals().error_fg_color),
             );
         }
@@ -1427,7 +1454,7 @@ impl SequenceTabState {
         if let Some(err) = &form.form_error.clone() {
             ui.label(
                 egui::RichText::new(err)
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
             ui.add_space(4.0);
@@ -1441,21 +1468,9 @@ impl SequenceTabState {
                 .clicked()
             {
                 let seed = form.draw.seed.unwrap();
-                let boundary: Vec<[f64; 2]> = form
-                    .draw
-                    .boundary
-                    .as_ref()
-                    .unwrap()
-                    .vertices
-                    .iter()
-                    .map(|p| [p.x as f64, p.y as f64])
-                    .collect();
-                let exclusions: Vec<Vec<[f64; 2]>> = form
-                    .draw
-                    .exclusions
-                    .iter()
-                    .map(|ex| ex.vertices.iter().map(|p| [p.x as f64, p.y as f64]).collect())
-                    .collect();
+                let boundary: Vec<[f64; 2]> = form.draw.boundary.as_ref().unwrap().to_nodes();
+                let exclusions: Vec<Vec<[f64; 2]>> =
+                    form.draw.exclusions.iter().map(|r| r.to_nodes()).collect();
                 let start = form.start_idx.unwrap();
                 let end = form.end_idx.unwrap();
                 let image_paths: Vec<PathBuf> = images[start..=end].to_vec();
@@ -1545,7 +1560,7 @@ fn show_progress_overlay(
             egui::pos2(bar_rect.min.x, bar_rect.max.y + 6.0),
             egui::Align2::LEFT_TOP,
             &message,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            egui::FontId::new(15.0, egui::FontFamily::Proportional),
             egui::Color32::from_rgb(200, 200, 200),
         );
     }
@@ -1660,6 +1675,18 @@ fn run_solve(
     let mut f_index = 0usize;
     let mut g_index = 1usize;
 
+    // Spawn background I/O thread so frame writes don't block the solve loop.
+    let (io_tx, io_rx) = std::sync::mpsc::sync_channel::<(PathBuf, MeshSolution)>(4);
+    let io_state = Arc::clone(&state);
+    let io_thread = std::thread::spawn(move || {
+        while let Ok((path, mesh_sol)) = io_rx.recv() {
+            if let Err(e) = geopyv_dev::io::save(&path, &GeopyvObject::Mesh(mesh_sol)) {
+                set_error(&io_state, format!("Frame save error: {e}"));
+                break;
+            }
+        }
+    });
+
     // Load initial reference image.
     let mut f_img = match Image::from_file(&params.image_paths[f_index], params.border) {
         Ok(img) => img,
@@ -1725,6 +1752,8 @@ fn run_solve(
             seed_coord,
             &seed_warp,
             &pair_cfg,
+            params.image_paths[f_index].clone(),
+            params.image_paths[g_index].clone(),
         );
 
         let mesh_sol = match pair_result {
@@ -1748,8 +1777,11 @@ fn run_solve(
                     }
                     continue 'outer;
                 } else {
+                    drop(io_tx);
+                    let _ = io_thread.join();
                     let sol = SequenceSolution {
                         mesh_solutions,
+                        mesh_paths: vec![],
                         solved: false,
                         unsolvable: true,
                         override_log,
@@ -1767,14 +1799,11 @@ fn run_solve(
             mesh_override = false;
         }
 
-        // Per-frame save.
+        // Queue frame for background I/O.
         let frame_path = params
             .mesh_subdir
             .join(format!("frame_{:03}.pyv", mesh_solutions.len()));
-        if let Err(e) =
-            geopyv_dev::io::save(&frame_path, &GeopyvObject::Mesh(mesh_sol.clone()))
-        {
-            set_error(&state, format!("Frame save error: {e}"));
+        if io_tx.send((frame_path, mesh_sol.clone())).is_err() {
             return;
         }
 
@@ -1827,10 +1856,15 @@ fn run_solve(
 
     let sol = SequenceSolution {
         mesh_solutions,
+        mesh_paths: vec![],
         solved: true,
         unsolvable: false,
         override_log,
     };
+
+    // Wait for all queued frame writes to complete before saving the sequence.
+    drop(io_tx);
+    let _ = io_thread.join();
 
     let seq_path = params.sequences_dir.join(format!("{}.pyv", params.name));
     if let Err(e) = geopyv_dev::io::save(&seq_path, &GeopyvObject::Sequence(sol.clone())) {
@@ -1877,13 +1911,13 @@ fn parse_1based_index(text: &str, n: usize) -> Option<usize> {
 }
 
 fn lbl(text: &str) -> egui::RichText {
-    egui::RichText::new(text).size(12.0)
+    egui::RichText::new(text).size(16.0)
 }
 
 fn section_header(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
-            .size(11.0)
+            .size(15.0)
             .color(ui.visuals().weak_text_color()),
     );
     ui.add_space(2.0);
@@ -1894,10 +1928,10 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(format!("{label}:"))
-                .size(12.0)
+                .size(16.0)
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.label(egui::RichText::new(value).size(13.0));
+        ui.label(egui::RichText::new(value).size(15.0));
     });
     ui.add_space(2.0);
 }

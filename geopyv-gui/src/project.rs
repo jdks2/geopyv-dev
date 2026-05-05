@@ -261,8 +261,24 @@ fn list_files_with_exts(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
         .filter(|p| p.is_file() && matches_ext(p, exts))
         .collect();
 
-    files.sort();
+    files.sort_by_key(|p| (natural_sort_key(p), p.clone()));
     files
+}
+
+fn last_integer_in_str(s: &str) -> Option<usize> {
+    let end = s.rfind(|c: char| c.is_ascii_digit())?;
+    let start = s[..=end]
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + s[i..].chars().next().map_or(1, |c| c.len_utf8()))
+        .unwrap_or(0);
+    s[start..=end].parse().ok()
+}
+
+fn natural_sort_key(p: &std::path::Path) -> usize {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(last_integer_in_str)
+        .unwrap_or(usize::MAX)
 }
 
 // ---------------------------------------------------------------------------

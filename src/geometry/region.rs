@@ -8,7 +8,7 @@
 //!   - Domain validation: `Result<T, Error>` constructors.
 //!   - GUI fallback: centre is always required; passing `None` is an error.
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -27,6 +27,33 @@ pub enum RegionOption {
     R,
     /// Flexible: tracked region that can fully deform.
     F,
+}
+
+impl std::fmt::Display for RegionOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            RegionOption::D => "D",
+            RegionOption::S => "S",
+            RegionOption::R => "R",
+            RegionOption::F => "F",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for RegionOption {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "D" => Ok(RegionOption::D),
+            "S" => Ok(RegionOption::S),
+            "R" => Ok(RegionOption::R),
+            "F" => Ok(RegionOption::F),
+            other => Err(crate::Error::InvalidInput(format!(
+                "option must be 'D', 'S', 'R', or 'F'; got '{other}'"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,14 +87,12 @@ pub struct Region {
     #[serde(with = "serde_ndarray_2d")]
     pub current_nodes: Array2<f64>,
     /// Working centre (updated by `update`).
-    #[serde(with = "serde_ndarray_1d")]
-    pub current_centre: Array1<f64>,
+    pub current_centre: [f64; 2],
     /// Accumulated node snapshots (grows with each `store_*` call).
     #[serde(with = "serde_vec_ndarray_2d")]
     pub history_nodes: Vec<Array2<f64>>,
     /// Accumulated centre snapshots (grows with each `store_*` call).
-    #[serde(with = "serde_vec_ndarray_1d")]
-    pub history_centres: Vec<Array1<f64>>,
+    pub history_centres: Vec<[f64; 2]>,
     pub counter: usize,
     pub ref_index: Option<usize>,
     pub reference_update_register: Vec<usize>,
@@ -114,14 +139,14 @@ impl Region {
             if j == 0 { radius * theta.cos() + centre[0] } else { radius * theta.sin() + centre[1] }
         });
 
-        Self::from_parts(
+        Ok(Self::from_parts(
             RegionShape::Circle { radius, size },
             option,
-            Array1::from_vec(vec![centre[0], centre[1]]),
+            centre,
             nodes,
             hard,
             compensate,
-        )
+        ))
     }
 
     /// Create a path (arbitrary polygon) region.
@@ -142,37 +167,37 @@ impl Region {
             return Err(Error::InvalidInput("nodes must not be empty".to_string()));
         }
 
-        let c: Array1<f64> = match centre {
-            Some(pt) => Array1::from_vec(vec![pt[0], pt[1]]),
+        let c: [f64; 2] = match centre {
+            Some(pt) => pt,
             None => {
                 let mx = nodes.column(0).mean().unwrap_or(0.0);
                 let my = nodes.column(1).mean().unwrap_or(0.0);
-                Array1::from_vec(vec![mx, my])
+                [mx, my]
             }
         };
 
-        Self::from_parts(
+        Ok(Self::from_parts(
             RegionShape::Path { radius },
             option,
             c,
             nodes,
             hard,
             compensate,
-        )
+        ))
     }
 
     /// Low-level constructor used by `circle` and `path`.
     fn from_parts(
         shape: RegionShape,
         option: RegionOption,
-        centre: Array1<f64>,
+        centre: [f64; 2],
         nodes: Array2<f64>,
         hard: bool,
         compensate: bool,
-    ) -> Result<Self, Error> {
+    ) -> Self {
         let history_nodes = vec![nodes.clone()];
-        let history_centres = vec![centre.clone()];
-        Ok(Region {
+        let history_centres = vec![centre];
+        Region {
             shape,
             option,
             hard,
@@ -186,7 +211,7 @@ impl Region {
             counter: 0,
             ref_index: None,
             reference_update_register: Vec::new(),
-        })
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -223,10 +248,10 @@ impl Region {
         let new_nodes: Array2<f64> = Array2::from_shape_fn((n, 2), |(i, j)| {
             self.current_centre[j] + warp[j] + rotated[[i, j]]
         });
-        let new_centre = Array1::from_vec(vec![
+        let new_centre: [f64; 2] = [
             self.current_centre[0] + warp[0],
             self.current_centre[1] + warp[1],
-        ]);
+        ];
         self.history_nodes.push(new_nodes);
         self.history_centres.push(new_centre);
         self.solved = true;
@@ -240,7 +265,7 @@ impl Region {
     ///
     /// `warp` is a 2-D array of shape `(N, 2)` with per-node displacement
     /// vectors `[du, dv]`, matching the shape of `current_nodes`.
-    pub fn store_flexible(&mut self, warp: &Array2<f64>) -> Result<(), Error> {
+    pub fn store_flexible(&mut self, warp: ArrayView2<f64>) -> Result<(), Error> {
         let n = self.current_nodes.nrows();
         if warp.nrows() != n || warp.ncols() != 2 {
             return Err(Error::InvalidInput(format!(
@@ -249,14 +274,14 @@ impl Region {
                 warp.ncols()
             )));
         }
-        let new_nodes = &self.current_nodes + warp;
+        let new_nodes = &self.current_nodes + &warp;
         // centre += mean(warp, axis=0)
         let warp_mean_x = warp.column(0).mean().unwrap_or(0.0);
         let warp_mean_y = warp.column(1).mean().unwrap_or(0.0);
-        let new_centre = Array1::from_vec(vec![
+        let new_centre: [f64; 2] = [
             self.current_centre[0] + warp_mean_x,
             self.current_centre[1] + warp_mean_y,
-        ]);
+        ];
         self.history_nodes.push(new_nodes);
         self.history_centres.push(new_centre);
         self.solved = true;
@@ -289,7 +314,7 @@ impl Region {
                 let idx = self.counter;
                 if idx < self.history_nodes.len() {
                     self.current_nodes = self.history_nodes[idx].clone();
-                    self.current_centre = self.history_centres[idx].clone();
+                    self.current_centre = self.history_centres[idx];
                 }
             }
         }
@@ -305,19 +330,12 @@ impl Region {
 ///
 /// Replicates Python `int(re.findall(r"\d+", s)[-1])`.
 fn last_integer_in_str(s: &str) -> Option<usize> {
-    let mut groups: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            groups.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        groups.push(current);
-    }
-    groups.last().and_then(|g| g.parse().ok())
+    let end = s.rfind(|c: char| c.is_ascii_digit())?;
+    let start = s[..=end]
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + s[i..].chars().next().map_or(1, |c| c.len_utf8()))
+        .unwrap_or(0);
+    s[start..=end].parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -344,20 +362,6 @@ mod serde_ndarray_2d {
         let flat: Vec<f64> = v.into_iter().flatten().collect();
         let rows = flat.len() / cols;
         Array2::from_shape_vec((rows, cols), flat).map_err(serde::de::Error::custom)
-    }
-}
-
-mod serde_ndarray_1d {
-    use ndarray::Array1;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(arr: &Array1<f64>, s: S) -> Result<S::Ok, S::Error> {
-        arr.to_vec().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Array1<f64>, D::Error> {
-        let v: Vec<f64> = Vec::deserialize(d)?;
-        Ok(Array1::from_vec(v))
     }
 }
 
@@ -390,21 +394,6 @@ mod serde_vec_ndarray_2d {
     }
 }
 
-mod serde_vec_ndarray_1d {
-    use ndarray::Array1;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Vec<Array1<f64>>, s: S) -> Result<S::Ok, S::Error> {
-        let vv: Vec<Vec<f64>> = v.iter().map(|a| a.to_vec()).collect();
-        vv.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Array1<f64>>, D::Error> {
-        let vv: Vec<Vec<f64>> = Vec::deserialize(d)?;
-        Ok(vv.into_iter().map(Array1::from_vec).collect())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -412,6 +401,12 @@ mod serde_vec_ndarray_1d {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_option_roundtrip() {
+        assert_eq!("R".parse::<RegionOption>().unwrap(), RegionOption::R);
+        assert!("X".parse::<RegionOption>().is_err());
+    }
 
     #[test]
     fn circle_region_node_count() {
@@ -443,7 +438,7 @@ mod tests {
         let nodes = ndarray::array![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         let mut r = Region::path(None, nodes.clone(), RegionOption::F, true, true, 5.0).unwrap();
         let warp = ndarray::array![[1.0, 0.5], [1.0, 0.5], [1.0, 0.5], [1.0, 0.5]];
-        r.store_flexible(&warp).unwrap();
+        r.store_flexible(warp.view()).unwrap();
         assert_eq!(r.counter, 1);
         assert_eq!(r.history_nodes.len(), 2);
         // New nodes = original + warp.
@@ -477,7 +472,7 @@ mod tests {
         let nodes = ndarray::array![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         let mut r = Region::path(None, nodes.clone(), RegionOption::F, true, true, 5.0).unwrap();
         let warp = ndarray::array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
-        r.store_flexible(&warp).unwrap(); // counter=1, history has 2 entries
+        r.store_flexible(warp.view()).unwrap(); // counter=1, history has 2 entries
         // update with counter=1: sets current to history[1]
         r.update("image_001.jpg");
         assert!((r.current_nodes[[0, 0]] - 1.0).abs() < 1e-12);
