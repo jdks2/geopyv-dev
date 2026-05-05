@@ -199,6 +199,7 @@ pub struct MainWindow {
     pub texture_cache: TextureCache,
     pending_refresh: bool,
     pub error_modal: Option<String>,
+    delete_confirm: Option<(PathBuf, String)>,
 }
 
 impl MainWindow {
@@ -216,6 +217,7 @@ impl MainWindow {
             texture_cache: TextureCache::new(),
             pending_refresh: false,
             error_modal: None,
+            delete_confirm: None,
         }
     }
 
@@ -368,6 +370,28 @@ impl MainWindow {
             if self.active_tab == Tab::Fields {
                 self.field.action_save(&out_dir, selected_path.as_deref());
             }
+            if self.active_tab == Tab::Subsets && self.mode == PaneMode::View {
+                self.subset_action_save(&out_dir, ctx);
+            }
+        }
+
+        // Handle egui screenshot events (for subset view save).
+        let screenshot: Option<std::sync::Arc<egui::ColorImage>> =
+            ctx.input(|i| {
+                i.events.iter().find_map(|e| {
+                    if let egui::Event::Screenshot { image, .. } = e {
+                        Some(image.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+        if let Some(img) = screenshot {
+            if let Some(result) = self.subset.handle_screenshot(&img) {
+                if let Err(e) = result {
+                    self.error_modal = Some(e);
+                }
+            }
         }
 
         egui::TopBottomPanel::top("tab_bar")
@@ -490,6 +514,7 @@ impl MainWindow {
 
         // Error modal.
         self.show_error_modal(ctx);
+        self.show_delete_modal(ctx);
     }
 
     fn show_error_modal(&mut self, ctx: &egui::Context) {
@@ -514,6 +539,48 @@ impl MainWindow {
         }
     }
 
+    fn show_delete_modal(&mut self, ctx: &egui::Context) {
+        let Some((ref path, ref name)) = self.delete_confirm.clone() else {
+            return;
+        };
+        egui::Window::new("Confirm Delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("Are you sure you want to delete {}?", name));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Warning: Any higher structures dependent on this file will crash.",
+                    )
+                    .color(ui.visuals().warn_fg_color),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("Yes").min_size(egui::vec2(60.0, 24.0)))
+                        .clicked()
+                    {
+                        let _ = if path.is_dir() {
+                            std::fs::remove_dir_all(path)
+                        } else {
+                            std::fs::remove_file(path)
+                        };
+                        self.left.selected = None;
+                        self.delete_confirm = None;
+                        self.pending_refresh = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(60.0, 24.0)))
+                        .clicked()
+                    {
+                        self.delete_confirm = None;
+                    }
+                });
+            });
+    }
+
     // -----------------------------------------------------------------------
     // Tab bar
     // -----------------------------------------------------------------------
@@ -523,7 +590,7 @@ impl MainWindow {
             ui.add_space(4.0);
             for &tab in Tab::ALL {
                 let selected = self.active_tab == tab;
-                let text = egui::RichText::new(tab.label()).size(13.0);
+                let text = egui::RichText::new(tab.label()).size(15.0);
                 let btn = egui::Button::new(text).selected(selected).corner_radius(4.0);
                 if ui.add(btn).clicked() && !selected {
                     self.active_tab = tab;
@@ -565,6 +632,25 @@ impl MainWindow {
                     } else if ui.button("New").clicked() {
                         self.left.selected = None;
                         self.mode = PaneMode::New;
+                        if self.active_tab == Tab::Meshes {
+                            self.mesh.new_form = crate::mesh_tab::NewMeshForm::default();
+                            self.mesh.image_viewer = crate::image_viewer::ImageViewer::new();
+                        }
+                    }
+
+                    if ui
+                        .add_enabled(
+                            has_selection,
+                            egui::Button::new("Delete").min_size(egui::vec2(54.0, 24.0)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(entry) =
+                            self.left.selected.and_then(|i| self.left.entries.get(i))
+                        {
+                            self.delete_confirm =
+                                Some((entry.path.clone(), entry.display.clone()));
+                        }
                     }
                 });
             });
@@ -580,7 +666,7 @@ impl MainWindow {
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new("(empty)")
-                                .size(12.0)
+                                .size(14.0)
                                 .color(ui.visuals().weak_text_color()),
                         );
                     });
@@ -629,12 +715,12 @@ impl MainWindow {
 
                     let galley_name = ui.painter().layout_no_wrap(
                         entry.display.clone(),
-                        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                        egui::FontId::new(15.0, egui::FontFamily::Proportional),
                         text_color,
                     );
                     let galley_age = ui.painter().layout_no_wrap(
                         entry.age.clone(),
-                        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                        egui::FontId::new(13.0, egui::FontFamily::Proportional),
                         ui.visuals().weak_text_color(),
                     );
 
@@ -696,7 +782,7 @@ impl MainWindow {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             egui::RichText::new("Select an image from the list")
-                                .size(14.0)
+                                .size(16.0)
                                 .color(ui.visuals().weak_text_color()),
                         );
                     });
@@ -801,7 +887,7 @@ impl MainWindow {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(status_text)
-                        .size(12.0)
+                        .size(14.0)
                         .color(ui.visuals().weak_text_color()),
                 );
             });
@@ -838,11 +924,20 @@ impl MainWindow {
                     if ui.button("Save").clicked() {
                         if tab == Tab::Fields {
                             self.field.action_save(out_dir, selected_path);
+                        } else if tab == Tab::Subsets && mode == PaneMode::View {
+                            self.subset_action_save(out_dir, ui.ctx());
                         }
                     }
                     if ui.button("Save As\u{2026}").clicked() {
                         if tab == Tab::Fields {
                             self.field.action_save_as(selected_path);
+                        } else if tab == Tab::Subsets && mode == PaneMode::View {
+                            self.subset_action_save_as(ui.ctx());
+                        }
+                    }
+                    if tab == Tab::Meshes && mode == PaneMode::View {
+                        if ui.button("Export As\u{2026}").clicked() {
+                            self.mesh_action_export_as();
                         }
                     }
                 });
@@ -865,7 +960,7 @@ impl MainWindow {
                     (Tab::Images, _, None) => {
                         ui.label(
                             egui::RichText::new("No image selected")
-                                .size(13.0)
+                                .size(15.0)
                                 .color(ui.visuals().weak_text_color()),
                         );
                     }
@@ -937,7 +1032,7 @@ impl MainWindow {
             ui,
             "Index",
             &index
-                .map(|i| format!("{}", i + 1))
+                .map(|i| format!("{}", i))
                 .unwrap_or_else(|| "\u{2014}".to_string()),
         );
         meta_row(ui, "Format", &extension);
@@ -965,6 +1060,84 @@ impl MainWindow {
         }
 
         self.left.refresh(Tab::Images, project, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Subset save actions
+    // -----------------------------------------------------------------------
+
+    fn subset_save_path(&self, out_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let sol = self.subset.view.solution.as_ref()?;
+        let stem = sol.ref_image
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "subset".to_string());
+        let mode_str = match self.subset.view.active_plot {
+            crate::subset_tab::SubsetPlotMode::Displacement => "displacement",
+            crate::subset_tab::SubsetPlotMode::Inspect => "inspect",
+            crate::subset_tab::SubsetPlotMode::Convergence => "convergence",
+        };
+        Some(out_dir.join(format!("{stem}_{mode_str}.png")))
+    }
+
+    fn subset_action_save(&mut self, out_dir: &std::path::Path, ctx: &egui::Context) {
+        if let Some(path) = self.subset_save_path(out_dir) {
+            self.subset.request_save(path, ctx);
+        }
+    }
+
+    fn subset_action_save_as(&mut self, ctx: &egui::Context) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save plot")
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        self.subset.request_save(path, ctx);
+    }
+
+    fn mesh_action_export_as(&mut self) {
+        let Some(sol) = self.mesh.view.solution.as_ref() else { return; };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export mesh CSV")
+            .add_filter("CSV", &["csv"])
+            .save_file()
+        else {
+            return;
+        };
+
+        let n = sol.nodes.nrows();
+        let mut rows: Vec<String> = Vec::with_capacity(n + 1);
+        rows.push(
+            "node,x,y,u_x,u_y,u_mag,eps_xx,eps_yy,eps_xy,eps_vm,c_zncc,iterations,norms"
+                .to_string(),
+        );
+
+        use crate::mesh_tab::{extract_nodal_values, MeshPlotType};
+        let exx = extract_nodal_values(sol, MeshPlotType::Exx);
+        let eyy = extract_nodal_values(sol, MeshPlotType::Eyy);
+        let exy = extract_nodal_values(sol, MeshPlotType::Exy);
+        let evm = extract_nodal_values(sol, MeshPlotType::EVM);
+
+        for i in 0..n {
+            let x   = sol.nodes[[i, 0]];
+            let y   = sol.nodes[[i, 1]];
+            let ux  = sol.displacements[[i, 0]];
+            let uy  = sol.displacements[[i, 1]];
+            let mag = (ux * ux + uy * uy).sqrt();
+            let czn = sol.c_zncc[i];
+            let itr = sol.iterations[i];
+            let nrm = sol.norms[i];
+            rows.push(format!(
+                "{i},{x:.6},{y:.6},{ux:.6},{uy:.6},{mag:.6},{:.6},{:.6},{:.6},{:.6},{czn:.6},{itr},{nrm:.6}",
+                exx[i], eyy[i], exy[i], evm[i]
+            ));
+        }
+
+        if let Err(e) = std::fs::write(&path, rows.join("\n")) {
+            self.error_modal = Some(format!("Export failed: {e}"));
+        }
     }
 
 }
@@ -1037,10 +1210,10 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(format!("{label}:"))
-                .size(12.0)
+                .size(14.0)
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.label(egui::RichText::new(value).size(13.0));
+        ui.label(egui::RichText::new(value).size(15.0));
     });
     ui.add_space(2.0);
 }

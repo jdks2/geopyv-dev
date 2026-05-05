@@ -8,9 +8,13 @@
 //!
 //! ```text
 //! [0..4]   magic  b"GPYV"
-//! [4]      version  0x01
-//! [5..]    bincode v2 (standard config) encoded GeopyvObject
+//! [4]      version  0x01 (uncompressed, legacy) or 0x02 (zstd-compressed)
+//! [5..]    bincode v2 (standard config) encoded GeopyvObject,
+//!          optionally compressed with zstd (level 3) for version 0x02
 //! ```
+//!
+//! Version 0x01 files (written by earlier releases) are still readable.
+//! New files are always written with version 0x02 (zstd-compressed).
 //!
 //! The type tag is embedded in the bincode stream via serde's enum encoding.
 //!
@@ -40,7 +44,10 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 const MAGIC: &[u8; 4] = b"GPYV";
-const VERSION: u8 = 0x01;
+/// Legacy uncompressed format; still readable on load.
+const VERSION_UNCOMPRESSED: u8 = 0x01;
+/// Current format: zstd-compressed bincode payload.
+const VERSION_ZSTD: u8 = 0x02;
 
 // ---------------------------------------------------------------------------
 // Tagged union for all serialisable object types
@@ -64,22 +71,26 @@ pub enum GeopyvObject {
 /// Serialise a [`GeopyvObject`] to a `.pyv` file at `path`.
 ///
 /// The file is created (or truncated if it already exists).
-/// Format: 4-byte magic `b"GPYV"` + 1-byte version `0x01` + bincode payload.
+/// Format: 4-byte magic `b"GPYV"` + 1-byte version `0x02` + zstd-compressed
+/// bincode payload.
 pub fn save<P: AsRef<Path>>(path: P, object: &GeopyvObject) -> Result<(), Error> {
     let encoded =
         bincode::serde::encode_to_vec(object, bincode::config::standard())
             .map_err(|e| Error::Io(e.to_string()))?;
+    let compressed = zstd::encode_all(encoded.as_slice(), 3)
+        .map_err(|e| Error::Io(e.to_string()))?;
     let mut file = std::fs::File::create(path)?;
     file.write_all(MAGIC)?;
-    file.write_all(&[VERSION])?;
-    file.write_all(&encoded)?;
+    file.write_all(&[VERSION_ZSTD])?;
+    file.write_all(&compressed)?;
     Ok(())
 }
 
 /// Load a [`GeopyvObject`] from a `.pyv` file at `path`.
 ///
 /// Returns [`Error::InvalidMagic`] if the file does not start with `b"GPYV"`.
-/// Returns [`Error::UnsupportedVersion`] if the version byte is not `0x01`.
+/// Returns [`Error::UnsupportedVersion`] for any version byte other than
+/// `0x01` (legacy uncompressed) or `0x02` (zstd-compressed).
 pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
     let mut file = std::fs::File::open(path.as_ref()).map_err(|e| {
         Error::FileNotFound(format!("{}: {}", path.as_ref().display(), e))
@@ -93,12 +104,16 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
 
     let mut ver_buf = [0u8; 1];
     file.read_exact(&mut ver_buf)?;
-    if ver_buf[0] != VERSION {
-        return Err(Error::UnsupportedVersion(ver_buf[0]));
-    }
 
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+
+    let data = match ver_buf[0] {
+        VERSION_UNCOMPRESSED => raw,
+        VERSION_ZSTD => zstd::decode_all(raw.as_slice())
+            .map_err(|e| Error::Io(e.to_string()))?,
+        v => return Err(Error::UnsupportedVersion(v)),
+    };
 
     let (object, _) =
         bincode::serde::decode_from_slice::<GeopyvObject, _>(
@@ -117,6 +132,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use ndarray::{array, Array1, Array2};
 
     use crate::{
@@ -144,8 +160,8 @@ mod tests {
             subset_order: 1,
             iterations: ndarray::array![0u32, 0, 0],
             norms: ndarray::array![0.0_f64, 0.0, 0.0],
-            f_img_path: None,
-            g_img_path: None,
+            f_img_path: PathBuf::new(),
+            g_img_path: PathBuf::new(),
         }
     }
 
@@ -176,6 +192,7 @@ mod tests {
     fn test_sequence_round_trip() {
         let sol = SequenceSolution {
             mesh_solutions: vec![make_mesh_solution(), make_mesh_solution()],
+            mesh_paths: vec![],
             solved: true,
             unsolvable: false,
             override_log: vec![],
@@ -232,10 +249,35 @@ mod tests {
         let tmp = std::env::temp_dir().join("geopyv_test_bad_ver.pyv");
         {
             let mut f = std::fs::File::create(&tmp).unwrap();
-            f.write_all(b"GPYV\x02\x00\x00\x00").unwrap();
+            f.write_all(b"GPYV\x03\x00\x00\x00").unwrap();
         }
         let result = load(&tmp);
-        assert!(matches!(result, Err(Error::UnsupportedVersion(0x02))));
+        assert!(matches!(result, Err(Error::UnsupportedVersion(0x03))));
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A version 0x01 (legacy uncompressed) file is still readable.
+    #[test]
+    fn test_v1_backwards_compat() {
+        let sol = make_mesh_solution();
+        let encoded = bincode::serde::encode_to_vec(
+            &GeopyvObject::Mesh(sol.clone()),
+            bincode::config::standard(),
+        )
+        .unwrap();
+        let tmp = std::env::temp_dir().join("geopyv_test_v1_compat.pyv");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            f.write_all(b"GPYV\x01").unwrap();
+            f.write_all(&encoded).unwrap();
+        }
+        let loaded = load(&tmp).unwrap();
+        match loaded {
+            GeopyvObject::Mesh(m) => {
+                assert_eq!(m.nodes, sol.nodes);
+            }
+            _ => panic!("expected Mesh"),
+        }
         let _ = std::fs::remove_file(tmp);
     }
 

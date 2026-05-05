@@ -18,7 +18,6 @@ from geopyv_dev import (
     CircleRegion,
     PathRegion,
     mask_image,
-    define_roi,
 )
 
 
@@ -223,23 +222,3 @@ class TestMaskImage:
         assert m[5, 5] == 1    # outside exclusion
 
 
-class TestDefineRoi:
-    def test_segment_count(self):
-        bn = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
-        borders, segs, curves = define_roi(bn)
-        assert segs.shape == (4, 2)
-        assert len(curves) == 1
-
-    def test_with_exclusion(self):
-        bn = np.array([[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]])
-        en = np.array([[5.0, 5.0], [10.0, 5.0], [10.0, 10.0], [5.0, 10.0]])
-        borders, segs, curves = define_roi(bn, exclusion_nodes=[en])
-        assert borders.shape[0] == 8
-        assert len(curves) == 2
-
-    def test_with_mask(self):
-        bn = np.array([[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]])
-        result = define_roi(bn, img_shape=(20, 20))
-        assert len(result) == 4  # borders, segments, curves, mask
-        mask = result[3]
-        assert mask.shape == (20, 20)

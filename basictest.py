@@ -1,40 +1,44 @@
-import glob
 import numpy as np
 import geopyv_dev as gp
+import time
 
-# # ---------------------------------------------------------------------------
-# # Subset test
-# # ---------------------------------------------------------------------------
-# # Setup.
+# ---------------------------------------------------------------------------
+# Subset test
+# ---------------------------------------------------------------------------
+# Setup.
 ref = gp.Image(filepath="images/comp/compression_0.jpg")
 tar = gp.Image(filepath="images/comp/compression_1.jpg")
 template = gp.Template("circle", size=50)
-# 
-# # Subset instantiation.
-# subset = gp.Subset(
-#     coord=[500.0, 500.0],
-#     template=template,
-#     f_img=ref,
-#     f_img_path=ref.filepath,
-# )
-# 
-# # Subset inspection.
-# print(subset)
-# print(f"  n_px={subset.n_px}, sssig={subset.sssig:.4f}")
-# subset.inspect()
-# 
-# # Subset solving via unified solve() dispatcher.
-# result = subset.solve(g_img=tar, p_0=[0.0] * 6, algorithm="icgn")
-# print(f"  C_ZNCC={result['c_zncc']:.4f}, converged={result['converged']}, "
-#       f"iterations={result['iterations']}")
-# subset.convergence()
-# # ---------------------------------------------------------------------------
-# # Mesh test
-# # ---------------------------------------------------------------------------
-# # ROI definition (boundary polygon → borders/segments/curves arrays).
+
+# Subset instantiation.
+subset = gp.Subset(
+    coord=[500.0, 500.0],
+    template=template,
+    f_img=ref,
+)
+
+# Subset inspection.
+print(subset)
+print(f"  n_px={subset.n_px}, sssig={subset.sssig:.4f}")
+subset.inspect()
+
+# Subset solving via unified solve() dispatcher.
+result = subset.solve(g_img=tar, p_0=[0.0] * 6, algorithm="icgn")
+print(f"  C_ZNCC={result['c_zncc']:.4f}, converged={result['converged']}, "
+      f"iterations={result['iterations']}")
+subset.convergence()
+
+# ---------------------------------------------------------------------------
+# Mesh test
+# ---------------------------------------------------------------------------
 boundary_nodes = np.array(
     [[200.0, 200.0], [200.0, 800.0], [800.0, 800.0], [800.0, 200.0]]
 )
+boundary = gp.PathRegion(
+    nodes = boundary_nodes,
+    hard = False
+)
+
 exclusion_circle = gp.CircleRegion(
     centre=[700.0, 700.0],
     radius=50.0,
@@ -42,17 +46,11 @@ exclusion_circle = gp.CircleRegion(
     option="F",
     hard=True,
 )
-borders, segments, curves = gp.define_roi(
-    boundary_nodes=boundary_nodes,
-    boundary_hard=True,
-    exclusion_nodes=[exclusion_circle.current_nodes],
-)
 
 # Mesh instantiation.
 mesh = gp.Mesh(
-    borders=borders,
-    segments=segments,
-    curves=curves,
+    boundary=boundary,
+    exclusions=[exclusion_circle],
     size_lower=20.0,
     size_upper=200.0,
     target_nodes=100,
@@ -81,7 +79,7 @@ del mesh_sol
 mesh_sol = gp.load("mesh.pyv")
 print(f"Loaded: {mesh_sol}")
 
-# Mesh plots.
+Mesh plots.
 mesh_sol.inspect(alpha = 0.5)
 mesh_sol.inspect(show_areas=True)
 mesh_sol.convergence()
@@ -95,24 +93,17 @@ mesh_sol.contour("C_ZNCC")
 # ---------------------------------------------------------------------------
 # Sequence test
 # ---------------------------------------------------------------------------
-# Setup: all compression images, sorted by frame number.
-image_paths = sorted(
-    glob.glob("images/comp/compression_*.jpg"),
-    key=lambda p: int(p.split("_")[-1].split(".")[0]),
-)
-print(f"\nSequence: {len(image_paths)} images, {len(image_paths) - 1} pairs")
-
-# Sequence instantiation.
-sequence = gp.Sequence(
-    image_paths=image_paths,
-    borders=borders,
-    segments=segments,
-    curves=curves,
+# Sequence instantiation — images sorted internally by trailing integer.
+sequence = gp.Sequence.from_dir(
+    image_dir="images/comp",
+    boundary=boundary_nodes,
+    exclusions=[exclusion_circle],
     size_lower=20.0,
     size_upper=200.0,
     target_nodes=100,
     mesh_order=1,
 )
+print(f"\nSequence: {sequence.n_pairs + 1} images, {sequence.n_pairs} pairs")
 print(sequence)
 
 # Sequence solving.
@@ -120,9 +111,7 @@ seq_sol = sequence.solve(
     template=template,
     seed_coord=seed_coord,
     seed_warp=seed_warp,
-    adaptive_iterations=0,
     method="icgn",
-    alpha=0.2,
     tolerance=0.75,
     sync=True,
 )

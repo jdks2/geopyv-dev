@@ -17,3 +17,4 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
 spade = "2"
+zstd = "0.13"

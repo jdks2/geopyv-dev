@@ -9,6 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 geopyv-dev = { path = ".." }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22", features = ["extension-module", "multiple-pymethods"] }
 numpy = "0.22"
 ndarray = "0.16"

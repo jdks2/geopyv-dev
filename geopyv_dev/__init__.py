@@ -136,6 +136,26 @@ class Sequence:
     def __init__(self, *args, **kwargs):
         self._inner = _core.Sequence(*args, **kwargs)
 
+    @classmethod
+    def from_dir(cls, image_dir, boundary, size_lower, size_upper,
+                 target_nodes, exclusions=None, mesh_order=1):
+        """Construct a Sequence by scanning a directory for image files.
+
+        Parameters
+        ----------
+        image_dir : str
+            Directory containing ``*.jpg``, ``*.jpeg``, or ``*.png`` images,
+            sorted internally by trailing integer in the filename stem.
+        boundary, size_lower, size_upper, target_nodes, exclusions, mesh_order
+            Same as :class:`Sequence.__init__`.
+        """
+        obj = cls.__new__(cls)
+        obj._inner = _core.Sequence.from_dir(
+            image_dir, boundary, size_lower, size_upper,
+            target_nodes, exclusions, mesh_order,
+        )
+        return obj
+
     def __getattr__(self, name):
         return getattr(self._inner, name)
 

@@ -53,11 +53,6 @@ def make_circle_template(radius):
     return Template("circle", size=radius)
 
 
-def square_roi(x0, y0, x1, y1):
-    borders = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
-    segments = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32)
-    curves = [[0, 1, 2, 3]]
-    return borders, segments, curves
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +82,11 @@ def solved_subset(ref_img, tar_img):
 @pytest.fixture(scope="module")
 def solved_mesh(ref_img, tar_img):
     tmpl = make_circle_template(20)
-    borders, segments, curves = square_roi(150.0, 150.0, 250.0, 250.0)
-    mesh = Mesh(borders, segments, curves, size_lower=20.0, size_upper=40.0, target_nodes=15)
+    boundary = np.array(
+        [[150.0, 150.0], [250.0, 150.0], [250.0, 250.0], [150.0, 250.0]],
+        dtype=np.float64,
+    )
+    mesh = Mesh(boundary=boundary, size_lower=20.0, size_upper=40.0, target_nodes=15)
     sol = mesh.solve(ref_img, tar_img, tmpl, [200.0, 200.0], [0.0] * 6,
                      max_norm=1e-3, max_iterations=20)
     return sol

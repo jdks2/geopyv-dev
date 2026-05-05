@@ -27,8 +27,6 @@ use crate::{
 ///     Template object whose pixel offsets define the subset shape.
 /// f_img : Image
 ///     Reference image (pre-computed B-spline data).
-/// f_img_path : str, optional
-///     Path of the reference image, stored for serialisation.
 ///
 /// Attributes
 /// ----------
@@ -66,12 +64,11 @@ pub struct PySubset {
 #[pymethods]
 impl PySubset {
     #[new]
-    #[pyo3(signature = (coord, template, f_img, f_img_path=None))]
+    #[pyo3(signature = (coord, template, f_img))]
     fn new(
         coord: [f64; 2],
         template: &Bound<'_, PyAny>,
         f_img: PyRef<'_, PyImage>,
-        f_img_path: Option<String>,
     ) -> PyResult<Self> {
         let tmpl = template
             .extract::<PyRef<'_, PyTemplate>>()
@@ -85,7 +82,7 @@ impl PySubset {
             .map_err(Error::from)?;
         Ok(PySubset {
             inner: s,
-            f_img_path,
+            f_img_path: f_img.filepath.clone(),
             template_size,
             template_shape,
             solve_result: None,

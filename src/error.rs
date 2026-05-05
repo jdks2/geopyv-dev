@@ -28,7 +28,7 @@ pub enum Error {
     InvalidMagic,
 
     /// `.pyv` file has a format version that this library cannot read.
-    #[error("unsupported .pyv format version {0}; expected 1")]
+    #[error("unsupported .pyv format version {0}; expected 1 or 2")]
     UnsupportedVersion(u8),
 }
 

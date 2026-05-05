@@ -49,7 +49,7 @@ impl GeopyvApp {
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new("Digital Image Correlation")
-                        .size(14.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
 
@@ -88,7 +88,7 @@ impl GeopyvApp {
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Recent")
-                .size(12.0)
+                .size(14.0)
                 .color(ui.visuals().weak_text_color()),
         );
         ui.add_space(4.0);
@@ -107,7 +107,7 @@ impl GeopyvApp {
             ui.horizontal(|ui| {
                 let resp = ui.add(
                     egui::Button::new(
-                        egui::RichText::new(&label).size(13.0).color(if exists {
+                        egui::RichText::new(&label).size(15.0).color(if exists {
                             ui.visuals().text_color()
                         } else {
                             ui.visuals().weak_text_color()
@@ -129,7 +129,7 @@ impl GeopyvApp {
                 if !exists {
                     ui.label(
                         egui::RichText::new("(missing)")
-                            .size(11.0)
+                            .size(13.0)
                             .color(ui.visuals().error_fg_color),
                     );
                 }
@@ -273,15 +273,15 @@ fn configure_visuals(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.text_styles.insert(
         egui::TextStyle::Body,
-        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        egui::FontId::new(16.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        egui::FontId::new(16.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        egui::FontId::new(20.0, egui::FontFamily::Proportional),
+        egui::FontId::new(22.0, egui::FontFamily::Proportional),
     );
     ctx.set_style(style);
 }

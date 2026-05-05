@@ -60,18 +60,13 @@ def make_mesh_solution(u, v, nodes=None, elements=None):
 
 
 # ---------------------------------------------------------------------------
-# Helpers: borders/segments/curves for a unit-square ROI
+# Boundary for sequence construction tests
 # ---------------------------------------------------------------------------
 
-def square_roi(size):
-    """100×100 square: borders, segments, curves in triangulation format."""
-    borders = np.array(
-        [[0.0, 0.0], [size, 0.0], [size, size], [0.0, size]],
-        dtype=np.float64,
-    )
-    segments = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32)
-    curves = [[0, 1, 2, 3]]
-    return borders, segments, curves
+_SQUARE_BOUNDARY = np.array(
+    [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
+    dtype=np.float64,
+)
 
 
 # Test image paths (relative to the repository root).
@@ -104,13 +99,10 @@ def test_mesh_solution_repr():
 
 def test_sequence_too_few_images_raises():
     """Sequence with only one image path raises an error."""
-    borders, segments, curves = square_roi(100.0)
     with pytest.raises(Exception):
         Sequence(
             image_paths=["/tmp/only_one.jpg"],
-            borders=borders,
-            segments=segments,
-            curves=curves,
+            boundary=_SQUARE_BOUNDARY,
             size_lower=5.0,
             size_upper=50.0,
             target_nodes=20,
@@ -119,13 +111,10 @@ def test_sequence_too_few_images_raises():
 
 def test_sequence_nonexistent_image_raises():
     """Sequence raises an error when any image path does not exist."""
-    borders, segments, curves = square_roi(100.0)
     with pytest.raises(Exception):
         Sequence(
             image_paths=["/no/such/file_a.jpg", "/no/such/file_b.jpg"],
-            borders=borders,
-            segments=segments,
-            curves=curves,
+            boundary=_SQUARE_BOUNDARY,
             size_lower=5.0,
             size_upper=50.0,
             target_nodes=20,
@@ -134,13 +123,10 @@ def test_sequence_nonexistent_image_raises():
 
 def test_sequence_size_lower_ge_upper_raises():
     """size_lower >= size_upper raises an error."""
-    borders, segments, curves = square_roi(100.0)
     with pytest.raises(Exception):
         Sequence(
             image_paths=[REF_IMG, TAR_IMG],
-            borders=borders,
-            segments=segments,
-            curves=curves,
+            boundary=_SQUARE_BOUNDARY,
             size_lower=100.0,
             size_upper=10.0,
             target_nodes=20,
@@ -149,13 +135,10 @@ def test_sequence_size_lower_ge_upper_raises():
 
 def test_sequence_zero_size_lower_raises():
     """size_lower = 0 raises an error."""
-    borders, segments, curves = square_roi(100.0)
     with pytest.raises(Exception):
         Sequence(
             image_paths=[REF_IMG, TAR_IMG],
-            borders=borders,
-            segments=segments,
-            curves=curves,
+            boundary=_SQUARE_BOUNDARY,
             size_lower=0.0,
             size_upper=50.0,
             target_nodes=20,
@@ -170,12 +153,9 @@ def test_sequence_zero_size_lower_raises():
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
 def test_sequence_n_pairs_two_images():
     """Two images → n_pairs = 1."""
-    borders, segments, curves = square_roi(100.0)
     seq = Sequence(
         image_paths=[REF_IMG, TAR_IMG],
-        borders=borders,
-        segments=segments,
-        curves=curves,
+        boundary=_SQUARE_BOUNDARY,
         size_lower=5.0,
         size_upper=50.0,
         target_nodes=10,
@@ -186,12 +166,9 @@ def test_sequence_n_pairs_two_images():
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
 def test_sequence_image_paths_round_trips():
     """image_paths getter returns the same paths passed in."""
-    borders, segments, curves = square_roi(100.0)
     seq = Sequence(
         image_paths=[REF_IMG, TAR_IMG],
-        borders=borders,
-        segments=segments,
-        curves=curves,
+        boundary=_SQUARE_BOUNDARY,
         size_lower=5.0,
         size_upper=50.0,
         target_nodes=10,
@@ -205,12 +182,9 @@ def test_sequence_image_paths_round_trips():
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
 def test_sequence_repr():
     """Sequence.__repr__ mentions n_images and n_pairs."""
-    borders, segments, curves = square_roi(100.0)
     seq = Sequence(
         image_paths=[REF_IMG, TAR_IMG],
-        borders=borders,
-        segments=segments,
-        curves=curves,
+        boundary=_SQUARE_BOUNDARY,
         size_lower=5.0,
         size_upper=50.0,
         target_nodes=10,
@@ -356,7 +330,7 @@ def test_sequence_solve_one_pair_returns_solution():
     # 200×200 px ROI centred at (500, 500) — well within the 1001×1001 images.
     cx, cy = 500.0, 500.0
     half = 100.0
-    borders = np.array(
+    boundary = np.array(
         [
             [cx - half, cy - half],
             [cx + half, cy - half],
@@ -365,14 +339,10 @@ def test_sequence_solve_one_pair_returns_solution():
         ],
         dtype=np.float64,
     )
-    segments = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32)
-    curves = [[0, 1, 2, 3]]
 
     seq = Sequence(
         image_paths=[REF_IMG, TAR_IMG],
-        borders=borders,
-        segments=segments,
-        curves=curves,
+        boundary=boundary,
         size_lower=10.0,
         size_upper=100.0,
         target_nodes=15,
@@ -403,7 +373,7 @@ def test_sequence_solve_one_pair_result_shape():
     """SequenceSolution.mesh_solutions has length 1 for a 2-image sequence."""
     cx, cy = 500.0, 500.0
     half = 100.0
-    borders = np.array(
+    boundary = np.array(
         [
             [cx - half, cy - half],
             [cx + half, cy - half],
@@ -412,14 +382,10 @@ def test_sequence_solve_one_pair_result_shape():
         ],
         dtype=np.float64,
     )
-    segments = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32)
-    curves = [[0, 1, 2, 3]]
 
     seq = Sequence(
         image_paths=[REF_IMG, TAR_IMG],
-        borders=borders,
-        segments=segments,
-        curves=curves,
+        boundary=boundary,
         size_lower=10.0,
         size_upper=100.0,
         target_nodes=15,
@@ -447,7 +413,7 @@ def test_sequence_solution_repr():
     """SequenceSolution.__repr__ includes solved/unsolvable info."""
     cx, cy = 500.0, 500.0
     half = 100.0
-    borders = np.array(
+    boundary = np.array(
         [
             [cx - half, cy - half],
             [cx + half, cy - half],
@@ -456,14 +422,10 @@ def test_sequence_solution_repr():
         ],
         dtype=np.float64,
     )
-    segments = np.array([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=np.int32)
-    curves = [[0, 1, 2, 3]]
 
     seq = Sequence(
         image_paths=[REF_IMG, TAR_IMG],
-        borders=borders,
-        segments=segments,
-        curves=curves,
+        boundary=boundary,
         size_lower=10.0,
         size_upper=100.0,
         target_nodes=15,

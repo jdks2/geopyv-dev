@@ -16,6 +16,7 @@
 //!   `Mesh` borrow.
 
 use std::collections::{BinaryHeap, HashSet};
+use std::path::PathBuf;
 
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
@@ -69,10 +70,10 @@ pub struct MeshSolution {
     pub iterations: Array1<u32>,
     /// Per-node final ∆norm values `(N,)`.
     pub norms: Array1<f64>,
-    /// Reference image file path (carried through serialisation).
-    pub f_img_path: Option<String>,
-    /// Target image file path (carried through serialisation).
-    pub g_img_path: Option<String>,
+    /// Reference image file path.
+    pub f_img_path: PathBuf,
+    /// Target image file path.
+    pub g_img_path: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +186,8 @@ impl Mesh {
         seed_coord: [f64; 2],
         seed_warp: &[f64],
         cfg: &SolveConfig,
+        f_img_path: PathBuf,
+        g_img_path: PathBuf,
     ) -> Result<MeshSolution, Error> {
         let n_nodes = self.nodes.nrows();
         let p_len = 6 * cfg.subset_order;
@@ -308,8 +311,8 @@ impl Mesh {
             subset_order: cfg.subset_order as u8,
             iterations,
             norms,
-            f_img_path: None,
-            g_img_path: None,
+            f_img_path,
+            g_img_path,
         })
     }
 

@@ -245,7 +245,7 @@ impl ParticleTabState {
                         ui.centered_and_justified(|ui| {
                             ui.label(
                                 egui::RichText::new("Select a particle from the list")
-                                    .size(14.0)
+                                    .size(16.0)
                                     .color(ui.visuals().weak_text_color()),
                             );
                         });
@@ -280,7 +280,7 @@ impl ParticleTabState {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("No images in project")
-                            .size(14.0)
+                            .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
                 });
@@ -312,7 +312,7 @@ impl ParticleTabState {
         let Some(sol) = &self.view.solution else {
             ui.label(
                 egui::RichText::new("No particle selected")
-                    .size(13.0)
+                    .size(15.0)
                     .color(ui.visuals().weak_text_color()),
             );
             return;
@@ -426,13 +426,13 @@ impl ParticleTabState {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new("Solving particle\u{2026}")
-                    .size(14.0)
+                    .size(16.0)
                     .color(ui.visuals().text_color()),
             );
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(&message)
-                    .size(12.0)
+                    .size(16.0)
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(8.0);
@@ -532,7 +532,7 @@ impl ParticleTabState {
         let pt_active = form.draw.mode == Some(ActiveDrawMode::Point);
         let btn_pt = egui::Button::new(
             egui::RichText::new(if pt_active { "Placing\u{2026}" } else { "Place point \u{25b6}" })
-                .size(12.0),
+                .size(16.0),
         )
         .selected(pt_active);
         if ui.add(btn_pt).clicked() {
@@ -547,14 +547,14 @@ impl ParticleTabState {
             Some(p) => {
                 ui.label(
                     egui::RichText::new(format!("x: {:.1}   y: {:.1}", p.x, p.y))
-                        .size(12.0)
+                        .size(16.0)
                         .color(egui::Color32::from_rgb(100, 200, 100)),
                 );
             }
             None => {
                 ui.label(
                     egui::RichText::new("Click image to place")
-                        .size(12.0)
+                        .size(16.0)
                         .color(ui.visuals().weak_text_color()),
                 );
             }
@@ -599,7 +599,7 @@ impl ParticleTabState {
         if let Some(err) = &form.form_error.clone() {
             ui.label(
                 egui::RichText::new(err)
-                    .size(11.0)
+                    .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
             ui.add_space(4.0);
@@ -775,7 +775,7 @@ fn show_progress_overlay(
             egui::pos2(bar_rect.min.x, bar_rect.max.y + 6.0),
             egui::Align2::LEFT_TOP,
             &message,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            egui::FontId::new(15.0, egui::FontFamily::Proportional),
             egui::Color32::from_rgb(200, 200, 200),
         );
     }
@@ -890,13 +890,13 @@ fn run_solve(
 // ---------------------------------------------------------------------------
 
 fn lbl(text: &str) -> egui::RichText {
-    egui::RichText::new(text).size(12.0)
+    egui::RichText::new(text).size(16.0)
 }
 
 fn section_header(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(label)
-            .size(11.0)
+            .size(15.0)
             .color(ui.visuals().weak_text_color()),
     );
     ui.add_space(2.0);
@@ -907,10 +907,10 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(format!("{label}:"))
-                .size(12.0)
+                .size(16.0)
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.label(egui::RichText::new(value).size(13.0));
+        ui.label(egui::RichText::new(value).size(15.0));
     });
     ui.add_space(2.0);
 }
