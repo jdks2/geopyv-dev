@@ -1,6 +1,6 @@
-//! Subset template shapes: Circle and Square.
+//! Subset mask shapes: Circle and Square.
 //!
-//! Translates `geopyv/templates.py`.  A `Template` records which pixel offsets
+//! Translates `geopyv/templates.py`.  A `LocalMask` records which pixel offsets
 //! relative to a subset centre are active, and an optional subset mask that
 //! can zero out pixels covered by a binary image mask.
 //!
@@ -19,20 +19,21 @@ use crate::Error;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum TemplateShape {
+pub enum MaskShape {
     Circle,
     Square,
 }
 
-/// Subset template: describes which pixel offsets relative to a centre are
+/// Subset local mask: describes which pixel offsets relative to a centre are
 /// active for DIC intensity sampling.
-pub struct Template {
-    pub shape: TemplateShape,
+#[derive(Debug, Clone)]
+pub struct LocalMask {
+    pub shape: MaskShape,
     /// Human-readable description of what `size` measures.
     pub dimension: String,
     /// Radius (Circle) or half-side-length (Square).
     pub size: usize,
-    /// Number of pixels in the unmasked template.
+    /// Number of pixels in the unmasked mask.
     pub n_px: usize,
     /// Pixel offset coordinates, shape `(n_px, 2)`.
     /// Column convention depends on shape — see module doc.
@@ -44,8 +45,8 @@ pub struct Template {
     pub m_n_px: Option<usize>,
 }
 
-impl Template {
-    /// Create a circular template of the given radius.
+impl LocalMask {
+    /// Create a circular local mask of the given radius.
     ///
     /// Replicates `geopyv.templates.Circle.__init__`.
     pub fn circle(radius: usize) -> Result<Self, Error> {
@@ -79,8 +80,8 @@ impl Template {
         let n_px = coord_rows.len();
         let coords = Array2::from_shape_fn((n_px, 2), |(i, j)| coord_rows[i][j]);
 
-        Ok(Template {
-            shape: TemplateShape::Circle,
+        Ok(LocalMask {
+            shape: MaskShape::Circle,
             dimension: "radius".to_string(),
             size,
             n_px,
@@ -90,7 +91,7 @@ impl Template {
         })
     }
 
-    /// Create a square template with the given half-side-length.
+    /// Create a square local mask with the given half-side-length.
     ///
     /// Replicates `geopyv.templates.Square.__init__`.
     pub fn square(length: usize) -> Result<Self, Error> {
@@ -117,8 +118,8 @@ impl Template {
         // Square subset_mask: all ones (no masking by shape).
         let subset_mask = Array2::<i32>::ones((side, side));
 
-        Ok(Template {
-            shape: TemplateShape::Square,
+        Ok(LocalMask {
+            shape: MaskShape::Square,
             dimension: "length".to_string(),
             size,
             n_px,
@@ -128,12 +129,12 @@ impl Template {
         })
     }
 
-    /// Apply a binary image mask to the template, updating `coords` and `m_n_px`.
+    /// Apply a binary image mask to the local mask, updating `coords` and `m_n_px`.
     ///
     /// Replicates `geopyv.templates.Template.mask`.
     ///
     /// After this call `coords` is always in `[row-offset, col-offset]` order
-    /// (matching `np.argwhere` row/col convention) regardless of template shape.
+    /// (matching `np.argwhere` row/col convention) regardless of mask shape.
     ///
     /// # Arguments
     /// * `centre` - `[x, y]` centre coordinates (integer pixel, 0-indexed).
@@ -216,14 +217,14 @@ mod tests {
     #[test]
     fn circle_5_n_px() {
         // 81 lattice points inside a radius-5 circle (computed analytically).
-        let t = Template::circle(5).unwrap();
+        let t = LocalMask::circle(5).unwrap();
         assert_eq!(t.n_px, 81);
     }
 
     #[test]
     fn circle_5_first_coord() {
         // Row-major scan: first included pixel is at row=0, col=5 → [x=0, y=-5].
-        let t = Template::circle(5).unwrap();
+        let t = LocalMask::circle(5).unwrap();
         assert_eq!(t.coords[[0, 0]], 0.0);  // x-offset
         assert_eq!(t.coords[[0, 1]], -5.0); // y-offset
     }
@@ -231,7 +232,7 @@ mod tests {
     #[test]
     fn circle_5_last_coord() {
         // Last included pixel is at row=10, col=5 → [x=0, y=5].
-        let t = Template::circle(5).unwrap();
+        let t = LocalMask::circle(5).unwrap();
         let n = t.n_px;
         assert_eq!(t.coords[[n - 1, 0]], 0.0);
         assert_eq!(t.coords[[n - 1, 1]], 5.0);
@@ -239,13 +240,13 @@ mod tests {
 
     #[test]
     fn circle_5_subset_mask_shape() {
-        let t = Template::circle(5).unwrap();
+        let t = LocalMask::circle(5).unwrap();
         assert_eq!(t.subset_mask.dim(), (11, 11));
     }
 
     #[test]
     fn circle_5_subset_mask_values() {
-        let t = Template::circle(5).unwrap();
+        let t = LocalMask::circle(5).unwrap();
         // Centre should be active.
         assert_eq!(t.subset_mask[[5, 5]], 1);
         // Poles should be active (dist = 5 = size, boundary included).
@@ -258,7 +259,7 @@ mod tests {
 
     #[test]
     fn square_5_n_px() {
-        let t = Template::square(5).unwrap();
+        let t = LocalMask::square(5).unwrap();
         assert_eq!(t.n_px, 121); // (2*5+1)^2 = 121
     }
 
@@ -266,7 +267,7 @@ mod tests {
     fn square_5_first_and_last_coord() {
         // coords[:, 0] = x-offset, coords[:, 1] = y-offset.
         // First (row=0, col=0): x=-5, y=-5.
-        let t = Template::square(5).unwrap();
+        let t = LocalMask::square(5).unwrap();
         assert_eq!(t.coords[[0, 0]], -5.0); // x
         assert_eq!(t.coords[[0, 1]], -5.0); // y
         let n = t.n_px;
@@ -276,14 +277,14 @@ mod tests {
 
     #[test]
     fn square_5_subset_mask_all_ones() {
-        let t = Template::square(5).unwrap();
+        let t = LocalMask::square(5).unwrap();
         assert!(t.subset_mask.iter().all(|&v| v == 1));
     }
 
     #[test]
     fn mask_update_full_mask() {
-        // Apply a full-ones mask to Square(2): all coords should survive.
-        let mut t = Template::square(2).unwrap();
+        // Apply a full-ones mask to square(2): all coords should survive.
+        let mut t = LocalMask::square(2).unwrap();
         let mask = Array2::<u8>::ones((20, 20));
         t.mask_update([5.0, 5.0], mask.view());
         assert_eq!(t.m_n_px, Some(25)); // (2*2+1)^2 = 25
@@ -292,7 +293,7 @@ mod tests {
     #[test]
     fn mask_update_zero_mask() {
         // Apply a full-zeros mask: no coords survive.
-        let mut t = Template::square(2).unwrap();
+        let mut t = LocalMask::square(2).unwrap();
         let mask = Array2::<u8>::zeros((20, 20));
         t.mask_update([5.0, 5.0], mask.view());
         assert_eq!(t.m_n_px, Some(0));

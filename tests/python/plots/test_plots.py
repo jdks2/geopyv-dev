@@ -9,7 +9,7 @@ from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 
 from geopyv_dev import (
-    Image, Subset, Mesh, Template,
+    Image, Subset, Mesh, Mask,
     Field, FieldSolution,
     Particle, ParticleSolution,
     field_distribute_particles,
@@ -50,7 +50,7 @@ def _preprocess(fp):
 
 
 def make_circle_template(radius):
-    return Template("circle", size=radius)
+    return Mask(mask_type="local", shape="circle", size=radius)
 
 
 
@@ -74,8 +74,8 @@ def tar_img():
 @pytest.fixture(scope="module")
 def solved_subset(ref_img, tar_img):
     tmpl = make_circle_template(RADIUS)
-    s = Subset(COORD, tmpl, ref_img)
-    s.solve_icgn(tar_img, [0.0] * 6)
+    s = Subset(COORD, tmpl, ref_img, tar_img)
+    s.solve()
     return s
 
 
@@ -86,10 +86,10 @@ def solved_mesh(ref_img, tar_img):
         [[150.0, 150.0], [250.0, 150.0], [250.0, 250.0], [150.0, 250.0]],
         dtype=np.float64,
     )
-    mesh = Mesh(boundary=boundary, size_lower=20.0, size_upper=40.0, target_nodes=15)
-    sol = mesh.solve(ref_img, tar_img, tmpl, [200.0, 200.0], [0.0] * 6,
-                     max_norm=1e-3, max_iterations=20)
-    return sol
+    mesh = Mesh(boundary, target_nodes=15, f_img=ref_img, g_img=tar_img,
+                size=(20.0, 40.0))
+    mesh.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20)
+    return mesh
 
 
 @pytest.fixture(scope="module")

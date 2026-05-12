@@ -28,8 +28,10 @@ from .wrappers import (
 # ---------------------------------------------------------------------------
 
 def _wrap(raw):
-    if isinstance(raw, _core.MeshSolution):
-        return MeshWrapper(raw)
+    if isinstance(raw, _core.Subset):
+        return Subset._new_from_inner(raw)
+    if isinstance(raw, _core.Mesh):
+        return Mesh._new_from_inner(raw)
     if isinstance(raw, _core.SequenceSolution):
         return SequenceSolutionWrapper(raw)
     if isinstance(raw, _core.FieldSolution):
@@ -61,10 +63,16 @@ def load(path):
 # ---------------------------------------------------------------------------
 
 class Subset:
-    """Reference subset for DIC. Wraps the Rust Subset with inspect/convergence."""
+    """Reference subset for DIC. Wraps PySubset with inspect/convergence."""
 
-    def __init__(self, *args, **kwargs):
-        self._inner = _core.Subset(*args, **kwargs)
+    def __init__(self, coord, local_mask, f_img, g_img, subset_order=1):
+        self._inner = _core.Subset(coord, local_mask, f_img, g_img, subset_order=subset_order)
+
+    @classmethod
+    def _new_from_inner(cls, inner):
+        obj = cls.__new__(cls)
+        obj._inner = inner
+        return obj
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -72,40 +80,42 @@ class Subset:
     def __repr__(self):
         return repr(self._inner)
 
-    def solve(self, g_img, p_0, algorithm="icgn", **kwargs):
-        """Run the DIC solver.
+    def solve(self, p_0=None, algorithm="icgn",
+              max_norm=1e-3, max_iterations=50, tolerance=0.75):
+        """Run the DIC solver. Mutates the object; returns None.
 
         Parameters
         ----------
-        g_img : Image
-            Target image.
-        p_0 : list[float]
-            Initial warp vector.
+        p_0 : list[float], optional
+            Initial warp vector. Defaults to zeros matching order.
         algorithm : str, optional
-            ``"icgn"`` (default) or ``"fagn"``. Unknown values fall back to
-            ICGN with a warning.
-        **kwargs
-            Forwarded to the underlying solver (``max_norm``, ``max_iterations``).
+            "icgn" (default) or "fagn".
+        max_norm : float, optional
+            Convergence norm threshold. Default 1e-3.
+        max_iterations : int, optional
+            Iteration limit. Default 50.
+        tolerance : float, optional
+            Minimum acceptable C_ZNCC for solved=True. Default 0.75.
         """
         import warnings
-        algorithm = algorithm.lower()
-        if algorithm == "icgn":
-            return self._inner.solve_icgn(g_img, p_0, **kwargs)
-        elif algorithm == "fagn":
-            return self._inner.solve_fagn(g_img, p_0, **kwargs)
+        algo = algorithm.lower()
+        kwargs = dict(p_0=p_0, max_norm=max_norm,
+                      max_iterations=max_iterations, tolerance=tolerance)
+        if algo == "icgn":
+            self._inner.solve_icgn(**kwargs)
+        elif algo == "fagn":
+            self._inner.solve_fagn(**kwargs)
         else:
             warnings.warn(
-                f"Unknown algorithm '{algorithm}'; falling back to 'icgn'.",
+                f"Unknown algorithm '{algo}'; falling back to 'icgn'.",
                 UserWarning,
                 stacklevel=2,
             )
-            return self._inner.solve_icgn(g_img, p_0, **kwargs)
+            self._inner.solve_icgn(**kwargs)
 
-    def solve_icgn(self, *args, **kwargs):
-        return self._inner.solve_icgn(*args, **kwargs)
-
-    def solve_fagn(self, *args, **kwargs):
-        return self._inner.solve_fagn(*args, **kwargs)
+    def save(self, path):
+        """Save the solved subset to a .pyv file."""
+        self._inner.save(path)
 
     def inspect(self, **kwargs):
         return inspect_subset(self._inner, **kwargs)
@@ -115,10 +125,21 @@ class Subset:
 
 
 class Mesh:
-    """DIC mesh. solve() returns a MeshWrapper with inspect/convergence/contour."""
+    """DIC mesh. solve() mutates in place and returns None."""
 
-    def __init__(self, *args, **kwargs):
-        self._inner = _core.Mesh(*args, **kwargs)
+    def __init__(self, boundary, target_nodes, f_img, g_img,
+                 size=(1, 1000), exclusions=None, exclusions_hard=None, mesh_order=2):
+        self._inner = _core.Mesh(
+            boundary, target_nodes, f_img, g_img,
+            size=size, exclusions=exclusions, exclusions_hard=exclusions_hard,
+            mesh_order=mesh_order,
+        )
+
+    @classmethod
+    def _new_from_inner(cls, inner):
+        obj = cls.__new__(cls)
+        obj._inner = inner
+        return obj
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -126,35 +147,33 @@ class Mesh:
     def __repr__(self):
         return repr(self._inner)
 
-    def solve(self, *args, **kwargs):
-        return MeshWrapper(self._inner.solve(*args, **kwargs))
+    def solve(self, local_mask, seed_coord, seed_warp=None, **kwargs):
+        """Run the DIC solver. Mutates in place; returns None."""
+        self._inner.solve(local_mask, seed_coord, seed_warp=seed_warp, **kwargs)
+
+    def save(self, path):
+        """Save the solved mesh to a .pyv file."""
+        self._inner.save(path)
+
+    def inspect(self, **kwargs):
+        return inspect_mesh(self._inner, **kwargs)
+
+    def convergence(self, quantity="C_ZNCC", **kwargs):
+        return convergence_mesh(self._inner, quantity, **kwargs)
+
+    def contour(self, quantity, **kwargs):
+        return contour_mesh(self._inner, quantity, **kwargs)
 
 
 class Sequence:
     """Multi-pair DIC sequence. solve() returns a SequenceSolutionWrapper."""
 
-    def __init__(self, *args, **kwargs):
-        self._inner = _core.Sequence(*args, **kwargs)
-
-    @classmethod
-    def from_dir(cls, image_dir, boundary, size_lower, size_upper,
-                 target_nodes, exclusions=None, mesh_order=1):
-        """Construct a Sequence by scanning a directory for image files.
-
-        Parameters
-        ----------
-        image_dir : str
-            Directory containing ``*.jpg``, ``*.jpeg``, or ``*.png`` images,
-            sorted internally by trailing integer in the filename stem.
-        boundary, size_lower, size_upper, target_nodes, exclusions, mesh_order
-            Same as :class:`Sequence.__init__`.
-        """
-        obj = cls.__new__(cls)
-        obj._inner = _core.Sequence.from_dir(
-            image_dir, boundary, size_lower, size_upper,
-            target_nodes, exclusions, mesh_order,
+    def __init__(self, image_dir, boundary, target_nodes,
+                 size=(1.0, 1000.0), exclusions=None, mesh_order=2):
+        self._inner = _core.Sequence(
+            image_dir, boundary, target_nodes,
+            size=size, exclusions=exclusions, mesh_order=mesh_order,
         )
-        return obj
 
     def __getattr__(self, name):
         return getattr(self._inner, name)

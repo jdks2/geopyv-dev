@@ -217,7 +217,7 @@ class TestMaskImage:
     def test_exclusion_zeros_interior(self):
         boundary = np.array([[0.0, 0.0], [50.0, 0.0], [50.0, 50.0], [0.0, 50.0]])
         exclusion = np.array([[15.0, 15.0], [30.0, 15.0], [30.0, 30.0], [15.0, 30.0]])
-        m = mask_image((50, 50), boundary, exclusion_nodes=[exclusion])
+        m = mask_image((50, 50), boundary, exclusion_nodes=[exclusion], exclusions_hard=[True])
         assert m[22, 22] == 0  # well inside exclusion
         assert m[5, 5] == 1    # outside exclusion
 

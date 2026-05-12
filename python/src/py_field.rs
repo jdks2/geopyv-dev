@@ -5,6 +5,8 @@
 //! - `FieldSolution` class: read-only result from `Field.solve`.
 //! - `field_distribute_particles` free function.
 
+use std::path::PathBuf;
+
 use ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -24,7 +26,6 @@ use crate::{py_particle::PyParticleSolution, Error};
 #[pyclass(name = "FieldSolution")]
 pub struct PyFieldSolution {
     pub(crate) inner: FieldSolution,
-    pub(crate) image_0_path: Option<String>,
 }
 
 #[pymethods]
@@ -35,7 +36,7 @@ impl PyFieldSolution {
         self.inner
             .particles
             .iter()
-            .map(|p| PyParticleSolution { inner: p.clone(), image_0_path: self.image_0_path.clone() })
+            .map(|p| PyParticleSolution { inner: p.clone() })
             .collect()
     }
 
@@ -72,7 +73,7 @@ impl PyFieldSolution {
     /// Path of the initial (reference) image, or ``None``.
     #[getter]
     fn image_0_path(&self) -> Option<String> {
-        self.image_0_path.clone()
+        self.inner.image_0_path.as_ref().map(|p| p.to_string_lossy().into_owned())
     }
 
     fn __repr__(&self) -> String {
@@ -105,7 +106,6 @@ impl PyFieldSolution {
 #[pyclass(name = "Field")]
 pub struct PyField {
     inner: Field,
-    pub(crate) image_0_path: Option<String>,
 }
 
 #[pymethods]
@@ -122,8 +122,9 @@ impl PyField {
     ) -> PyResult<Self> {
         let c = coordinates.as_array().to_owned();
         let v = volumes.as_array().to_owned();
-        let f = Field::new(c, v, track, depth, inc_no).map_err(Error::from)?;
-        Ok(PyField { inner: f, image_0_path })
+        let path = image_0_path.map(PathBuf::from);
+        let f = Field::new(c, v, track, depth, inc_no, path).map_err(Error::from)?;
+        Ok(PyField { inner: f })
     }
 
     /// Solve strain paths for all particles over a sequence of mesh increments.
@@ -187,7 +188,7 @@ impl PyField {
             .inner
             .solve(&mesh_data, &ru, factor, true_incs)
             .map_err(Error::from)?;
-        Ok(PyFieldSolution { inner: sol, image_0_path: self.image_0_path.clone() })
+        Ok(PyFieldSolution { inner: sol })
     }
 
     // --- Getters ---
@@ -237,7 +238,7 @@ impl PyField {
     /// Path of the initial (reference) image, or ``None``.
     #[getter]
     fn image_0_path(&self) -> Option<String> {
-        self.image_0_path.clone()
+        self.inner.image_0_path.as_ref().map(|p| p.to_string_lossy().into_owned())
     }
 
     fn __repr__(&self) -> String {

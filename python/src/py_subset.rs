@@ -1,15 +1,22 @@
 //! PyO3 wrapper for `geopyv_dev::subset`.
 
-use numpy::{IntoPyArray, PyArray1, PyArray2};
-use pyo3::exceptions::PyTypeError;
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use geopyv_dev::subset::Subset;
+use numpy::{IntoPyArray, PyArray1, PyArray2};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::prelude::*;
+
+use geopyv_dev::{
+    image::Image,
+    io::{self as gp_io, GeopyvObject},
+    subset::{Subset, SubsetSolution, SolveResult},
+    masks::{LocalMask, MaskShape},
+};
 
 use crate::{
     py_image::PyImage,
-    py_templates::PyTemplate,
+    py_mask::PyMask,
     Error,
 };
 
@@ -17,250 +24,366 @@ use crate::{
 // Python class
 // ---------------------------------------------------------------------------
 
-/// Reference subset for DIC.
-///
-/// Parameters
-/// ----------
-/// coord : array_like of shape (2,)
-///     Subset centre coordinate ``[x, y]``.
-/// template : Template
-///     Template object whose pixel offsets define the subset shape.
-/// f_img : Image
-///     Reference image (pre-computed B-spline data).
-///
-/// Attributes
-/// ----------
-/// coord : list[float]
-///     Subset centre ``[x, y]``.
-/// template_shape : str
-///     ``"circle"`` or ``"square"``.
-/// template_size : int
-///     Radius or half-side-length of the template.
-/// n_px : int
-///     Number of pixels in the subset.
-/// f_coords : numpy.ndarray, shape (n_px, 2)
-///     Absolute coordinates of each subset pixel in the reference image.
-/// f : numpy.ndarray, shape (n_px,)
-///     Reference intensities (B-spline interpolated).
-/// f_m : float
-///     Mean reference intensity.
-/// delta_f : float
-///     ``sqrt(Σ(f_i − f_m)²)`` normalisation factor.
-/// grad_f : numpy.ndarray, shape (n_px, 2)
-///     Image gradient at each subset pixel ``[grad_x, grad_y]``.
-/// sssig : float
-///     Sum of squared intensity gradients (quality metric).
-/// sigma_intensity : float
-///     Standard deviation of reference intensities (quality metric).
 #[pyclass(name = "Subset")]
 pub struct PySubset {
-    inner: Subset,
-    pub(crate) f_img_path: Option<String>,
-    pub(crate) template_size: usize,
-    pub(crate) template_shape: String,
-    solve_result: Option<pyo3::PyObject>,
+    // Always present; image-dependent fields within inner may be None.
+    pub(crate) inner: Subset,
+
+    // Python object handles (not in Rust core).
+    local_mask: Option<Py<PyMask>>,
+    pub(crate) f_img: Option<Py<PyImage>>,
+    pub(crate) g_img: Option<Py<PyImage>>,
+
+    // Solve result — None until solved or loaded.
+    pub(crate) result: Option<SolveResult>,
 }
+
+// ---------------------------------------------------------------------------
+// Non-pymethods impl (Rust-internal helpers)
+// ---------------------------------------------------------------------------
+
+impl PySubset {
+    /// Reconstruct a `PySubset` from a loaded `SubsetSolution`.
+    pub(crate) fn from_solution(py: Python<'_>, sol: SubsetSolution) -> PyResult<Self> {
+        let order = (sol.result.p.len() / 6).max(1);
+
+        // Reconstruct LocalMask from template summary.
+        let local_mask = match sol.mask.shape {
+            MaskShape::Circle => LocalMask::circle(sol.mask.size),
+            MaskShape::Square => LocalMask::square(sol.mask.size),
+        }.map_err(Error::from)?;
+        let py_mask: Py<PyMask> = Py::new(py, PyMask::from_local(local_mask.clone()))?;
+
+        // Attempt to load reference image.
+        let py_f_img: Option<Py<PyImage>> =
+            Image::from_file(&sol.ref_image, 20).ok().map(|img| {
+                Py::new(py, PyImage {
+                    inner: Arc::new(img),
+                    filepath: Some(sol.ref_image.to_string_lossy().into_owned()),
+                })
+            }).transpose()?;
+
+        // Attempt to load target image.
+        let py_g_img: Option<Py<PyImage>> =
+            Image::from_file(&sol.target_image, 20).ok().map(|img| {
+                Py::new(py, PyImage {
+                    inner: Arc::new(img),
+                    filepath: Some(sol.target_image.to_string_lossy().into_owned()),
+                })
+            }).transpose()?;
+
+        // Build inner — always Subset.
+        let inner = if let (Some(ref f_py), Some(ref g_py)) = (&py_f_img, &py_g_img) {
+            let f_ref = f_py.bind(py).borrow();
+            let g_ref = g_py.bind(py).borrow();
+            Subset::new(
+                sol.coord, &local_mask, None,
+                Arc::clone(&f_ref.inner), Arc::clone(&g_ref.inner), order,
+            ).unwrap_or_else(|_| Subset::from_subset_solution(&sol, &local_mask))
+        } else {
+            Subset::from_subset_solution(&sol, &local_mask)
+        };
+
+        Ok(PySubset {
+            inner,
+            local_mask: Some(py_mask),
+            f_img: py_f_img,
+            g_img: py_g_img,
+            result: Some(sol.result),
+        })
+    }
+
+    /// Build a `SubsetSolution` for serialisation.
+    pub(crate) fn to_subset_solution(&self, py: Python<'_>) -> PyResult<SubsetSolution> {
+        let result = self.result.clone().ok_or_else(|| {
+            PyRuntimeError::new_err("Subset has not been solved")
+        })?;
+        let f_img_path = self.f_img.as_ref()
+            .and_then(|img| img.bind(py).borrow().filepath.clone())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let g_img_path = self.g_img.as_ref()
+            .and_then(|img| img.bind(py).borrow().filepath.clone())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+
+        let n_px = self.inner.n_px();
+        Ok(SubsetSolution {
+            coord: self.inner.coord,
+            mask: self.inner.mask.clone(),
+            ref_image: f_img_path,
+            target_image: g_img_path,
+            result,
+            std_dev: self.inner.delta_f / (n_px as f64).sqrt(),
+            sssig: self.inner.sssig,
+            delta_f: self.inner.delta_f,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pymethods
+// ---------------------------------------------------------------------------
 
 #[pymethods]
 impl PySubset {
     #[new]
-    #[pyo3(signature = (coord, template, f_img))]
+    #[pyo3(signature = (coord, local_mask, f_img, g_img, subset_order = 1, global_mask = None))]
     fn new(
+        py: Python<'_>,
         coord: [f64; 2],
-        template: &Bound<'_, PyAny>,
-        f_img: PyRef<'_, PyImage>,
+        local_mask: &Bound<'_, PyAny>,
+        f_img: &Bound<'_, PyImage>,
+        g_img: &Bound<'_, PyImage>,
+        subset_order: usize,
+        global_mask: Option<Py<PyMask>>,
     ) -> PyResult<Self> {
-        let tmpl = template
-            .extract::<PyRef<'_, PyTemplate>>()
-            .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
-        let template_shape = match tmpl.inner.shape {
-            geopyv_dev::templates::TemplateShape::Circle => "circle",
-            geopyv_dev::templates::TemplateShape::Square => "square",
-        }.to_string();
-        let template_size = tmpl.inner.size;
-        let s = Subset::new(coord, &tmpl.inner.coords, &f_img.inner.qcqt)
-            .map_err(Error::from)?;
+        if subset_order != 1 && subset_order != 2 {
+            return Err(PyValueError::new_err(format!(
+                "subset_order must be 1 or 2, got {subset_order}"
+            )));
+        }
+
+        let lm_bound = local_mask
+            .downcast::<PyMask>()
+            .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
+
+        let inner = {
+            let lm_ref = lm_bound.borrow();
+            let lm = lm_ref.local_mask_ref()?;
+            let gm_guard = global_mask.as_ref().map(|gm| gm.bind(py).borrow());
+            let gm_view = gm_guard.as_ref().and_then(|g| g.global_view());
+            let f_img_ref = f_img.borrow();
+            let g_img_ref = g_img.borrow();
+            Subset::new(
+                coord,
+                lm,
+                gm_view,
+                Arc::clone(&f_img_ref.inner),
+                Arc::clone(&g_img_ref.inner),
+                subset_order,
+            ).map_err(Error::from)?
+        };
+
+        let lm_py: Py<PyMask> = lm_bound.clone().unbind();
+        let f_img_py: Py<PyImage> = f_img.clone().unbind();
+        let g_img_py: Py<PyImage> = g_img.clone().unbind();
+
         Ok(PySubset {
-            inner: s,
-            f_img_path: f_img.filepath.clone(),
-            template_size,
-            template_shape,
-            solve_result: None,
+            inner,
+            local_mask: Some(lm_py),
+            f_img: Some(f_img_py),
+            g_img: Some(g_img_py),
+            result: None,
         })
     }
 
-    /// Subset centre ``[x, y]``.
-    #[getter]
-    fn coord(&self) -> [f64; 2] {
-        self.inner.coord
-    }
+    // -----------------------------------------------------------------------
+    // Solvers
+    // -----------------------------------------------------------------------
 
-    /// ``"circle"`` or ``"square"``.
-    #[getter]
-    fn template_shape(&self) -> &str {
-        &self.template_shape
-    }
-
-    /// Radius (circle) or half-side-length (square) in pixels.
-    #[getter]
-    fn template_size(&self) -> usize {
-        self.template_size
-    }
-
-    /// Number of pixels.
-    #[getter]
-    fn n_px(&self) -> usize {
-        self.inner.n_px()
-    }
-
-    /// Absolute subset pixel coordinates, shape (n_px, 2).
-    #[getter]
-    fn f_coords<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.f_coords.clone().into_pyarray_bound(py)
-    }
-
-    /// Reference intensities, shape (n_px,).
-    #[getter]
-    fn f<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.f.clone().into_pyarray_bound(py)
-    }
-
-    /// Mean reference intensity.
-    #[getter]
-    fn f_m(&self) -> f64 {
-        self.inner.f_m
-    }
-
-    /// ``sqrt(Σ(f_i − f_m)²)`` normalisation factor.
-    #[getter]
-    fn delta_f(&self) -> f64 {
-        self.inner.delta_f
-    }
-
-    /// Reference image gradients, shape (n_px, 2) — ``[grad_x, grad_y]``.
-    #[getter]
-    fn grad_f<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.grad_f.clone().into_pyarray_bound(py)
-    }
-
-    /// Sum of squared intensity gradients (quality metric).
-    #[getter]
-    fn sssig(&self) -> f64 {
-        self.inner.sssig
-    }
-
-    /// Standard deviation of reference intensities.
-    #[getter]
-    fn sigma_intensity(&self) -> f64 {
-        self.inner.sigma_intensity
-    }
-
-    /// Inverse Compositional Gauss-Newton solver.
-    ///
-    /// Parameters
-    /// ----------
-    /// g_img : Image
-    ///     Target image (pre-computed B-spline data).
-    /// p_0 : list[float]
-    ///     Initial warp vector. Length 6 for order-1, 12 for order-2.
-    /// max_norm : float, optional
-    ///     Convergence criterion on ``||Δp||``. Default 1e-3.
-    /// max_iterations : int, optional
-    ///     Iteration limit. Default 50.
-    ///
-    /// Returns
-    /// -------
-    /// dict with keys:
-    ///     ``p`` (list[float]), ``c_zncc`` (float), ``c_znssd`` (float),
-    ///     ``iterations`` (int), ``converged`` (bool),
-    ///     ``history`` (list of (iter, norm, zncc, znssd)).
-    #[pyo3(signature = (g_img, p_0, max_norm=1e-3, max_iterations=50))]
-    fn solve_icgn<'py>(
+    /// Inverse Compositional Gauss-Newton solver. Mutates object; returns None.
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75))]
+    fn solve_icgn(
         &mut self,
-        py: Python<'py>,
-        g_img: PyRef<'_, PyImage>,
-        p_0: Vec<f64>,
+        p_0: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let result = self
-            .inner
-            .solve_icgn(&g_img.inner.qcqt, &p_0, max_norm, max_iterations)
+        tolerance: f64,
+    ) -> PyResult<()> {
+        let result = self.inner
+            .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
-        let d = result_to_dict(py, result)?;
-        d.set_item("max_norm", max_norm)?;
-        d.set_item("max_iterations", max_iterations)?;
-        self.solve_result = Some(d.clone().into_any().unbind());
-        Ok(d)
+        self.result = Some(result);
+        Ok(())
     }
 
-    /// Forward Additive Gauss-Newton solver.
-    ///
-    /// Parameters and return value same as :meth:`solve_icgn`.
-    #[pyo3(signature = (g_img, p_0, max_norm=1e-3, max_iterations=50))]
-    fn solve_fagn<'py>(
+    /// Forward Additive Gauss-Newton solver. Mutates object; returns None.
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75))]
+    fn solve_fagn(
         &mut self,
-        py: Python<'py>,
-        g_img: PyRef<'_, PyImage>,
-        p_0: Vec<f64>,
+        p_0: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let result = self
-            .inner
-            .solve_fagn(&g_img.inner.qcqt, &p_0, max_norm, max_iterations)
+        tolerance: f64,
+    ) -> PyResult<()> {
+        let result = self.inner
+            .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
-        let d = result_to_dict(py, result)?;
-        d.set_item("max_norm", max_norm)?;
-        d.set_item("max_iterations", max_iterations)?;
-        self.solve_result = Some(d.clone().into_any().unbind());
-        Ok(d)
+        self.result = Some(result);
+        Ok(())
     }
 
-    /// File path of the reference image, or ``None``.
-    #[getter]
-    fn f_img_path(&self) -> Option<String> {
-        self.f_img_path.clone()
+    // -----------------------------------------------------------------------
+    // Save
+    // -----------------------------------------------------------------------
+
+    fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        if self.result.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "Subset has not been solved; cannot save.",
+            ));
+        }
+        let sol = self.to_subset_solution(py)?;
+        gp_io::save(path, &GeopyvObject::Subset(sol)).map_err(Error::from)?;
+        Ok(())
     }
 
-    /// Solve result dict from the last solve call, or ``None``.
+    // -----------------------------------------------------------------------
+    // Always-available getters
+    // -----------------------------------------------------------------------
+
     #[getter]
-    fn solve_result<'py>(&self, py: Python<'py>) -> Option<Bound<'py, pyo3::types::PyDict>> {
-        self.solve_result.as_ref().map(|obj| {
-            obj.bind(py).downcast::<pyo3::types::PyDict>().unwrap().clone()
-        })
+    fn coord(&self) -> [f64; 2] { self.inner.coord }
+
+    #[getter]
+    fn n_px(&self) -> usize { self.inner.n_px() }
+
+    #[getter]
+    fn subset_order(&self) -> usize { self.inner.subset_order }
+
+    #[getter]
+    fn sssig(&self) -> f64 { self.inner.sssig }
+
+    #[getter]
+    fn solved(&self) -> bool { self.result.is_some() }
+
+    #[getter]
+    fn template_shape(&self) -> String {
+        match &self.inner.mask.shape {
+            MaskShape::Circle => "circle".to_string(),
+            MaskShape::Square => "square".to_string(),
+        }
     }
+
+    #[getter]
+    fn template_size(&self) -> usize { self.inner.mask.size }
+
+    #[getter]
+    fn template_n_px(&self) -> usize { self.inner.mask.n_px }
+
+    #[getter]
+    fn f_img(&self, py: Python<'_>) -> Option<PyObject> {
+        self.f_img.as_ref().map(|img| img.clone_ref(py).into_any())
+    }
+
+    #[getter]
+    fn g_img(&self, py: Python<'_>) -> Option<PyObject> {
+        self.g_img.as_ref().map(|img| img.clone_ref(py).into_any())
+    }
+
+    #[getter]
+    fn local_mask(&self, py: Python<'_>) -> Option<PyObject> {
+        self.local_mask.as_ref().map(|m| m.clone_ref(py).into_any())
+    }
+
+    #[getter]
+    fn f_img_path(&self, py: Python<'_>) -> Option<String> {
+        self.f_img.as_ref()
+            .and_then(|img| img.bind(py).borrow().filepath.clone())
+    }
+
+    #[getter]
+    fn g_img_path(&self, py: Python<'_>) -> Option<String> {
+        self.g_img.as_ref()
+            .and_then(|img| img.bind(py).borrow().filepath.clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Image-dependent getters (None when images missing after load)
+    // -----------------------------------------------------------------------
+
+    #[getter]
+    fn f_coords<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.inner.f_coords.clone().map(|fc| fc.into_pyarray_bound(py))
+    }
+
+    #[getter]
+    fn f<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner.f.clone().map(|f| f.into_pyarray_bound(py))
+    }
+
+    #[getter]
+    fn f_m(&self) -> Option<f64> { self.inner.f_m }
+
+    #[getter]
+    fn delta_f(&self) -> Option<f64> { Some(self.inner.delta_f) }
+
+    #[getter]
+    fn grad_f<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.inner.grad_f.clone().map(|gf| gf.into_pyarray_bound(py))
+    }
+
+    #[getter]
+    fn sigma_intensity(&self) -> Option<f64> { self.inner.sigma_intensity }
+
+    // -----------------------------------------------------------------------
+    // Getters requiring a solve result (None when unsolved)
+    // -----------------------------------------------------------------------
+
+    #[getter]
+    fn p(&self) -> Option<Vec<f64>> { self.result.as_ref().map(|r| r.p.clone()) }
+
+    #[getter]
+    fn c_zncc(&self) -> Option<f64> { self.result.as_ref().map(|r| r.c_zncc) }
+
+    #[getter]
+    fn c_znssd(&self) -> Option<f64> { self.result.as_ref().map(|r| r.c_znssd) }
+
+    #[getter]
+    fn converged(&self) -> Option<bool> { self.result.as_ref().map(|r| r.converged) }
+
+    #[getter]
+    fn iterations(&self) -> Option<usize> { self.result.as_ref().map(|r| r.iterations) }
+
+    #[getter]
+    fn history(&self) -> Option<Vec<(usize, f64, f64, f64)>> { self.result.as_ref().map(|r| r.history.clone()) }
+
+    #[getter]
+    fn max_norm(&self) -> Option<f64> { self.result.as_ref().map(|r| r.max_norm) }
+
+    #[getter]
+    fn tolerance(&self) -> Option<f64> { self.result.as_ref().map(|r| r.tolerance) }
+
+    // -----------------------------------------------------------------------
+    // __repr__
+    // -----------------------------------------------------------------------
 
     fn __repr__(&self) -> String {
-        format!(
-            "Subset(coord={:?}, n_px={})",
-            self.inner.coord,
-            self.inner.n_px()
-        )
+        let shape_str = match &self.inner.mask.shape {
+            MaskShape::Circle => "circle",
+            MaskShape::Square => "square",
+        };
+        let tmpl_str = format!("{}({})", shape_str, self.inner.mask.size);
+        if let Some(ref r) = self.result {
+            let p_str = {
+                let parts: Vec<String> = r.p.iter().map(|v| format!("{:.6}", v)).collect();
+                format!("[{}]", parts.join(", "))
+            };
+            let zncc_str = format!("{:.5}", r.c_zncc);
+            format!(
+                "Subset(coord=[{:.2}, {:.2}], n_px={}, template={}, sssig={:.1},\n       solved=True, c_zncc={}, p={})",
+                self.inner.coord[0], self.inner.coord[1],
+                self.inner.n_px(),
+                tmpl_str,
+                self.inner.sssig,
+                zncc_str,
+                p_str,
+            )
+        } else {
+            format!(
+                "Subset(coord=[{:.2}, {:.2}], n_px={}, template={}, sssig={:.1}, solved=False)",
+                self.inner.coord[0], self.inner.coord[1],
+                self.inner.n_px(),
+                tmpl_str,
+                self.inner.sssig,
+            )
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helper: convert SolveResult → Python dict
-// ---------------------------------------------------------------------------
-
-fn result_to_dict<'py>(
-    py: Python<'py>,
-    result: geopyv_dev::subset::SolveResult,
-) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new_bound(py);
-    d.set_item("p", result.p)?;
-    d.set_item("c_zncc", result.c_zncc)?;
-    d.set_item("c_znssd", result.c_znssd)?;
-    d.set_item("iterations", result.iterations)?;
-    d.set_item("converged", result.converged)?;
-    let history: Vec<(usize, f64, f64, f64)> = result.history;
-    d.set_item("history", history)?;
-    Ok(d)
-}
-
-// ---------------------------------------------------------------------------
-// Module registration helper
+// Module registration
 // ---------------------------------------------------------------------------
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

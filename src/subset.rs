@@ -1,6 +1,6 @@
 //! Subset module for geopyv-dev.
 //!
-//! Performs DIC/PIV algorithms on pixel patches. 
+//! Performs DIC/PIV algorithms on pixel patches.
 //!
 //! # Solvers
 //!
@@ -18,7 +18,7 @@
 //! | 1     | 6          | `[u, v, u_x, v_x, u_y, v_y]` |
 //! | 2     | 12         | `[u, v, u_x, v_x, u_y, v_y, u_xx, v_xx, u_xy, v_xy, u_yy, v_yy]` |
 //!
-//! # Coordinate convention 
+//! # Coordinate convention
 //!
 //! `coord[0]` and `coord[1]` are the two components of the subset centre, in
 //! the same order as `template.coords` columns. `f_coords[:,0]` and
@@ -30,12 +30,14 @@
 //! - Tier B  rtol = 1e-8   intensity interpolation (same B-spline as image)
 //! - Tier C  rtol = 1e-5   solver outputs (ZNCC, warp at convergence)
 
+use std::sync::Arc;
+
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
 use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{templates::TemplateShape, Error};
+use crate::{image::Image, masks::{LocalMask, MaskShape}, Error};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -54,38 +56,48 @@ type QcqtBlock = SMatrix<f64, 6, 6>;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Reference subset quantities computed once from the reference image.
-///
-/// Created by [`Subset::new`]. All fields reflect the coordinate convention
-/// from `geopyv`: `coord[0]` and `coord[1]` are the centre; `f_coords[:,0]`
-/// and `f_coords[:,1]` are the two coordinate components per pixel.
-pub struct Subset {
-    /// Centre coordinate `[coord0, coord1]`.
-    pub coord: [f64; 2],
-    /// Subset pixel coordinates, shape `(n_px, 2)`.
-    pub f_coords: Array2<f64>,
-    /// Reference subset intensities (B-spline interpolated), shape `(n_px,)`.
-    pub f: Array1<f64>,
-    /// Mean reference intensity `f_m`.
-    pub f_m: f64,
-    /// `sqrt(Σ(f_i − f_m)²)` — normalisation factor for ZNSSD.
-    pub delta_f: f64,
-    /// Reference image gradients at `f_coords`, shape `(n_px, 2)`.
-    pub grad_f: Array2<f64>,
-    /// Sum of squared intensity gradients (SSSIG quality metric).
-    pub sssig: f64,
-    /// Standard deviation of reference intensities (quality metric).
-    pub sigma_intensity: f64,
-}
-
-/// Serialisable summary of the template used in a [`SubsetSolution`].
+/// Serialisable summary of the local mask used by a subset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemplateSummary {
-    pub shape: TemplateShape,
+pub struct MaskSummary {
+    pub shape: MaskShape,
     /// Radius (Circle) or half-side-length (Square) in pixels.
     pub size: usize,
-    /// Number of active pixels in the template.
+    /// Number of active pixels in the mask.
     pub n_px: usize,
+}
+
+/// Reference subset quantities.
+///
+/// Created by [`Subset::new`] (full constructor) or
+/// [`Subset::from_subset_solution`] (partial constructor, no images).
+pub struct Subset {
+    // Always populated — image-independent or recoverable from SubsetSolution.
+    /// Centre coordinate `[coord0, coord1]`.
+    pub coord: [f64; 2],
+    /// Warp order: 1 (affine, 6 params) or 2 (quadratic, 12 params).
+    pub subset_order: usize,
+    /// Local mask shape/size/n_px summary.
+    pub mask: MaskSummary,
+    /// Sum of squared intensity gradients (SSSIG quality metric).
+    pub sssig: f64,
+    /// `sqrt(Σ(f_i − f_m)²)` — normalisation factor for ZNSSD. Equal to `std_dev * sqrt(n_px)`.
+    pub delta_f: f64,
+
+    // Image handles — None when images unavailable (load-from-disk path).
+    pub f_img: Option<Arc<Image>>,
+    pub g_img: Option<Arc<Image>>,
+
+    // Image-dependent — None when images unavailable.
+    /// Subset pixel coordinates, shape `(n_px, 2)`.
+    pub f_coords: Option<Array2<f64>>,
+    /// Reference subset intensities (B-spline interpolated), shape `(n_px,)`.
+    pub f: Option<Array1<f64>>,
+    /// Mean reference intensity.
+    pub f_m: Option<f64>,
+    /// Reference image gradients at `f_coords`, shape `(n_px, 2)`.
+    pub grad_f: Option<Array2<f64>>,
+    /// Standard deviation of reference intensities.
+    pub sigma_intensity: Option<f64>,
 }
 
 /// Serialisable result of a single-coordinate, single image-pair DIC solve.
@@ -94,7 +106,8 @@ pub struct TemplateSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubsetSolution {
     pub coord: [f64; 2],
-    pub template: TemplateSummary,
+    #[serde(alias = "template")]
+    pub mask: MaskSummary,
     pub ref_image: PathBuf,
     pub target_image: PathBuf,
     pub result: SolveResult,
@@ -104,13 +117,9 @@ pub struct SubsetSolution {
     /// Sum of squared intensity gradients (quality metric).
     #[serde(default)]
     pub sssig: f64,
-    /// Convergence norm threshold used in the solve (for display in convergence plot).
-    #[serde(default = "default_max_norm")]
-    pub max_norm: f64,
-}
-
-fn default_max_norm() -> f64 {
-    1e-3
+    /// `sqrt(Σ(f_i − f_m)²)` — normalisation factor for ZNSSD.
+    #[serde(default)]
+    pub delta_f: f64,
 }
 
 /// Output of a DIC solve ([`Subset::solve_icgn`] / [`Subset::solve_fagn`]).
@@ -126,8 +135,15 @@ pub struct SolveResult {
     pub iterations: usize,
     /// Whether the norm criterion `||Δp|| < max_norm` was satisfied.
     pub converged: bool,
+    /// Whether `c_zncc >= tolerance` (quality threshold passed).
+    #[serde(default)]
+    pub solved: bool,
     /// Per-iteration history: `(iteration, norm, C_ZNCC, C_ZNSSD)`.
     pub history: Vec<(usize, f64, f64, f64)>,
+    #[serde(default)]
+    pub max_norm: f64,
+    #[serde(default)]
+    pub tolerance: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -557,34 +573,50 @@ pub fn znssd(
 // ---------------------------------------------------------------------------
 
 impl Subset {
-    /// Create a new `Subset` from a centre coordinate, template coordinates,
-    /// and the reference image QCQT.
+    /// Full constructor — called when images are available.
     ///
-    /// # Arguments
-    /// * `coord` — subset centre `[coord0, coord1]`
-    /// * `template_coords` — pixel offsets relative to centre, shape `(n_px, 2)`
-    /// * `f_qcqt` — B-spline coefficient matrix from [`crate::image::Image`],
-    ///   shape `(rows*6, cols*6)`
+    /// Masking logic: if `global_mask` is `Some`, clones `local_mask`, applies
+    /// `mask_update`, and uses the masked coords. If `None`, uses `local_mask`
+    /// coords directly (all pixels within the local mask shape are active).
     ///
     /// # Errors
-    /// Returns [`Error::InvalidInput`] if `template_coords` is empty or
+    /// Returns [`Error::InvalidInput`] if the effective pixel set is empty or
     /// `delta_f == 0` (featureless subset).
     pub fn new(
         coord: [f64; 2],
-        template_coords: &Array2<f64>,
-        f_qcqt: &Array2<f64>,
+        local_mask: &LocalMask,
+        global_mask: Option<ArrayView2<u8>>,
+        f_img: Arc<Image>,
+        g_img: Arc<Image>,
+        subset_order: usize,
     ) -> Result<Self, Error> {
-        let n = template_coords.nrows();
-        if n == 0 {
-            return Err(Error::InvalidInput("template_coords is empty".to_string()));
-        }
-        let qv = f_qcqt.view();
+        let coords = match global_mask {
+            Some(mask) => {
+                let mut lm = local_mask.clone();
+                lm.mask_update(coord, mask);
+                lm.coords
+            }
+            None => local_mask.coords.clone(),
+        };
 
-        // f_coords[i] = template_coords[i] + coord  (matches _f_coords in C++)
+        let n = coords.nrows();
+        if n == 0 {
+            return Err(Error::InvalidInput("effective mask coords is empty".to_string()));
+        }
+
+        let mask = MaskSummary {
+            shape: local_mask.shape.clone(),
+            size: local_mask.size,
+            n_px: n,
+        };
+
+        let qv = f_img.qcqt.view();
+
+        // f_coords[i] = coords[i] + coord  (matches _f_coords in C++)
         let mut f_coords = Array2::zeros((n, 2));
         for i in 0..n {
-            f_coords[[i, 0]] = template_coords[[i, 0]] + coord[0];
-            f_coords[[i, 1]] = template_coords[[i, 1]] + coord[1];
+            f_coords[[i, 0]] = coords[[i, 0]] + coord[0];
+            f_coords[[i, 1]] = coords[[i, 1]] + coord[1];
         }
 
         // Reference intensities (Tier B)
@@ -617,20 +649,46 @@ impl Subset {
 
         Ok(Subset {
             coord,
-            f_coords,
-            f,
-            f_m,
-            delta_f,
-            grad_f,
+            subset_order,
+            mask,
             sssig,
-            sigma_intensity,
+            delta_f,
+            f_img: Some(f_img),
+            g_img: Some(g_img),
+            f_coords: Some(f_coords),
+            f: Some(f),
+            f_m: Some(f_m),
+            grad_f: Some(grad_f),
+            sigma_intensity: Some(sigma_intensity),
         })
     }
 
-    /// Number of pixels in the subset.
+    /// Partial constructor — called on load when images cannot be found on disk.
+    ///
+    /// Populates only the always-populated tier from `sol`. All image handles
+    /// and image-dependent fields are `None`.
+    pub fn from_subset_solution(sol: &SubsetSolution, _local_mask: &LocalMask) -> Self {
+        let subset_order = if sol.result.p.is_empty() { 1 } else { sol.result.p.len() / 6 };
+        Subset {
+            coord: sol.coord,
+            subset_order,
+            mask: sol.mask.clone(),
+            sssig: sol.sssig,
+            delta_f: sol.delta_f,
+            f_img: None,
+            g_img: None,
+            f_coords: None,
+            f: None,
+            f_m: None,
+            grad_f: None,
+            sigma_intensity: None,
+        }
+    }
+
+    /// Number of active pixels (from template summary; always available).
     #[inline]
     pub fn n_px(&self) -> usize {
-        self.f_coords.nrows()
+        self.mask.n_px
     }
 
     /// Inverse Compositional Gauss-Newton solver (ICGN).
@@ -639,35 +697,44 @@ impl Subset {
     /// The warp is updated via matrix composition.
     ///
     /// # Arguments
-    /// * `g_qcqt` — target image B-spline coefficient matrix
-    /// * `p_0` — initial warp vector (6 elements for order 1, 12 for order 2)
-    /// * `max_norm` — convergence criterion on `||Δp||`
-    /// * `max_iterations` — iteration limit
+    /// * `p_0` — initial warp vector; `None` → zeros of length `6 * subset_order`;
+    ///   provided slice is silently resized to `6 * subset_order`.
+    /// * `tolerance` — minimum ZNCC for `solved = true`.
+    /// * `max_norm` — convergence criterion on `||Δp||`.
+    /// * `max_iterations` — iteration limit.
     ///
     /// # Errors
-    /// Propagates any [`Error`] from internal operations.
+    /// Returns [`Error::InvalidInput`] if any image-dependent field is `None`.
     pub fn solve_icgn(
         &self,
-        g_qcqt: &Array2<f64>,
-        p_0: &[f64],
+        p_0: Option<&[f64]>,
+        tolerance: f64,
         max_norm: f64,
         max_iterations: usize,
     ) -> Result<SolveResult, Error> {
-        let n = self.n_px();
+        let unavail = || Error::InvalidInput("solve_icgn: images unavailable".to_string());
+        let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
+        let f       = self.f.as_ref().ok_or_else(unavail)?;
+        let f_m     = self.f_m.ok_or_else(unavail)?;
+        let grad_f  = self.grad_f.as_ref().ok_or_else(unavail)?;
+        let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
+
+        let n = f_coords.nrows();
         let size = (n as f64).sqrt();
-        let order = if p_0.len() <= 7 { 1 } else { 2 };
-        let gv = g_qcqt.view();
+        let expected = 6 * self.subset_order;
+        let mut p = p_0.map(|v| v.to_vec()).unwrap_or_else(|| vec![0.0; expected]);
+        p.resize(expected, 0.0);
+        let gv = g_img.qcqt.view();
 
         // Precompute SDI and Hessian (constant in ICGN)
-        let sdi_ref = steepest_descent(self.coord, &self.f_coords, &self.grad_f, order);
+        let sdi_ref = steepest_descent(self.coord, f_coords, grad_f, self.subset_order);
         let hessian = compute_hessian(&sdi_ref);
 
-        let mut p = p_0.to_vec();
         let mut history = Vec::with_capacity(max_iterations);
         let mut converged = false;
 
         for iteration in 1..=max_iterations {
-            let gc = apply_warp(self.coord, &p, &self.f_coords);
+            let gc = apply_warp(self.coord, &p, f_coords);
             let g: Array1<f64> = (0..n)
                 .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
                 .collect();
@@ -675,20 +742,13 @@ impl Subset {
             let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
 
             let dp_vec = delta_p_icgn(
-                &hessian,
-                &self.f,
-                &g,
-                self.f_m,
-                g_m,
-                self.delta_f,
-                delta_g,
-                &sdi_ref,
+                &hessian, f, &g, f_m, g_m, self.delta_f, delta_g, &sdi_ref,
             );
             let dp: Vec<f64> = dp_vec.iter().copied().collect();
             p = compose_icgn(&p, &dp);
 
             let norm = convergence_norm(&dp, size);
-            let c_znssd = znssd(&self.f, &g, self.f_m, g_m, self.delta_f, delta_g);
+            let c_znssd = znssd(f, &g, f_m, g_m, self.delta_f, delta_g);
             let c_zncc = 1.0 - c_znssd / 2.0;
             history.push((iteration, norm, c_zncc, c_znssd));
 
@@ -703,7 +763,8 @@ impl Subset {
             .map(|&(_, _, zncc, z)| (zncc, z))
             .unwrap_or((0.0, 4.0));
 
-        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, history })
+        let solved = c_zncc >= tolerance;
+        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, solved, history, max_norm, tolerance })
     }
 
     /// Forward Additive Gauss-Newton solver (FAGN).
@@ -714,25 +775,31 @@ impl Subset {
     /// # Arguments: same as [`solve_icgn`].
     pub fn solve_fagn(
         &self,
-        g_qcqt: &Array2<f64>,
-        p_0: &[f64],
+        p_0: Option<&[f64]>,
+        tolerance: f64,
         max_norm: f64,
         max_iterations: usize,
     ) -> Result<SolveResult, Error> {
-        let n = self.n_px();
-        let size = (n as f64).sqrt();
-        let order = if p_0.len() <= 7 { 1 } else { 2 };
-        let gv = g_qcqt.view();
+        let unavail = || Error::InvalidInput("solve_fagn: images unavailable".to_string());
+        let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
+        let f       = self.f.as_ref().ok_or_else(unavail)?;
+        let f_m     = self.f_m.ok_or_else(unavail)?;
+        let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
 
-        let mut p = p_0.to_vec();
+        let n = f_coords.nrows();
+        let size = (n as f64).sqrt();
+        let expected = 6 * self.subset_order;
+        let mut p = p_0.map(|v| v.to_vec()).unwrap_or_else(|| vec![0.0; expected]);
+        p.resize(expected, 0.0);
+        let gv = g_img.qcqt.view();
+
         let mut history = Vec::with_capacity(max_iterations);
         let mut converged = false;
 
         for iteration in 1..=max_iterations {
-            // Warped centre coordinate
             let g_center = [self.coord[0] + p[0], self.coord[1] + p[1]];
 
-            let gc = apply_warp(self.coord, &p, &self.f_coords);
+            let gc = apply_warp(self.coord, &p, f_coords);
             let g: Array1<f64> = (0..n)
                 .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
                 .collect();
@@ -747,17 +814,10 @@ impl Subset {
                 grad_g[[i, 1]] = gy;
             }
 
-            let sdi_cur = steepest_descent(g_center, &gc, &grad_g, order);
+            let sdi_cur = steepest_descent(g_center, &gc, &grad_g, self.subset_order);
             let hessian = compute_hessian(&sdi_cur);
             let dp_vec = delta_p_fagn(
-                &hessian,
-                &self.f,
-                &g,
-                self.f_m,
-                g_m,
-                self.delta_f,
-                delta_g,
-                &sdi_cur,
+                &hessian, f, &g, f_m, g_m, self.delta_f, delta_g, &sdi_cur,
             );
 
             // Additive update
@@ -767,7 +827,7 @@ impl Subset {
             let dp: Vec<f64> = dp_vec.iter().copied().collect();
 
             let norm = convergence_norm(&dp, size);
-            let c_znssd = znssd(&self.f, &g, self.f_m, g_m, self.delta_f, delta_g);
+            let c_znssd = znssd(f, &g, f_m, g_m, self.delta_f, delta_g);
             let c_zncc = 1.0 - c_znssd / 2.0;
             history.push((iteration, norm, c_zncc, c_znssd));
 
@@ -782,7 +842,8 @@ impl Subset {
             .map(|&(_, _, zncc, z)| (zncc, z))
             .unwrap_or((0.0, 4.0));
 
-        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, history })
+        let solved = c_zncc >= tolerance;
+        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, solved, history, max_norm, tolerance })
     }
 }
 
@@ -914,7 +975,7 @@ mod tests {
     #[test]
     fn test_bspline_eval_constant_image() {
         // Build a tiny constant QCQT (enough for 2×2 pixels)
-        // For a constant image `val`, QCQT block[0,0] = val, rest 0
+        // For a constant image `val`, QCQT block[0, 0] = val, rest 0
         // (because Q row-0 = [1/120, 13/60, 11/20, 13/60, 1/120, 0] sums to 1,
         //  and at dx=dy=0 only the constant term contributes).
         let val = 42.0_f64;
@@ -941,12 +1002,6 @@ mod tests {
             .join(name)
     }
 
-    /// Circle template coordinates matching `geopyv.templates.Circle(25)`.
-    fn circle_coords_25() -> Array2<f64> {
-        use crate::templates::Template;
-        Template::circle(25).unwrap().coords
-    }
-
     /// Tier C: ICGN order-1 converges on the real DIC test pair.
     ///
     /// Golden values (x-first coordinate convention):
@@ -963,18 +1018,22 @@ mod tests {
         }
 
         use crate::image::Image;
-        let ref_img = Image::from_file(&ref_path, 20).unwrap();
-        let tar_img = Image::from_file(&tar_path, 20).unwrap();
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
 
         let coord = [200.43, 200.76];
-        let tmpl = circle_coords_25();
-        let subset = Subset::new(coord, &tmpl, &ref_img.qcqt).unwrap();
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
+        ).unwrap();
 
         // Verify reference quantities match golden values (x-first coordinate convention)
         assert_eq!(subset.n_px(), 1961, "n_px mismatch");
         assert!(
-            (subset.f_m - 70.8561329162).abs() < 1e-4,
-            "f_m = {}", subset.f_m
+            (subset.f_m.unwrap() - 70.8561329162).abs() < 1e-4,
+            "f_m = {:?}", subset.f_m
         );
         assert!(
             (subset.delta_f - 3179.4465451209).abs() < 0.01,
@@ -986,13 +1045,11 @@ mod tests {
         );
 
         // Solve
-        let p_0 = vec![0.0f64; 6];
-        let result = subset
-            .solve_icgn(&tar_img.qcqt, &p_0, 1e-3, 50)
-            .unwrap();
+        let result = subset.solve_icgn(None, 0.75, 1e-3, 50).unwrap();
 
         // Tier C: ZNCC ≈ 0.999987, rtol = 1e-5
         assert!(result.converged, "ICGN did not converge");
+        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
         assert!(
             (result.c_zncc - 0.999987).abs() < 1e-4,
             "ZNCC = {} (expected ~0.999987)", result.c_zncc
@@ -1023,19 +1080,21 @@ mod tests {
         }
 
         use crate::image::Image;
-        let ref_img = Image::from_file(&ref_path, 20).unwrap();
-        let tar_img = Image::from_file(&tar_path, 20).unwrap();
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
 
         let coord = [200.43, 200.76];
-        let tmpl = circle_coords_25();
-        let subset = Subset::new(coord, &tmpl, &ref_img.qcqt).unwrap();
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
+        ).unwrap();
 
-        let p_0 = vec![0.0f64; 6];
-        let result = subset
-            .solve_fagn(&tar_img.qcqt, &p_0, 1e-3, 50)
-            .unwrap();
+        let result = subset.solve_fagn(None, 0.75, 1e-3, 50).unwrap();
 
         assert!(result.converged, "FAGN did not converge");
+        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
         assert!(
             (result.c_zncc - 0.999987).abs() < 1e-4,
             "ZNCC = {} (expected ~0.999987)", result.c_zncc
@@ -1061,19 +1120,21 @@ mod tests {
         }
 
         use crate::image::Image;
-        let ref_img = Image::from_file(&ref_path, 20).unwrap();
-        let tar_img = Image::from_file(&tar_path, 20).unwrap();
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
 
         let coord = [200.43, 200.76];
-        let tmpl = circle_coords_25();
-        let subset = Subset::new(coord, &tmpl, &ref_img.qcqt).unwrap();
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 2,
+        ).unwrap();
 
-        let p_0 = vec![0.0f64; 12];
-        let result = subset
-            .solve_icgn(&tar_img.qcqt, &p_0, 1e-3, 50)
-            .unwrap();
+        let result = subset.solve_icgn(None, 0.75, 1e-3, 50).unwrap();
 
         assert!(result.converged, "ICGN order-2 did not converge");
+        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
         assert!(
             result.c_zncc > 0.999,
             "ZNCC = {} (expected > 0.999)", result.c_zncc
@@ -1091,23 +1152,52 @@ mod tests {
         }
 
         use crate::image::Image;
-        let ref_img = Image::from_file(&ref_path, 20).unwrap();
-        let tar_img = Image::from_file(&tar_path, 20).unwrap();
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
 
         let coord = [200.43, 200.76];
-        let tmpl = circle_coords_25();
-        let subset = Subset::new(coord, &tmpl, &ref_img.qcqt).unwrap();
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 2,
+        ).unwrap();
 
-        let p_0 = vec![0.0f64; 12];
-        let result = subset
-            .solve_fagn(&tar_img.qcqt, &p_0, 1e-3, 50)
-            .unwrap();
+        let result = subset.solve_fagn(None, 0.75, 1e-3, 50).unwrap();
 
         assert!(result.converged, "FAGN order-2 did not converge");
+        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
         assert!(
             result.c_zncc > 0.999,
             "ZNCC = {} (expected > 0.999)", result.c_zncc
         );
     }
 
+    /// solved=false when tolerance is set above the actual ZNCC score.
+    #[test]
+    fn test_solved_false_below_tolerance() {
+        let ref_path = test_image_path("ref.jpg");
+        let tar_path = test_image_path("tar.jpg");
+        if !ref_path.exists() || !tar_path.exists() {
+            eprintln!("Skipping: test images not found");
+            return;
+        }
+
+        use crate::image::Image;
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
+
+        let coord = [200.43, 200.76];
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
+        ).unwrap();
+
+        // Set tolerance above 1.0 so no solve can ever pass.
+        let result = subset.solve_icgn(None, 2.0, 1e-3, 50).unwrap();
+
+        assert!(!result.solved, "solved should be false when tolerance > max possible ZNCC");
+    }
 }

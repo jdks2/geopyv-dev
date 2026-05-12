@@ -15,7 +15,7 @@ import pytest
 
 from geopyv_dev import (
     Particle,
-    ParticleSolution,
+    ParticleWrapper,
     particle_local_coordinates,
     particle_shape_function,
     particle_warp_increment,
@@ -424,7 +424,7 @@ def test_particle_solve_full_sequence():
         [1, 1],
     )
 
-    assert isinstance(sol, ParticleSolution)
+    assert isinstance(sol, ParticleWrapper)
     assert p.solved is True
     assert sol.coordinates.shape == (3, 2)
     assert sol.strains.shape == (3, 6)

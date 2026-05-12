@@ -1,5 +1,5 @@
 mod py_image;
-mod py_templates;
+mod py_mask;
 mod py_geometry;
 mod py_subset;
 mod py_mesh;
@@ -36,7 +36,7 @@ impl From<Error> for PyErr {
 #[pymodule]
 fn _geopyv_dev(m: &Bound<'_, PyModule>) -> PyResult<()> {
     py_image::register(m)?;
-    py_templates::register(m)?;
+    py_mask::register(m)?;
     py_geometry::register(m)?;
     py_subset::register(m)?;
     py_mesh::register(m)?;

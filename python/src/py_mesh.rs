@@ -1,30 +1,34 @@
 //! PyO3 wrapper for `geopyv_dev::mesh`.
 //!
 //! Exposes:
-//! - `Mesh` class: constructed via `generate()`, runs `solve()`.
-//! - `MeshSolution` class: read-only result from `Mesh.solve()`.
+//! - `Mesh` class: single mutable object, constructed with images, mutated in
+//!   place by `solve()` which returns `None`.
 //! - Free functions mirroring the pure-math helpers in `mesh.rs`, prefixed
 //!   `mesh_` to avoid name collisions at the module level.
+//! - `MeshSolution` class: retained as the serialisation boundary (IO tests
+//!   and `py_io.rs` use `MeshSolution`), but removed from `register()` so it
+//!   is not user-visible.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
-// PyArray1<u32> is used for iterations getter
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
-use geopyv_dev::geometry::meshing;
+use geopyv_dev::image::Image;
+use geopyv_dev::io::{save as io_save, GeopyvObject};
 use geopyv_dev::mesh::{
-    self, Mesh, MeshSolution, SolveConfig, SolveMethod,
+    self, Mesh, MeshSolution, SeedConfig, SolveConfig, SolveMethod,
 };
 
 use crate::{
     py_geometry::extract_region,
     py_image::PyImage,
-    py_templates::PyTemplate,
+    py_mask::PyMask,
     Error,
 };
 
@@ -34,38 +38,52 @@ use crate::{
 
 /// DIC mesh: geometry + reliability-guided solver.
 ///
-/// Construct with :meth:`Mesh.generate`; then call :meth:`Mesh.solve`.
+/// Construct with ``Mesh(boundary, target_nodes, f_img, g_img, ...)``;
+/// then call ``mesh.solve(template, seed_coord)`` which mutates in place.
 #[pyclass(name = "Mesh")]
 pub struct PyMesh {
-    inner: Mesh,
+    pub(crate) inner: Mesh,
+    pub(crate) f_img: Option<Py<PyImage>>,
+    pub(crate) g_img: Option<Py<PyImage>>,
+    pub(crate) solution: Option<MeshSolution>,
 }
 
 #[pymethods]
 impl PyMesh {
-    /// Generate a constrained-Delaunay triangulation and return a `Mesh`.
+    /// Construct a mesh: triangulate the boundary, compute the binary mask,
+    /// and store the reference and target images.
     ///
     /// Parameters
     /// ----------
     /// boundary : CircleRegion, PathRegion, or numpy.ndarray (N, 2)
-    ///     Boundary region or raw polygon vertices. Raw arrays imply ``boundary_hard=False``.
-    /// size_lower : float
-    ///     Minimum element edge length.
-    /// size_upper : float
-    ///     Maximum element edge length.
+    ///     Boundary region. Raw arrays imply ``boundary_hard=False``.
     /// target_nodes : int
     ///     Target node count for binary-search sizing.
+    /// f_img : Image
+    ///     Reference image.
+    /// g_img : Image
+    ///     Target image.
+    /// size : (float, float), optional
+    ///     ``(size_lower, size_upper)`` element edge lengths. Default ``(1.0, 1000.0)``.
     /// exclusions : list[CircleRegion | PathRegion | numpy.ndarray], optional
-    ///     Exclusion regions or raw polygon arrays. Default None.
+    ///     Exclusion regions. Default ``None``.
+    /// exclusions_hard : list[bool], optional
+    ///     Per-exclusion hard flag. Default all ``True``.
     /// mesh_order : int, optional
-    ///     1 (linear) or 2 (quadratic). Default 1.
+    ///     1 (linear) or 2 (quadratic). Default 2.
     #[new]
-    #[pyo3(signature = (boundary, size_lower, size_upper, target_nodes, exclusions=None, mesh_order=1))]
+    #[pyo3(signature = (boundary, target_nodes, f_img, g_img,
+                         size=(1.0, 1000.0), exclusions=None, exclusions_hard=None,
+                         mesh_order=2))]
     fn new(
+        _py: Python<'_>,
         boundary: &Bound<'_, PyAny>,
-        size_lower: f64,
-        size_upper: f64,
         target_nodes: usize,
+        f_img: &Bound<'_, PyImage>,
+        g_img: &Bound<'_, PyImage>,
+        size: (f64, f64),
         exclusions: Option<Vec<Bound<'_, PyAny>>>,
+        exclusions_hard: Option<Vec<bool>>,
         mesh_order: u8,
     ) -> PyResult<Self> {
         let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
@@ -74,65 +92,87 @@ impl PyMesh {
             .iter()
             .map(|obj| extract_region(obj).map(|(nodes, _)| nodes))
             .collect::<PyResult<Vec<_>>>()?;
+        let n_excl = excl_owned.len();
         let excl_views: Vec<_> = excl_owned.iter().map(|a| a.view()).collect();
-        let roi = meshing::define_roi(boundary_nodes.view(), boundary_hard, &excl_views, None);
-        let m = Mesh::generate(
-            roi.borders.view(),
-            roi.segments.view(),
-            &roi.curves,
-            size_lower,
-            size_upper,
+        let excl_hard: Vec<bool> = exclusions_hard.unwrap_or_else(|| vec![true; n_excl]);
+
+        let f_py = f_img.clone().unbind();
+        let g_py = g_img.clone().unbind();
+        let f_ref = f_img.borrow();
+        let g_ref = g_img.borrow();
+        let f_arc = Arc::clone(&f_ref.inner);
+        let g_arc = Arc::clone(&g_ref.inner);
+
+        let inner = Mesh::new(
+            boundary_nodes.view(),
+            boundary_hard,
+            &excl_views,
+            &excl_hard,
+            size,
             target_nodes,
             mesh_order,
+            f_arc,
+            g_arc,
         )
         .map_err(Error::from)?;
-        Ok(PyMesh { inner: m })
+
+        Ok(PyMesh {
+            inner,
+            f_img: Some(f_py),
+            g_img: Some(g_py),
+            solution: None,
+        })
     }
 
-    /// Run the reliability-guided DIC solver.
+    /// Run the reliability-guided DIC solver. Mutates in place; returns ``None``.
     ///
     /// Parameters
     /// ----------
-    /// f_img : Image
-    ///     Reference image (pre-computed B-spline data).
-    /// g_img : Image
-    ///     Target image.
     /// template : Template
     ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Image coordinate ``[x, y]`` near a region of low deformation.
-    /// seed_warp : list[float]
-    ///     Initial warp vector for the seed node (length 6 or 12).
+    /// seed_warp : list[float], optional
+    ///     Initial warp vector for the seed node. Defaults to zeros.
     /// max_norm : float, optional
     ///     Convergence criterion. Default 1e-5.
     /// max_iterations : int, optional
     ///     Iteration limit per node. Default 50.
     /// subset_order : int, optional
-    ///     1 (affine) or 2 (quadratic). Default 1.
+    ///     1 (affine) or 2 (quadratic). Default 2.
     /// tolerance : float, optional
-    ///     Minimum acceptable C_ZNCC. Default 0.75.
+    ///     Minimum acceptable C_ZNCC for propagated nodes. Default 0.75.
+    /// seed_tolerance : float, optional
+    ///     Minimum acceptable C_ZNCC for the seed node. Default 0.9.
     /// method : str, optional
     ///     ``"icgn"`` (default) or ``"fagn"``.
-    ///
-    /// Returns
-    /// -------
-    /// MeshSolution
-    #[pyo3(signature = (f_img, g_img, template, seed_coord, seed_warp,
-                         max_norm=1e-5, max_iterations=50, subset_order=1,
-                         tolerance=0.75, method="icgn"))]
+    #[pyo3(signature = (local_mask, seed_coord, seed_warp=None,
+                        max_norm=1e-5, max_iterations=50, subset_order=2,
+                        tolerance=0.75, seed_tolerance=0.9, method="icgn"))]
     fn solve(
-        &self,
-        f_img: PyRef<'_, PyImage>,
-        g_img: PyRef<'_, PyImage>,
-        template: &Bound<'_, PyAny>,
+        &mut self,
+        _py: Python<'_>,
+        local_mask: &Bound<'_, PyAny>,
         seed_coord: [f64; 2],
-        seed_warp: Vec<f64>,
+        seed_warp: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
         subset_order: usize,
         tolerance: f64,
+        seed_tolerance: f64,
         method: &str,
-    ) -> PyResult<PyMeshSolution> {
+    ) -> PyResult<()> {
+        let tmpl = local_mask
+            .extract::<PyRef<'_, PyMask>>()
+            .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
+        let local_mask_ref = tmpl.local_mask_ref()?;
+        let p_len = 6 * subset_order;
+        let warp = seed_warp.unwrap_or_else(|| vec![0.0; p_len]);
+        let seed = SeedConfig {
+            coord: seed_coord,
+            warp,
+            tolerance: seed_tolerance,
+        };
         let solve_method = if method == "fagn" { SolveMethod::Fagn } else { SolveMethod::Icgn };
         let cfg = SolveConfig {
             max_norm,
@@ -141,17 +181,14 @@ impl PyMesh {
             tolerance,
             method: solve_method,
         };
-        let f_path = f_img.filepath.as_deref().map(PathBuf::from).unwrap_or_default();
-        let g_path = g_img.filepath.as_deref().map(PathBuf::from).unwrap_or_default();
-        let tmpl = template
-            .extract::<PyRef<'_, PyTemplate>>()
-            .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
-        let sol = self
-            .inner
-            .solve(&f_img.inner, &g_img.inner, &tmpl.inner.coords, seed_coord, &seed_warp, &cfg, f_path, g_path)
-            .map_err(Error::from)?;
-        Ok(PyMeshSolution { inner: sol })
+        let sol = self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
+        self.solution = Some(sol);
+        Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Geometry getters — always available
+    // -----------------------------------------------------------------------
 
     /// Node coordinates, shape ``(N, 2)``.
     #[getter]
@@ -188,21 +225,197 @@ impl PyMesh {
         self.inner.mesh_order()
     }
 
+    /// Reference image used at construction, or ``None``.
+    #[getter]
+    fn f_img(&self, py: Python<'_>) -> Option<Py<PyImage>> {
+        self.f_img.as_ref().map(|img| img.clone_ref(py))
+    }
+
+    /// Target image used at construction, or ``None``.
+    #[getter]
+    fn g_img(&self, py: Python<'_>) -> Option<Py<PyImage>> {
+        self.g_img.as_ref().map(|img| img.clone_ref(py))
+    }
+
+    /// ``True`` once ``solve()`` has been called successfully.
+    #[getter]
+    fn solved(&self) -> bool {
+        self.solution.is_some()
+    }
+
+    // -----------------------------------------------------------------------
+    // Solve-result getters — raise AttributeError if not yet solved
+    // -----------------------------------------------------------------------
+
+    /// Signed element areas ``(M,)``.
+    #[getter]
+    fn areas<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        Ok(self.require_solved()?.areas.clone().into_pyarray_bound(py))
+    }
+
+    /// Element warp vectors ``(M, 12)``.
+    #[getter]
+    fn warps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        Ok(self.require_solved()?.warps.clone().into_pyarray_bound(py))
+    }
+
+    /// Per-node displacements ``(N, 2)``.
+    #[getter]
+    fn displacements<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        Ok(self.require_solved()?.displacements.clone().into_pyarray_bound(py))
+    }
+
+    /// Per-node ZNCC scores ``(N,)``.
+    #[getter]
+    fn c_zncc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        Ok(self.require_solved()?.c_zncc.clone().into_pyarray_bound(py))
+    }
+
+    /// Per-node warp parameters ``(N, 6)`` or ``(N, 12)``.
+    #[getter]
+    fn p<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        Ok(self.require_solved()?.p.clone().into_pyarray_bound(py))
+    }
+
+    /// Index of the seed node.
+    #[getter]
+    fn seed_node(&self) -> PyResult<i64> {
+        Ok(self.require_solved()?.seed_node as i64)
+    }
+
+    /// Subset warp order (1 or 2).
+    #[getter]
+    fn subset_order(&self) -> PyResult<u8> {
+        Ok(self.require_solved()?.subset_order)
+    }
+
+    /// Per-node iteration counts ``(N,)``.
+    #[getter]
+    fn iterations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u32>>> {
+        Ok(self.require_solved()?.iterations.clone().into_pyarray_bound(py))
+    }
+
+    /// Per-node final ∆norm values ``(N,)``.
+    #[getter]
+    fn norms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        Ok(self.require_solved()?.norms.clone().into_pyarray_bound(py))
+    }
+
+    /// Reference image file path, or ``None`` if not set.
+    #[getter]
+    fn f_img_path(&self) -> PyResult<Option<String>> {
+        let s = self.require_solved()?.f_img_path.to_string_lossy().into_owned();
+        Ok(if s.is_empty() { None } else { Some(s) })
+    }
+
+    /// Target image file path, or ``None`` if not set.
+    #[getter]
+    fn g_img_path(&self) -> PyResult<Option<String>> {
+        let s = self.require_solved()?.g_img_path.to_string_lossy().into_owned();
+        Ok(if s.is_empty() { None } else { Some(s) })
+    }
+
+    // -----------------------------------------------------------------------
+    // IO
+    // -----------------------------------------------------------------------
+
+    /// Save the solved mesh to a ``.pyv`` file.
+    fn save(&self, path: &str) -> PyResult<()> {
+        let sol = self.solution.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("Mesh has not been solved; cannot save.")
+        })?;
+        io_save(path, &GeopyvObject::Mesh(sol.clone())).map_err(Error::from)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Repr
+    // -----------------------------------------------------------------------
+
     fn __repr__(&self) -> String {
-        format!(
-            "Mesh(nodes={}, elements={}, order={})",
-            self.inner.nodes().nrows(),
-            self.inner.elements().nrows(),
-            self.inner.mesh_order(),
-        )
+        if self.solution.is_some() {
+            let sol = self.solution.as_ref().unwrap();
+            let zncc_min = sol.c_zncc.iter().cloned().fold(f64::INFINITY, f64::min);
+            let zncc_max = sol.c_zncc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            format!(
+                "Mesh(nodes={}, elements={}, mesh_order={}, subset_order={}, solved=True, c_zncc=[{:.4}..{:.4}])",
+                self.inner.nodes().nrows(),
+                self.inner.elements().nrows(),
+                self.inner.mesh_order(),
+                sol.subset_order,
+                zncc_min,
+                zncc_max,
+            )
+        } else {
+            format!(
+                "Mesh(nodes={}, elements={}, mesh_order={}, solved=False)",
+                self.inner.nodes().nrows(),
+                self.inner.elements().nrows(),
+                self.inner.mesh_order(),
+            )
+        }
+    }
+}
+
+impl PyMesh {
+    fn require_solved(&self) -> PyResult<&MeshSolution> {
+        self.solution.as_ref().ok_or_else(|| {
+            PyAttributeError::new_err("Mesh has not been solved; call solve() first")
+        })
+    }
+
+    /// Restore a solved `PyMesh` from a serialised `MeshSolution`.
+    ///
+    /// Attempts to reload the reference and target images from their stored
+    /// paths.  Falls back to a 1×1 placeholder image if a path is missing or
+    /// the file cannot be read (the mesh geometry is always restored).
+    pub(crate) fn from_solution(py: Python<'_>, sol: MeshSolution) -> PyResult<Self> {
+        let dummy = || Arc::new(Image::from_array(ndarray::Array2::<f64>::zeros((10, 10)), 3));
+
+        let mut f_py: Option<Py<PyImage>> = None;
+        let mut f_arc = dummy();
+        if !sol.f_img_path.as_os_str().is_empty() {
+            if let Ok(img) = Image::from_file(&sol.f_img_path, 20) {
+                let arc = Arc::new(img);
+                f_arc = Arc::clone(&arc);
+                let py_img = PyImage {
+                    inner: arc,
+                    filepath: Some(sol.f_img_path.to_string_lossy().into_owned()),
+                };
+                f_py = Py::new(py, py_img).ok();
+            }
+        }
+
+        let mut g_py: Option<Py<PyImage>> = None;
+        let mut g_arc = dummy();
+        if !sol.g_img_path.as_os_str().is_empty() {
+            if let Ok(img) = Image::from_file(&sol.g_img_path, 20) {
+                let arc = Arc::new(img);
+                g_arc = Arc::clone(&arc);
+                let py_img = PyImage {
+                    inner: arc,
+                    filepath: Some(sol.g_img_path.to_string_lossy().into_owned()),
+                };
+                g_py = Py::new(py, py_img).ok();
+            }
+        }
+
+        let inner = Mesh::from_solution(&sol, f_arc, g_arc);
+
+        Ok(PyMesh {
+            inner,
+            f_img: f_py,
+            g_img: g_py,
+            solution: Some(sol),
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
-// MeshSolution class
+// MeshSolution class — kept for serialisation boundary; NOT registered.
 // ---------------------------------------------------------------------------
 
-/// Read-only DIC solve result from :meth:`Mesh.solve`.
+/// Serialisation-only result type.  Not exposed to Python users.
 #[pyclass(name = "MeshSolution")]
 pub struct PyMeshSolution {
     pub(crate) inner: MeshSolution,
@@ -210,10 +423,7 @@ pub struct PyMeshSolution {
 
 #[pymethods]
 impl PyMeshSolution {
-    /// Construct a `MeshSolution` directly from arrays.
-    ///
-    /// Used primarily in tests to build synthetic results without running a
-    /// full DIC solve.
+    /// Construct a `MeshSolution` directly from arrays (used in tests).
     #[new]
     #[pyo3(signature = (nodes, elements, boundary, exclusions,
                          areas, warps, displacements, c_zncc, p,
@@ -262,26 +472,22 @@ impl PyMeshSolution {
         }
     }
 
-    /// Node coordinates ``(N, 2)``.
     #[getter]
     fn nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         self.inner.nodes.clone().into_pyarray_bound(py)
     }
 
-    /// Element connectivity ``(M, 3)`` or ``(M, 6)``.
     #[getter]
     fn elements<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<i64>> {
         let e: Array2<i64> = self.inner.elements.map(|&x| x as i64);
         e.into_pyarray_bound(py)
     }
 
-    /// Boundary node indices.
     #[getter]
     fn boundary(&self) -> Vec<i64> {
         self.inner.boundary.iter().map(|&x| x as i64).collect()
     }
 
-    /// Exclusion node index groups.
     #[getter]
     fn exclusions(&self) -> Vec<Vec<i64>> {
         self.inner
@@ -291,105 +497,88 @@ impl PyMeshSolution {
             .collect()
     }
 
-    /// Signed element areas ``(M,)``.
     #[getter]
     fn areas<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.areas.clone().into_pyarray_bound(py)
     }
 
-    /// Element warp vectors ``(M, 12)``.
     #[getter]
     fn warps<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         self.inner.warps.clone().into_pyarray_bound(py)
     }
 
-    /// Per-node displacements ``(N, 2)``.
     #[getter]
     fn displacements<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         self.inner.displacements.clone().into_pyarray_bound(py)
     }
 
-    /// Per-node ZNCC scores ``(N,)``.
     #[getter]
     fn c_zncc<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.c_zncc.clone().into_pyarray_bound(py)
     }
 
-    /// Per-node warp parameters ``(N, 6)`` or ``(N, 12)``.
     #[getter]
     fn p<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         self.inner.p.clone().into_pyarray_bound(py)
     }
 
-    /// Index of the seed node.
     #[getter]
     fn seed_node(&self) -> i64 {
         self.inner.seed_node as i64
     }
 
-    /// Mesh element order.
     #[getter]
     fn mesh_order(&self) -> u8 {
         self.inner.mesh_order
     }
 
-    /// Subset warp order.
     #[getter]
     fn subset_order(&self) -> u8 {
         self.inner.subset_order
     }
 
-    /// Reference image file path, or ``None`` if not set.
     #[getter]
     fn f_img_path(&self) -> Option<String> {
         let s = self.inner.f_img_path.to_string_lossy().into_owned();
         if s.is_empty() { None } else { Some(s) }
     }
 
-    /// Target image file path, or ``None`` if not set.
     #[getter]
     fn g_img_path(&self) -> Option<String> {
         let s = self.inner.g_img_path.to_string_lossy().into_owned();
         if s.is_empty() { None } else { Some(s) }
     }
 
-    /// Per-node iteration counts ``(N,)``.
     #[getter]
     fn iterations<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
         self.inner.iterations.clone().into_pyarray_bound(py)
     }
 
-    /// Per-node final ∆norm values ``(N,)``.
     #[getter]
     fn norms<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.norms.clone().into_pyarray_bound(py)
     }
 
     fn __repr__(&self) -> String {
+        let zncc = &self.inner.c_zncc;
+        let zncc_min = zncc.iter().cloned().fold(f64::INFINITY, f64::min);
+        let zncc_max = zncc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         format!(
-            "MeshSolution(nodes={}, elements={}, mesh_order={}, subset_order={})",
+            "MeshSolution(nodes={}, elements={}, mesh_order={}, subset_order={}, c_zncc=[{:.4}..{:.4}])",
             self.inner.nodes.nrows(),
             self.inner.elements.nrows(),
             self.inner.mesh_order,
             self.inner.subset_order,
+            zncc_min,
+            zncc_max,
         )
     }
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — mirroring Phase 1 fixture function signatures
+// Free functions
 // ---------------------------------------------------------------------------
 
-/// Signed element areas: ``0.5 * det([[1,x0,y0],[1,x1,y1],[1,x2,y2]])``.
-///
-/// Parameters
-/// ----------
-/// nodes : numpy.ndarray, shape (N, 2), float64
-/// elements : numpy.ndarray, shape (M, 3) or (M, 6), int64
-///
-/// Returns
-/// -------
-/// numpy.ndarray, shape (M,), float64
 #[pyfunction]
 fn mesh_element_area<'py>(
     py: Python<'py>,
@@ -401,19 +590,6 @@ fn mesh_element_area<'py>(
     mesh::element_area(&n, &e).into_pyarray_bound(py)
 }
 
-/// Element warp vectors ``(M, 12)`` from nodal displacements.
-///
-/// Parameters
-/// ----------
-/// nodes : numpy.ndarray, shape (N, 2), float64
-/// elements : numpy.ndarray, shape (M, 3) or (M, 6), int64
-/// displacements : numpy.ndarray, shape (N, 2), float64
-/// mesh_order : int
-///     1 (linear) or 2 (quadratic).
-///
-/// Returns
-/// -------
-/// numpy.ndarray, shape (M, 12), float64
 #[pyfunction]
 fn mesh_element_strains<'py>(
     py: Python<'py>,
@@ -430,28 +606,13 @@ fn mesh_element_strains<'py>(
         .map_err(|e| PyErr::from(Error::from(e)))
 }
 
-/// Shape functions and their derivatives at the element centroid.
-///
-/// Parameters
-/// ----------
-/// mesh_order : int
-///     1 or 2.
-///
-/// Returns
-/// -------
-/// tuple of (N, dN, d2N):
-///     N   – shape (3,) or (6,)
-///     dN  – shape (2, 3) or (2, 6)
-///     d2N – shape (3, 6) for order-2; ``None`` for order-1
 #[pyfunction]
 fn mesh_shape_function(py: Python<'_>, mesh_order: u8) -> PyResult<Bound<'_, PyTuple>> {
     let (n_vec, dn_vec, d2n_opt) = mesh::shape_function(mesh_order);
 
-    // N
     let n_arr: Array1<f64> = Array1::from(n_vec);
     let n_any = n_arr.into_pyarray_bound(py).into_any();
 
-    // dN
     let dn_r = dn_vec.len();
     let dn_c = if dn_r > 0 { dn_vec[0].len() } else { 0 };
     let dn_flat: Vec<f64> = dn_vec.into_iter().flatten().collect();
@@ -459,7 +620,6 @@ fn mesh_shape_function(py: Python<'_>, mesh_order: u8) -> PyResult<Bound<'_, PyT
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let dn_any = dn_arr.into_pyarray_bound(py).into_any();
 
-    // d2N
     let d2n_any = match d2n_opt {
         Some(d2n_vec) => {
             let r = d2n_vec.len();
@@ -476,20 +636,6 @@ fn mesh_shape_function(py: Python<'_>, mesh_order: u8) -> PyResult<Bound<'_, PyT
     Ok(PyTuple::new_bound(py, [n_any, dn_any, d2n_any]))
 }
 
-/// Node connectivity for a given node index.
-///
-/// Parameters
-/// ----------
-/// elements : numpy.ndarray, shape (M, 3) or (M, 6), int64
-/// mesh_order : int
-/// idx : int
-///     Node index.
-/// full : bool, optional
-///     If True, return all element-sharing nodes. Default False.
-///
-/// Returns
-/// -------
-/// list[int]  — sorted neighbour indices
 #[pyfunction]
 #[pyo3(signature = (elements, mesh_order, idx, full=false))]
 fn mesh_connectivity(
@@ -505,34 +651,12 @@ fn mesh_connectivity(
         .collect()
 }
 
-/// Return the node index closest to ``seed_coord``.
-///
-/// Parameters
-/// ----------
-/// nodes : numpy.ndarray, shape (N, 2), float64
-/// seed_coord : list[float]
-///     ``[x, y]`` query coordinate.
-///
-/// Returns
-/// -------
-/// int
 #[pyfunction]
 fn mesh_find_seed_node(nodes: PyReadonlyArray2<f64>, seed_coord: [f64; 2]) -> i64 {
     let n = nodes.as_array().to_owned();
     mesh::find_seed_node(&n, seed_coord) as i64
 }
 
-/// IQR-based outlier detection on C_ZNCC scores.
-///
-/// Returns indices where ``C_ZNCC < LQ − 2.5 × IQR``.
-///
-/// Parameters
-/// ----------
-/// c_zncc : numpy.ndarray, shape (N,), float64
-///
-/// Returns
-/// -------
-/// numpy.ndarray of int64, outlier indices
 #[pyfunction]
 fn mesh_corr<'py>(
     py: Python<'py>,
@@ -544,23 +668,6 @@ fn mesh_corr<'py>(
     Array1::from(ids_i64).into_pyarray_bound(py)
 }
 
-/// Flow score: dot product between node displacement direction and mean neighbour direction.
-///
-/// Parameters
-/// ----------
-/// idx : int
-///     Node index.
-/// displacements : numpy.ndarray, shape (N, 2), float64
-/// elements : numpy.ndarray, shape (M, 3) or (M, 6), int64
-/// mesh_order : int
-/// exclude : list[int], optional
-///     Neighbour indices to exclude. Default ``[]``.
-/// displacement : list[float] or numpy array (2,), optional
-///     Override for the node's own displacement. Default uses ``displacements[idx]``.
-///
-/// Returns
-/// -------
-/// float  (−1 if no valid neighbours)
 #[pyfunction]
 #[pyo3(signature = (idx, displacements, elements, mesh_order, exclude=None, displacement=None))]
 fn mesh_flow_calc(
@@ -574,21 +681,10 @@ fn mesh_flow_calc(
     let e: Array2<usize> = elements.as_array().map(|&x| x as usize);
     let d = displacements.as_array();
     let excl: HashSet<usize> = exclude.unwrap_or_default().into_iter().collect();
-    let disp_override: Option<[f64; 2]> =
-        displacement.map(|v| [v[0], v[1]]);
+    let disp_override: Option<[f64; 2]> = displacement.map(|v| [v[0], v[1]]);
     mesh::flow_calc(idx, &e, mesh_order, d, &excl, disp_override)
 }
 
-/// Displacement magnitude: ``sqrt(dx² + dy²)``.
-///
-/// Parameters
-/// ----------
-/// displacement : list[float]
-///     ``[dx, dy]``.
-///
-/// Returns
-/// -------
-/// float
 #[pyfunction]
 fn mesh_r_calc(displacement: [f64; 2]) -> f64 {
     mesh::r_calc(displacement)
@@ -600,7 +696,7 @@ fn mesh_r_calc(displacement: [f64; 2]) -> f64 {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMesh>()?;
-    m.add_class::<PyMeshSolution>()?;
+    // PyMeshSolution intentionally NOT registered — serialisation boundary only.
     m.add_function(wrap_pyfunction!(mesh_element_area, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_element_strains, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_shape_function, m)?)?;

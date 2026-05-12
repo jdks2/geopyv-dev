@@ -7,6 +7,8 @@
 //! - Free functions mirroring the pure-math helpers in `particle.rs`, prefixed
 //!   `particle_` to avoid name collisions at the module level.
 
+use std::path::PathBuf;
+
 use ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -26,7 +28,6 @@ use crate::Error;
 #[pyclass(name = "ParticleSolution")]
 pub struct PyParticleSolution {
     pub(crate) inner: ParticleSolution,
-    pub(crate) image_0_path: Option<String>,
 }
 
 #[pymethods]
@@ -96,7 +97,7 @@ impl PyParticleSolution {
     /// Path of the initial (reference) image, or ``None``.
     #[getter]
     fn image_0_path(&self) -> Option<String> {
-        self.image_0_path.clone()
+        self.inner.image_0_path.as_ref().map(|p| p.to_string_lossy().into_owned())
     }
 
     fn __repr__(&self) -> String {
@@ -132,7 +133,6 @@ impl PyParticleSolution {
 #[pyclass(name = "Particle")]
 pub struct PyParticle {
     inner: Particle,
-    pub(crate) image_0_path: Option<String>,
 }
 
 #[pymethods]
@@ -148,9 +148,10 @@ impl PyParticle {
         track: bool,
         image_0_path: Option<String>,
     ) -> PyResult<Self> {
-        let p = Particle::new(coordinate, &initial_warp, initial_volume, inc_no, mesh_order, track)
+        let path = image_0_path.map(PathBuf::from);
+        let p = Particle::new(coordinate, &initial_warp, initial_volume, inc_no, mesh_order, track, path)
             .map_err(Error::from)?;
-        Ok(PyParticle { inner: p, image_0_path })
+        Ok(PyParticle { inner: p })
     }
 
     /// Solve a single increment.
@@ -249,7 +250,7 @@ impl PyParticle {
 
         let cfg = ParticleConfig { factor, true_incs };
         let sol = self.inner.solve(&mesh_data, &cfg).map_err(Error::from)?;
-        Ok(PyParticleSolution { inner: sol, image_0_path: self.image_0_path.clone() })
+        Ok(PyParticleSolution { inner: sol })
     }
 
     // --- State getters ---
@@ -305,7 +306,7 @@ impl PyParticle {
     /// Path of the initial (reference) image, or ``None``.
     #[getter]
     fn image_0_path(&self) -> Option<String> {
-        self.image_0_path.clone()
+        self.inner.image_0_path.as_ref().map(|p| p.to_string_lossy().into_owned())
     }
 
     /// Initial coordinate of the particle ``[x, y]``.

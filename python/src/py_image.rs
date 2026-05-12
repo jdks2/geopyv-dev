@@ -1,6 +1,7 @@
 //! PyO3 wrapper for `geopyv_dev::image::Image`.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2}; // IntoPyArray brings into_pyarray_bound into scope
 use pyo3::exceptions::PyValueError;
@@ -31,7 +32,7 @@ use crate::Error;
 /// Exactly one of `filepath` or `image_gs` must be supplied.
 #[pyclass(name = "Image")]
 pub struct PyImage {
-    pub(crate) inner: Image,
+    pub(crate) inner: Arc<Image>,
     pub(crate) filepath: Option<String>,
 }
 
@@ -47,11 +48,11 @@ impl PyImage {
         match (filepath, image_gs) {
             (Some(fp), None) => {
                 let img = Image::from_file(Path::new(fp), border).map_err(Error::from)?;
-                Ok(PyImage { inner: img, filepath: Some(fp.to_owned()) })
+                Ok(PyImage { inner: Arc::new(img), filepath: Some(fp.to_owned()) })
             }
             (None, Some(arr)) => {
                 let owned = arr.as_array().to_owned();
-                Ok(PyImage { inner: Image::from_array(owned, border), filepath: None })
+                Ok(PyImage { inner: Arc::new(Image::from_array(owned, border)), filepath: None })
             }
             (Some(_), Some(_)) => Err(PyValueError::new_err(
                 "supply exactly one of `filepath` or `image_gs`, not both",
