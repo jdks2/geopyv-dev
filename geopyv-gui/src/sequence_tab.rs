@@ -6,13 +6,12 @@ use std::time::Instant;
 use eframe::egui;
 use ndarray::Array2;
 
-use geopyv_dev::geometry::meshing::define_roi;
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::mesh::{Mesh, MeshSolution, SolveConfig};
+use geopyv_dev::mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::sequence::{deformation_preconditioning, SequenceSolution};
-use geopyv_dev::templates::{Template, TemplateShape};
+use geopyv_dev::masks::{LocalMask, MaskShape};
 
 use crate::colormap::ColormapType;
 use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
@@ -72,7 +71,7 @@ pub struct NewSequenceForm {
     pub start_idx: Option<usize>,
     pub end_text: String,
     pub end_idx: Option<usize>,
-    pub template_shape: TemplateShape,
+    pub template_shape: MaskShape,
     pub template_size_text: String,
     pub template_size: u32,
     pub template_size_error: Option<String>,
@@ -91,7 +90,7 @@ impl Default for NewSequenceForm {
             start_idx: None,
             end_text: String::new(),
             end_idx: None,
-            template_shape: TemplateShape::Circle,
+            template_shape: MaskShape::Circle,
             template_size_text: "20".to_string(),
             template_size: 20,
             template_size_error: None,
@@ -210,7 +209,7 @@ impl SequenceSolveState {
 pub struct SequenceSpawnParams {
     pub name: String,
     pub image_paths: Vec<PathBuf>,
-    pub template_shape: TemplateShape,
+    pub template_shape: MaskShape,
     pub template_size: u32,
     pub boundary: Vec<[f64; 2]>,
     pub exclusions: Vec<Vec<[f64; 2]>>,
@@ -1003,8 +1002,8 @@ impl SequenceTabState {
             .show(ui, |ui| {
                 ui.label(lbl("Shape:"));
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut form.template_shape, TemplateShape::Circle, "Circle");
-                    ui.radio_value(&mut form.template_shape, TemplateShape::Square, "Square");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Circle, "Circle");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Square, "Square");
                 });
                 ui.end_row();
 
@@ -1590,16 +1589,16 @@ fn run_solve(
     state: Arc<Mutex<SequenceSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    // Build template.
-    set_progress(&state, 0.02, "Building template\u{2026}");
-    let template = match params.template_shape {
-        TemplateShape::Circle => Template::circle(params.template_size as usize),
-        TemplateShape::Square => Template::square(params.template_size as usize),
+    // Build local mask.
+    set_progress(&state, 0.02, "Building local mask\u{2026}");
+    let local_mask = match params.template_shape {
+        MaskShape::Circle => LocalMask::circle(params.template_size as usize),
+        MaskShape::Square => LocalMask::square(params.template_size as usize),
     };
-    let template = match template {
+    let local_mask = match local_mask {
         Ok(t) => t,
         Err(e) => {
-            set_error(&state, format!("Template build error: {e}"));
+            set_error(&state, format!("Mask build error: {e}"));
             return;
         }
     };
@@ -1611,7 +1610,7 @@ fn run_solve(
         return;
     }
 
-    // Build ROI from boundary / exclusions.
+    // Build boundary / exclusion arrays (reused each pair).
     set_progress(&state, 0.04, "Building mesh region\u{2026}");
     let boundary_arr = Array2::from_shape_fn((params.boundary.len(), 2), |(i, j)| {
         params.boundary[i][j]
@@ -1622,7 +1621,7 @@ fn run_solve(
         .map(|ex| Array2::from_shape_fn((ex.len(), 2), |(i, j)| ex[i][j]))
         .collect();
     let exclusion_views: Vec<_> = exclusion_arrs.iter().map(|a| a.view()).collect();
-    let roi = define_roi(boundary_arr.view(), true, &exclusion_views, None);
+    let excl_hard = vec![false; exclusion_arrs.len()];
 
     if cancel.load(Ordering::Relaxed) {
         if let Ok(mut s) = state.lock() {
@@ -1630,19 +1629,6 @@ fn run_solve(
         }
         return;
     }
-
-    // Helper: generate a fresh mesh from the ROI for this sequence.
-    let generate_fresh_mesh = || -> Result<Mesh, geopyv_dev::Error> {
-        Mesh::generate(
-            roi.borders.view(),
-            roi.segments.view(),
-            &roi.curves,
-            params.size_lower,
-            params.size_upper,
-            params.target_nodes,
-            params.mesh_order,
-        )
-    };
 
     // Prepare solve config.
     let subset_order_int = if matches!(params.subset_order, SubsetOrder::First) {
@@ -1689,7 +1675,7 @@ fn run_solve(
 
     // Load initial reference image.
     let mut f_img = match Image::from_file(&params.image_paths[f_index], params.border) {
-        Ok(img) => img,
+        Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Reference image error: {e}"));
             return;
@@ -1716,25 +1702,35 @@ fn run_solve(
             return;
         }
 
+        // Load target image (needed before mesh construction).
+        let g_img = match Image::from_file(&params.image_paths[g_index], params.border) {
+            Ok(img) => Arc::new(img),
+            Err(e) => {
+                set_error(&state, format!("Target image {g_index} error: {e}"));
+                return;
+            }
+        };
+
         // Build / reuse mesh.
         let mesh = match (params.sync, &sync_sol) {
-            (true, Some(prev)) => Mesh::from_solution(prev),
-            _ => match generate_fresh_mesh() {
+            (true, Some(prev)) => Mesh::from_solution(prev, Arc::clone(&f_img), Arc::clone(&g_img)),
+            _ => match Mesh::new(
+                boundary_arr.view(),
+                true,
+                &exclusion_views,
+                &excl_hard,
+                (params.size_lower, params.size_upper),
+                params.target_nodes,
+                params.mesh_order,
+                Arc::clone(&f_img),
+                Arc::clone(&g_img),
+            ) {
                 Ok(m) => m,
                 Err(e) => {
                     set_error(&state, format!("Mesh generation error: {e}"));
                     return;
                 }
             },
-        };
-
-        // Load target image.
-        let g_img = match Image::from_file(&params.image_paths[g_index], params.border) {
-            Ok(img) => img,
-            Err(e) => {
-                set_error(&state, format!("Target image {g_index} error: {e}"));
-                return;
-            }
         };
 
         // Solve config (possibly override).
@@ -1744,17 +1740,14 @@ fn run_solve(
             mesh_cfg.clone()
         };
 
+        let pair_seed = SeedConfig {
+            coord: seed_coord,
+            warp: seed_warp.clone(),
+            tolerance: 0.9,
+        };
+
         // Solve this pair.
-        let pair_result = mesh.solve(
-            &f_img,
-            &g_img,
-            &template.coords,
-            seed_coord,
-            &seed_warp,
-            &pair_cfg,
-            params.image_paths[f_index].clone(),
-            params.image_paths[g_index].clone(),
-        );
+        let pair_result = mesh.solve(&local_mask, &pair_seed, &pair_cfg, None);
 
         let mesh_sol = match pair_result {
             Ok(sol) => sol,
@@ -1763,7 +1756,7 @@ fn run_solve(
                     f_index = g_index - 1;
                     f_img =
                         match Image::from_file(&params.image_paths[f_index], params.border) {
-                            Ok(img) => img,
+                            Ok(img) => Arc::new(img),
                             Err(e) => {
                                 set_error(&state, format!("Image {f_index} error: {e}"));
                                 return;
@@ -1842,7 +1835,7 @@ fn run_solve(
             f_index = g_index - 1;
             f_img =
                 match Image::from_file(&params.image_paths[f_index], params.border) {
-                    Ok(img) => img,
+                    Ok(img) => Arc::new(img),
                     Err(e) => {
                         set_error(&state, format!("Image {f_index} error: {e}"));
                         return;

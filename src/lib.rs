@@ -7,7 +7,7 @@ pub mod particle;
 pub mod field;
 pub mod sequence;
 pub mod subset;
-pub mod templates;
+pub mod masks;
 pub mod validation;
 
 pub use error::Error;

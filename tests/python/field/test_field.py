@@ -14,8 +14,8 @@ import pytest
 
 from geopyv_dev import (
     Field,
-    FieldSolution,
-    ParticleSolution,
+    FieldWrapper,
+    ParticleWrapper,
     field_distribute_particles,
 )
 
@@ -189,7 +189,7 @@ def test_field_solve_returns_field_solution():
     f = _make_field()
     disps = make_disps(0.3, 0.0)
     sol = _solve(f, disps)
-    assert isinstance(sol, FieldSolution)
+    assert isinstance(sol, FieldWrapper)
 
 
 def test_field_solve_sets_solved_flag():
@@ -217,7 +217,7 @@ def test_field_solve_particles_are_particle_solutions():
     f = _make_field()
     sol = _solve(f, make_disps(0.0, 0.0))
     for p in sol.particles:
-        assert isinstance(p, ParticleSolution)
+        assert isinstance(p, ParticleWrapper)
 
 
 def test_field_solve_lagrangian_coordinate_shift():

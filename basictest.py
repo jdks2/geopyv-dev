@@ -8,25 +8,32 @@ import time
 # Setup.
 ref = gp.Image(filepath="images/comp/compression_0.jpg")
 tar = gp.Image(filepath="images/comp/compression_1.jpg")
-template = gp.Template("circle", size=50)
+local_mask = gp.Mask(mask_type="local", shape="circle", size=50)
 
 # Subset instantiation.
 subset = gp.Subset(
-    coord=[500.0, 500.0],
-    template=template,
-    f_img=ref,
+    coord = [500.0, 500.0], 
+    local_mask = local_mask, 
+    f_img = ref, 
+    g_img = tar,
 )
 
 # Subset inspection.
-print(subset)
-print(f"  n_px={subset.n_px}, sssig={subset.sssig:.4f}")
 subset.inspect()
+print(subset)
 
-# Subset solving via unified solve() dispatcher.
-result = subset.solve(g_img=tar, p_0=[0.0] * 6, algorithm="icgn")
-print(f"  C_ZNCC={result['c_zncc']:.4f}, converged={result['converged']}, "
-      f"iterations={result['iterations']}")
+# Subset solving.
+subset.solve(p_0=[0.0] * 6, algorithm="icgn")
+print(subset)
+print(subset.p)
+
 subset.convergence()
+
+# Subset saving and loading.
+gp.save("subset.pyv", subset)
+del subset
+subset = gp.load("subset.pyv")
+print(f"Loaded: {subset}")
 
 # ---------------------------------------------------------------------------
 # Mesh test
@@ -50,10 +57,11 @@ exclusion_circle = gp.CircleRegion(
 # Mesh instantiation.
 mesh = gp.Mesh(
     boundary=boundary,
-    exclusions=[exclusion_circle],
-    size_lower=20.0,
-    size_upper=200.0,
     target_nodes=100,
+    f_img=ref,
+    g_img=tar,
+    size=(20.0, 200.0),
+    exclusions=[exclusion_circle],
     mesh_order=1,
 )
 print(mesh)
@@ -62,44 +70,41 @@ seed_coord = [501.0, 501.0]
 seed_warp = [0.0] * 6
 
 # Mesh solving.
-mesh_sol = mesh.solve(
-    f_img=ref,
-    g_img=tar,
-    template=template,
-    seed_coord=seed_coord,
+mesh.solve(
+    local_mask,
+    seed_coord,
     seed_warp=seed_warp,
     tolerance=0.7,
 )
-print(mesh_sol)
-print(f"  mean C_ZNCC={mesh_sol.c_zncc.mean():.4f}")
+print(mesh)
+print(f"  mean C_ZNCC={mesh.c_zncc.mean():.4f}")
 
 # Mesh saving / loading.
-gp.save("mesh.pyv", mesh_sol)
-del mesh_sol
-mesh_sol = gp.load("mesh.pyv")
-print(f"Loaded: {mesh_sol}")
+gp.save("mesh.pyv", mesh)
+del mesh
+mesh = gp.load("mesh.pyv")
+print(f"Loaded: {mesh}")
 
-Mesh plots.
-mesh_sol.inspect(alpha = 0.5)
-mesh_sol.inspect(show_areas=True)
-mesh_sol.convergence()
-mesh_sol.convergence(quantity="iterations")
-mesh_sol.convergence(quantity="norm")
-mesh_sol.contour("u")
-mesh_sol.contour("v")
-mesh_sol.contour("R")
-mesh_sol.contour("C_ZNCC")
+# Mesh plots.
+mesh.inspect(alpha = 0.5)
+mesh.inspect(show_areas=True)
+mesh.convergence()
+mesh.convergence(quantity="iterations")
+mesh.convergence(quantity="norm")
+mesh.contour("u")
+mesh.contour("v")
+mesh.contour("R")
+mesh.contour("C_ZNCC")
 
 # ---------------------------------------------------------------------------
 # Sequence test
 # ---------------------------------------------------------------------------
 # Sequence instantiation — images sorted internally by trailing integer.
-sequence = gp.Sequence.from_dir(
+sequence = gp.Sequence(
     image_dir="images/comp",
     boundary=boundary_nodes,
     exclusions=[exclusion_circle],
-    size_lower=20.0,
-    size_upper=200.0,
+    size = (20,200),
     target_nodes=100,
     mesh_order=1,
 )
@@ -108,7 +113,7 @@ print(sequence)
 
 # Sequence solving.
 seq_sol = sequence.solve(
-    template=template,
+    local_mask=local_mask,
     seed_coord=seed_coord,
     seed_warp=seed_warp,
     method="icgn",
@@ -116,110 +121,107 @@ seq_sol = sequence.solve(
     sync=True,
 )
 print(seq_sol)
-
 # Sequence saving / loading.
 gp.save("sequence.pyv", seq_sol)
 del seq_sol
 seq_sol = gp.load("sequence.pyv")
 print(f"Loaded: {seq_sol}")
-
 # Sequence plots.
 seq_sol.inspect(mesh_idx=0)
 seq_sol.inspect(mesh_idx=5)
 seq_sol.convergence()
 seq_sol.convergence(mesh_idx=0)
 seq_sol.convergence(mesh_idx=0, quantity="iterations")
-
-# ---------------------------------------------------------------------------
-# Particle test
-# ---------------------------------------------------------------------------
-# Extract mesh arrays from the sequence solution.
-mesh_solutions = seq_sol.mesh_solutions
-nodes_list        = [m.nodes        for m in mesh_solutions]
-elements_list     = [m.elements     for m in mesh_solutions]
-displacements_list= [m.displacements for m in mesh_solutions]
-mesh_order_list   = [int(m.mesh_order) for m in mesh_solutions]
-
-n_pairs = len(mesh_solutions)
-inc_no  = n_pairs + 1  # initial state + one per pair
-
-# Particle instantiation.
-particle = gp.Particle(
-    coordinate=[500.0, 500.0],
-    initial_warp=[0.0] * 6,
-    initial_volume=1.0,
-    inc_no=inc_no,
-    mesh_order=1,
-    track=True,
-)
-print(f"\n{particle}")
-
-# Particle solving.
-particle_sol = particle.solve(
-    nodes_list=nodes_list,
-    elements_list=elements_list,
-    displacements_list=displacements_list,
-    mesh_order_list=mesh_order_list,
-)
-print(particle_sol)
-print(f"  coordinates shape: {particle_sol.coordinates.shape}")
-print(f"  warps shape: {particle_sol.warps.shape}")
-print(f"  strains shape: {particle_sol.strains.shape}")
-print(f"  volumes: {particle_sol.volumes}")
-
-# Particle plots (image_0_path not propagated from sequence — blank background).
-particle_sol.inspect()
-
-# ---------------------------------------------------------------------------
-# Field test
-# ---------------------------------------------------------------------------
-# Distribute particles at element centroids of the first mesh.
-first_mesh = mesh_solutions[0]
-coords, volumes = gp.field_distribute_particles(
-    nodes=first_mesh.nodes,
-    elements=first_mesh.elements,
-)
-print(f"\nField: {len(volumes)} particles distributed")
-
-# Field instantiation.
-field = gp.Field(
-    coordinates=coords,
-    volumes=volumes,
-    inc_no=inc_no,
-    track=True,
-)
-print(field)
-
-# Field solving.
-field_sol = field.solve(
-    nodes_list=nodes_list,
-    elements_list=elements_list,
-    displacements_list=displacements_list,
-    mesh_order_list=mesh_order_list,
-)
-print(field_sol)
-
-# Field saving / loading.
-gp.save("field.pyv", field_sol)
-del field_sol
-field_sol = gp.load("field.pyv")
-print(f"Loaded: {field_sol}")
-
-# Inspect data from a specific particle.
-particle_idx = 4
-psol = field_sol.particles[particle_idx]
-print(f"\nParticle {particle_idx}:")
-print(f"  coordinates:\n{psol.coordinates}")
-print(f"  warps (u, v, ...):\n{psol.warps[:, :2]}")
-print(f"  strains:\n{psol.strains}")
-print(f"  volumes: {psol.volumes}")
-
-# Field plots (image_0_path not propagated — blank background for inspect).
-field_sol.inspect()
-field_sol.inspect(particle_idx=4)
-field_sol.contour("u")
-field_sol.contour("v")
-field_sol.contour("ep_xx")
-field_sol.contour("ep_vol")
-field_sol.contour("u", window=[0, 5])
-field_sol.contour("ep_xx", absolute=True)
+# # ---------------------------------------------------------------------------
+# # Particle test
+# # ---------------------------------------------------------------------------
+# # Extract mesh arrays from the sequence solution.
+# mesh_solutions = seq_sol.mesh_solutions
+# nodes_list        = [m.nodes        for m in mesh_solutions]
+# elements_list     = [m.elements     for m in mesh_solutions]
+# displacements_list= [m.displacements for m in mesh_solutions]
+# mesh_order_list   = [int(m.mesh_order) for m in mesh_solutions]
+#
+# n_pairs = len(mesh_solutions)
+# inc_no  = n_pairs + 1  # initial state + one per pair
+#
+# # Particle instantiation.
+# particle = gp.Particle(
+#     coordinate=[500.0, 500.0],
+#     initial_warp=[0.0] * 6,
+#     initial_volume=1.0,
+#     inc_no=inc_no,
+#     mesh_order=1,
+#     track=True,
+# )
+# print(f"\n{particle}")
+#
+# # Particle solving.
+# particle_sol = particle.solve(
+#     nodes_list=nodes_list,
+#     elements_list=elements_list,
+#     displacements_list=displacements_list,
+#     mesh_order_list=mesh_order_list,
+# )
+# print(particle_sol)
+# print(f"  coordinates shape: {particle_sol.coordinates.shape}")
+# print(f"  warps shape: {particle_sol.warps.shape}")
+# print(f"  strains shape: {particle_sol.strains.shape}")
+# print(f"  volumes: {particle_sol.volumes}")
+#
+# # Particle plots (image_0_path not propagated from sequence — blank background).
+# particle_sol.inspect()
+#
+# # ---------------------------------------------------------------------------
+# # Field test
+# # ---------------------------------------------------------------------------
+# # Distribute particles at element centroids of the first mesh.
+# first_mesh = mesh_solutions[0]
+# coords, volumes = gp.field_distribute_particles(
+#     nodes=first_mesh.nodes,
+#     elements=first_mesh.elements,
+# )
+# print(f"\nField: {len(volumes)} particles distributed")
+#
+# # Field instantiation.
+# field = gp.Field(
+#     coordinates=coords,
+#     volumes=volumes,
+#     inc_no=inc_no,
+#     track=True,
+# )
+# print(field)
+#
+# # Field solving.
+# field_sol = field.solve(
+#     nodes_list=nodes_list,
+#     elements_list=elements_list,
+#     displacements_list=displacements_list,
+#     mesh_order_list=mesh_order_list,
+# )
+# print(field_sol)
+#
+# # Field saving / loading.
+# gp.save("field.pyv", field_sol)
+# del field_sol
+# field_sol = gp.load("field.pyv")
+# print(f"Loaded: {field_sol}")
+#
+# # Inspect data from a specific particle.
+# particle_idx = 4
+# psol = field_sol.particles[particle_idx]
+# print(f"\nParticle {particle_idx}:")
+# print(f"  coordinates:\n{psol.coordinates}")
+# print(f"  warps (u, v, ...):\n{psol.warps[:, :2]}")
+# print(f"  strains:\n{psol.strains}")
+# print(f"  volumes: {psol.volumes}")
+#
+# # Field plots (image_0_path not propagated — blank background for inspect).
+# field_sol.inspect()
+# field_sol.inspect(particle_idx=4)
+# field_sol.contour("u")
+# field_sol.contour("v")
+# field_sol.contour("ep_xx")
+# field_sol.contour("ep_vol")
+# field_sol.contour("u", window=[0, 5])
+# field_sol.contour("ep_xx", absolute=True)

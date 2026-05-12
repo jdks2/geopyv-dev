@@ -12,7 +12,7 @@
 //! - `get_c`    Tier B  rtol = 1e-8   (FFT-based computation)
 //! - `get_qcqt` Tier A  atol = 1e-12  (pure matrix algebra)
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nalgebra::SMatrix;
 use ndarray::{s, Array2, ArrayView2};
@@ -36,6 +36,8 @@ pub struct Image {
     pub qcqt: Array2<f64>,
     /// Border used for padding during B-spline coefficient computation. Must be ≥ 3.
     pub border: usize,
+    /// File path used to load the image; `None` when constructed from an array.
+    pub filepath: Option<PathBuf>,
 }
 
 impl Image {
@@ -51,7 +53,9 @@ impl Image {
             return Err(Error::FileNotFound(path.display().to_string()));
         }
         let image_gs = load_grayscale(path)?;
-        Ok(Self::from_array(image_gs, border))
+        let mut img = Self::from_array(image_gs, border);
+        img.filepath = Some(path.to_path_buf());
+        Ok(img)
     }
 
     /// Create directly from a pre-loaded greyscale array (values 0.0–255.0).
@@ -61,7 +65,7 @@ impl Image {
     pub fn from_array(image_gs: Array2<f64>, border: usize) -> Self {
         let c = get_c(&image_gs, border);
         let qcqt = get_qcqt(&image_gs, &c, border);
-        Self { image_gs, qcqt, border }
+        Self { image_gs, qcqt, border, filepath: None }
     }
 }
 

@@ -25,6 +25,8 @@
 //! - `_check_update` filename comparison — replaced by explicit `ref_update`
 //!   flag in `solve_increment`
 
+use std::path::PathBuf;
+
 use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 
@@ -458,6 +460,9 @@ pub struct ParticleSolution {
     pub vol_strains: Array1<f64>,
     /// Increment indices at which the reference mesh was updated.
     pub reference_update_register: Vec<usize>,
+    /// Path of the initial (reference) image.
+    #[serde(default)]
+    pub image_0_path: Option<PathBuf>,
 }
 
 /// Lagrangian / Eulerian particle tracking and strain-path computation.
@@ -491,6 +496,9 @@ pub struct Particle {
     // --- Solve bookkeeping ---
     pub current_step: usize,
     pub solved: bool,
+
+    /// Path of the initial (reference) image.
+    pub image_0_path: Option<PathBuf>,
 }
 
 impl Particle {
@@ -504,6 +512,7 @@ impl Particle {
     /// * `inc_no`         — total number of increments (= number of meshes + 1)
     /// * `mesh_order`     — 1 or 2
     /// * `track`          — `true` for Lagrangian tracking
+    /// * `image_0_path`   — path to the initial (reference) image
     pub fn new(
         coordinate: [f64; 2],
         initial_warp: &[f64],
@@ -511,6 +520,7 @@ impl Particle {
         inc_no: usize,
         mesh_order: u8,
         track: bool,
+        image_0_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
         if initial_volume <= 0.0 {
             return Err(Error::InvalidInput(
@@ -542,6 +552,7 @@ impl Particle {
             _adrift: false,
             current_step: 0,
             solved: false,
+            image_0_path,
         })
     }
 
@@ -679,6 +690,7 @@ impl Particle {
             strain_incs,
             vol_strains: vs,
             reference_update_register: self.reference_update_register.clone(),
+            image_0_path: self.image_0_path.clone(),
         }
     }
 }
@@ -941,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_particle_new() {
-        let p = Particle::new([10.0, 20.0], &[0.0; 6], 1e9, 3, 1, true).unwrap();
+        let p = Particle::new([10.0, 20.0], &[0.0; 6], 1e9, 3, 1, true, None).unwrap();
         assert_eq!(p.inc_no, 3);
         assert_eq!(p.mesh_order, 1);
         assert!(p.track);
@@ -970,6 +982,7 @@ mod tests {
             2,   // 2 frames → 1 increment
             1,
             true,
+            None,
         ).unwrap();
         assert!(p.solve_increment(0, &cm, false));
 
@@ -995,7 +1008,7 @@ mod tests {
             displacements: &disps, mesh_order: 1,
         };
 
-        let mut p = Particle::new([0.3, 0.3], &[0.0;6], 1e6, 3, 1, true).unwrap();
+        let mut p = Particle::new([0.3, 0.3], &[0.0;6], 1e6, 3, 1, true, None).unwrap();
         let sol = p.solve(&[m], &ParticleConfig::default());
         // solve expects 2 meshes for inc_no=3; we only supplied 1 → should error
         assert!(sol.is_err());

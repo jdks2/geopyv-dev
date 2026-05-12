@@ -1,50 +1,44 @@
 """
 Phase 3 validation tests for the IO module.
 
-Tests that MeshSolution, FieldSolution, and SequenceSolution round-trip through
+Tests that Mesh, FieldSolution, and SequenceSolution round-trip through
 geopyv_dev.save / geopyv_dev.load with bit-exact precision (Tier A, atol=1e-12).
 """
-import os
 import tempfile
 
 import numpy as np
 import pytest
 
-from geopyv_dev import MeshSolution, save, load
+from geopyv_dev import Image, Mesh, Mask, save, load
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_mesh_solution(seed=42):
-    """Create a synthetic MeshSolution with deterministic values."""
+def _make_image(seed, shape=(200, 200)):
+    """Create a synthetic greyscale image with texture suitable for DIC."""
     rng = np.random.default_rng(seed)
-    n_nodes = 6
-    n_elems = 4
-    nodes = rng.uniform(0, 100, (n_nodes, 2))
-    elements = np.array([[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]], dtype=np.int64)
-    boundary = list(range(n_nodes))
-    exclusions = []
-    areas = rng.uniform(10, 50, n_elems)
-    warps = rng.standard_normal((n_nodes, 12))
-    displacements = rng.standard_normal((n_nodes, 2))
-    c_zncc = rng.uniform(0.9, 1.0, n_nodes)
-    p = rng.standard_normal((n_nodes, 6))
-    return MeshSolution(
-        nodes=nodes,
-        elements=elements,
-        boundary=boundary,
-        exclusions=exclusions,
-        areas=areas,
-        warps=warps,
-        displacements=displacements,
-        c_zncc=c_zncc,
-        p=p,
-        seed_node=0,
-        mesh_order=1,
-        subset_order=1,
+    xx, yy = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+    img = 128.0 + 50.0 * np.sin(2 * np.pi * xx / 20) * np.cos(2 * np.pi * yy / 20)
+    img += 8.0 * rng.standard_normal(shape)
+    return np.clip(img, 0.0, 255.0)
+
+
+def make_solved_mesh():
+    """Create and solve a Mesh on synthetic images."""
+    f_arr = _make_image(42)
+    g_arr = _make_image(42)   # identical pattern → near-zero displacement
+    f_img = Image(image_gs=f_arr)
+    g_img = Image(image_gs=g_arr)
+    tmpl = Mask(mask_type="local", shape="circle", size=20)
+    boundary = np.array(
+        [[40.0, 40.0], [160.0, 40.0], [160.0, 160.0], [40.0, 160.0]],
+        dtype=np.float64,
     )
+    mesh = Mesh(boundary, target_nodes=10, f_img=f_img, g_img=g_img, size=(20.0, 60.0))
+    mesh.solve(tmpl, seed_coord=[100.0, 100.0], max_iterations=20)
+    return mesh
 
 
 # ---------------------------------------------------------------------------
@@ -52,96 +46,86 @@ def make_mesh_solution(seed=42):
 # ---------------------------------------------------------------------------
 
 class TestMeshRoundTrip:
-    """MeshSolution save/load round-trips."""
+    """Mesh save/load round-trips."""
 
     def test_nodes_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=1)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_array_equal(loaded.nodes, sol.nodes)
+        np.testing.assert_array_equal(loaded.nodes, mesh.nodes)
 
     def test_elements_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=2)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_array_equal(loaded.elements, sol.elements)
+        np.testing.assert_array_equal(loaded.elements, mesh.elements)
 
     def test_displacements_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=3)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_allclose(loaded.displacements, sol.displacements, atol=1e-12)
+        np.testing.assert_allclose(loaded.displacements, mesh.displacements, atol=1e-12)
 
     def test_warps_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=4)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_allclose(loaded.warps, sol.warps, atol=1e-12)
+        np.testing.assert_allclose(loaded.warps, mesh.warps, atol=1e-12)
 
     def test_c_zncc_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=5)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_allclose(loaded.c_zncc, sol.c_zncc, atol=1e-12)
+        np.testing.assert_allclose(loaded.c_zncc, mesh.c_zncc, atol=1e-12)
 
     def test_areas_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=6)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_allclose(loaded.areas, sol.areas, atol=1e-12)
+        np.testing.assert_allclose(loaded.areas, mesh.areas, atol=1e-12)
 
     def test_boundary_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=7)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        np.testing.assert_array_equal(loaded.boundary, sol.boundary)
+        np.testing.assert_array_equal(loaded.boundary, mesh.boundary)
 
     def test_metadata_exact(self, tmp_path):
-        sol = make_mesh_solution(seed=8)
+        mesh = make_solved_mesh()
         path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
+        save(path, mesh)
         loaded = load(path)
-        assert loaded.seed_node == sol.seed_node
-        assert loaded.mesh_order == sol.mesh_order
-        assert loaded.subset_order == sol.subset_order
+        assert loaded.seed_node == mesh.seed_node
+        assert loaded.mesh_order == mesh.mesh_order
+        assert loaded.subset_order == mesh.subset_order
 
-    def test_pi_precision(self, tmp_path):
-        """f64 irrational value round-trips bit-exactly (Tier A)."""
-        sol = make_mesh_solution(seed=9)
-        path = str(tmp_path / "pi.pyv")
-        save(path, sol)
+    def test_loaded_type_is_mesh(self, tmp_path):
+        mesh = make_solved_mesh()
+        path = str(tmp_path / "mesh.pyv")
+        save(path, mesh)
         loaded = load(path)
-        # Nodes contain rng values; pi used as a sentinel check on displacements[0,0]
-        val = np.pi
-        sol2 = MeshSolution(
-            nodes=sol.nodes,
-            elements=sol.elements,
-            boundary=list(sol.boundary),
-            exclusions=[],
-            areas=sol.areas,
-            warps=sol.warps,
-            displacements=np.array([[val, 0.0]] + list(sol.displacements[1:])),
-            c_zncc=sol.c_zncc,
-            p=sol.p,
+        assert isinstance(loaded, Mesh)
+
+    def test_save_unsolved_raises(self, tmp_path):
+        f_arr = _make_image(1)
+        g_arr = _make_image(1)
+        f_img = Image(image_gs=f_arr)
+        g_img = Image(image_gs=g_arr)
+        boundary = np.array(
+            [[40.0, 40.0], [160.0, 40.0], [160.0, 160.0], [40.0, 160.0]],
+            dtype=np.float64,
         )
-        path2 = str(tmp_path / "pi2.pyv")
-        save(path2, sol2)
-        loaded2 = load(path2)
-        assert loaded2.displacements[0, 0] == val
-
-    def test_loaded_type_is_meshsolution(self, tmp_path):
-        sol = make_mesh_solution()
-        path = str(tmp_path / "mesh.pyv")
-        save(path, sol)
-        loaded = load(path)
-        assert isinstance(loaded, MeshSolution)
+        mesh = Mesh(boundary, target_nodes=10, f_img=f_img, g_img=g_img, size=(20.0, 60.0))
+        path = str(tmp_path / "unsolved.pyv")
+        with pytest.raises(RuntimeError, match="[Ss]olve"):
+            save(path, mesh)
 
 
 class TestErrorCases:
@@ -161,7 +145,7 @@ class TestErrorCases:
     def test_load_wrong_version(self, tmp_path):
         path = str(tmp_path / "badver.pyv")
         with open(path, "wb") as f:
-            f.write(b"GPYV\x02" + b"\x00" * 8)
+            f.write(b"GPYV\x03" + b"\x00" * 8)
         with pytest.raises(RuntimeError, match="version"):
             load(path)
 

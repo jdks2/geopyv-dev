@@ -21,6 +21,8 @@
 //! | `sync` | Reuse previous mesh geometry for next pair (skips CDT) |
 //! | `override_` | On failure, relax tolerance for next attempt from updated ref |
 //!
+//! These flags are grouped in [`SequenceOptions`], passed via [`SequenceSolveConfig::options`].
+//!
 //! # Excluded from translation
 //!
 //! - `SequenceBase` plotting methods (`inspect`, `convergence`, `contour`, `quiver`)
@@ -30,15 +32,16 @@
 //! - Adaptive remeshing — deferred; use `adaptive_iterations=0`
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     image::Image,
     io::{save as io_save, GeopyvObject},
-    mesh::{Mesh, MeshSolution, SolveConfig},
+    mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig},
     particle::{MeshData, Particle},
+    masks::LocalMask,
     Error,
 };
 
@@ -60,16 +63,19 @@ fn last_number_in_name(s: &str) -> u64 {
 // Mesh-generation configuration
 // ---------------------------------------------------------------------------
 
-/// Parameters forwarded to [`Mesh::generate`] for each image pair.
+/// Parameters forwarded to [`Mesh::new`] for each image pair.
 #[derive(Debug, Clone)]
 pub struct SequenceMeshConfig {
-    /// Boundary polygon vertices + exclusion polygon vertices/segments in the
-    /// format expected by [`crate::geometry::triangulation::generate_mesh`].
-    pub borders: ndarray::Array2<f64>,
-    pub segments: ndarray::Array2<i32>,
-    pub curves: Vec<Vec<i32>>,
-    pub size_lower: f64,
-    pub size_upper: f64,
+    /// Boundary polygon vertices `(N, 2)`.
+    pub boundary_nodes: ndarray::Array2<f64>,
+    /// If `true`, only pixels inside the boundary polygon are active.
+    pub boundary_hard: bool,
+    /// Exclusion polygon arrays.
+    pub exclusion_nodes: Vec<ndarray::Array2<f64>>,
+    /// Per-exclusion hard flag (soft = meshing constraint only, does not clip mask).
+    pub exclusions_hard: Vec<bool>,
+    /// `(size_lower, size_upper)` element edge lengths.
+    pub size: (f64, f64),
     pub target_nodes: usize,
     pub mesh_order: u8,
 }
@@ -78,17 +84,9 @@ pub struct SequenceMeshConfig {
 // Solve configuration
 // ---------------------------------------------------------------------------
 
-/// Solver parameters for each mesh pair within a sequence.
+/// Temporal coupling strategy for [`Sequence::solve`].
 #[derive(Debug, Clone)]
-pub struct SequenceSolveConfig {
-    /// Per-subset solver settings forwarded to [`Mesh::solve`].
-    pub mesh_cfg: SolveConfig,
-    /// Template pixel coordinates (from [`crate::templates`]).
-    pub template_coords: Array2<f64>,
-    /// Initial seed coordinate for the reliability-guided solver.
-    pub seed_coord: [f64; 2],
-    /// Initial seed warp vector (length ≤ 12, zero-padded to 12 internally).
-    pub seed_warp: Vec<f64>,
+pub struct SequenceOptions {
     /// Apply particle-based warp preconditioning between pairs.
     pub guide: bool,
     /// Advance reference image after each successful solve (cumulative mode).
@@ -97,6 +95,25 @@ pub struct SequenceSolveConfig {
     pub sync: bool,
     /// Relax tolerance on retry after a failed non-consecutive pair.
     pub override_: bool,
+}
+
+impl Default for SequenceOptions {
+    fn default() -> Self {
+        SequenceOptions { guide: true, sequential: false, sync: true, override_: false }
+    }
+}
+
+/// Solver parameters for each mesh pair within a sequence.
+#[derive(Debug, Clone)]
+pub struct SequenceSolveConfig {
+    /// Per-subset solver settings forwarded to [`Mesh::solve`].
+    pub mesh_cfg: SolveConfig,
+    /// Local mask (cloned per node when a mask is present).
+    pub local_mask: LocalMask,
+    /// Seed-node parameters (coord, initial warp, tolerance).
+    pub seed: SeedConfig,
+    /// Temporal coupling strategy (guide, sequential, sync, override).
+    pub options: SequenceOptions,
     /// Image border (pixels) for B-spline precomputation. Defaults to 20.
     pub border: usize,
     /// When `Some(dir)`, save each mesh frame to `{dir}/mesh_{i:04}.pyv`
@@ -104,23 +121,6 @@ pub struct SequenceSolveConfig {
     /// When `None` (default), accumulate all solutions in
     /// `SequenceSolution::mesh_solutions`.
     pub save: Option<PathBuf>,
-}
-
-impl Default for SequenceSolveConfig {
-    fn default() -> Self {
-        Self {
-            mesh_cfg: SolveConfig::default(),
-            template_coords: Array2::zeros((0, 2)),
-            seed_coord: [0.0, 0.0],
-            seed_warp: vec![0.0; 12],
-            guide: true,
-            sequential: false,
-            sync: true,
-            override_: false,
-            border: 20,
-            save: None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,9 +180,9 @@ impl Sequence {
                 return Err(Error::FileNotFound(p.to_string_lossy().to_string()));
             }
         }
-        if mesh_cfg.size_lower <= 0.0 || mesh_cfg.size_lower >= mesh_cfg.size_upper {
+        if mesh_cfg.size.0 <= 0.0 || mesh_cfg.size.0 >= mesh_cfg.size.1 {
             return Err(Error::InvalidInput(
-                "size_lower must be > 0 and < size_upper".to_string(),
+                "size.0 must be > 0 and < size.1".to_string(),
             ));
         }
         if mesh_cfg.target_nodes < 1 {
@@ -247,28 +247,61 @@ impl Sequence {
         let mut f_index = 0usize;
         let mut g_index = 1usize;
 
-        let mut seed_coord = cfg.seed_coord;
-        // Normalise seed_warp to 12 elements.
-        let mut seed_warp = cfg.seed_warp.clone();
-        seed_warp.resize(12, 0.0);
+        let mut seed_coord = cfg.seed.coord;
+        let warp_len = 6 * cfg.mesh_cfg.subset_order;
+        let mut seed_warp: Vec<f64> = {
+            let mut w = cfg.seed.warp.clone();
+            w.resize(warp_len, 0.0);
+            w
+        };
 
         // Cached previous-pair solution for sync mode.
         let mut sync_sol: Option<MeshSolution> = None;
         // Override flag: relax tolerance for the next mesh solve.
         let mut mesh_override = false;
 
-        // Load initial images.
-        let mut f_img = Image::from_file(&self.image_paths[f_index], cfg.border)?;
-        let mut g_img = Image::from_file(&self.image_paths[g_index], cfg.border)?;
+        // Load initial images as Arc to enable zero-cost sharing across pairs.
+        let mut f_img: Arc<Image> = Arc::new(Image::from_file(&self.image_paths[f_index], cfg.border)?);
+        let mut g_img: Arc<Image> = Arc::new(Image::from_file(&self.image_paths[g_index], cfg.border)?);
+
+        // Progress: outer bar for image pairs, inner bar for subsets.
+        let mp = indicatif::MultiProgress::new();
+        let pb_seq = mp.add(indicatif::ProgressBar::new((n_images - 1) as u64));
+        pb_seq.set_style(
+            indicatif::ProgressStyle::with_template(
+                "Solving sequence: [{bar:40.green}] {pos}/{len} pairs  ({msg})"
+            )
+            .unwrap()
+            .progress_chars("█░"),
+        );
+        let pb_mesh = mp.add(indicatif::ProgressBar::new(0));
+        pb_mesh.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  Solving mesh:  [{bar:40.cyan}] {pos}/{len} subsets  eta {eta}"
+            )
+            .unwrap()
+            .progress_chars("█░"),
+        );
 
         let all_solved;
 
         'outer: loop {
             // --- Build mesh for this pair. ----------------------------------
             // In sync mode, reuse previous pair's geometry when available.
-            let mesh = match (cfg.sync, &sync_sol) {
-                (true, Some(prev)) => Mesh::from_solution(prev),
-                _ => self.generate_mesh()?,
+            let excl_views: Vec<_> = self.mesh_cfg.exclusion_nodes.iter().map(|a| a.view()).collect();
+            let mesh = match (cfg.options.sync, &sync_sol) {
+                (true, Some(prev)) => Mesh::from_solution(prev, Arc::clone(&f_img), Arc::clone(&g_img)),
+                _ => Mesh::new(
+                    self.mesh_cfg.boundary_nodes.view(),
+                    self.mesh_cfg.boundary_hard,
+                    &excl_views,
+                    &self.mesh_cfg.exclusions_hard,
+                    self.mesh_cfg.size,
+                    self.mesh_cfg.target_nodes,
+                    self.mesh_cfg.mesh_order,
+                    Arc::clone(&f_img),
+                    Arc::clone(&g_img),
+                )?,
             };
 
             // Override: use tolerance = 0 (accept any subset).
@@ -281,17 +314,24 @@ impl Sequence {
                 cfg.mesh_cfg.clone()
             };
 
+            let pair_seed = SeedConfig {
+                coord: seed_coord,
+                warp: seed_warp.clone(),
+                tolerance: cfg.seed.tolerance,
+            };
+
             // --- Solve this pair. ------------------------------------------
-            let pair_result = mesh.solve(
-                &f_img,
-                &g_img,
-                &cfg.template_coords,
-                seed_coord,
-                &seed_warp,
-                &pair_cfg,
-                self.image_paths[f_index].clone(),
-                self.image_paths[g_index].clone(),
-            );
+            let ref_name = self.image_paths[f_index].file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| f_index.to_string());
+            let tar_name = self.image_paths[g_index].file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| g_index.to_string());
+            pb_seq.set_message(format!("{}→{}", ref_name, tar_name));
+            pb_mesh.set_length(mesh.nodes().nrows() as u64);
+            pb_mesh.set_position(0);
+
+            let pair_result = mesh.solve(&cfg.local_mask, &pair_seed, &pair_cfg, Some(&pb_mesh));
 
             let mesh_sol = match pair_result {
                 Ok(sol) => sol,
@@ -300,11 +340,11 @@ impl Sequence {
                     if f_index + 1 < g_index {
                         // Non-consecutive pair failed: step reference forward.
                         f_index = g_index - 1;
-                        f_img = Image::from_file(&self.image_paths[f_index], cfg.border)?;
-                        if cfg.sync {
+                        f_img = Arc::new(Image::from_file(&self.image_paths[f_index], cfg.border)?);
+                        if cfg.options.sync {
                             sync_sol = None;
                         }
-                        if cfg.override_ {
+                        if cfg.options.override_ {
                             mesh_override = true;
                         }
                         continue 'outer;
@@ -330,7 +370,7 @@ impl Sequence {
             }
 
             // --- Store result and update sync geometry. ---------------------
-            if cfg.sync {
+            if cfg.options.sync {
                 sync_sol = Some(mesh_sol.clone());
             }
             if let Some(ref save_dir) = cfg.save {
@@ -342,16 +382,18 @@ impl Sequence {
                 mesh_solutions.push(mesh_sol.clone());
             }
 
+            pb_seq.inc(1);
+
             // --- Advance target image. ------------------------------------
             g_index += 1;
             if g_index >= n_images {
                 all_solved = true;
                 break 'outer;
             }
-            g_img = Image::from_file(&self.image_paths[g_index], cfg.border)?;
+            g_img = Arc::new(Image::from_file(&self.image_paths[g_index], cfg.border)?);
 
             // --- Deformation preconditioning. ----------------------------
-            if cfg.guide {
+            if cfg.options.guide {
                 let (disp, new_warp) = deformation_preconditioning(
                     &mesh_sol,
                     seed_coord,
@@ -366,20 +408,23 @@ impl Sequence {
                 for i in 0..n_copy.min(new_warp.len()).min(seed_warp.len()) {
                     seed_warp[i] = new_warp[i];
                 }
-                for i in n_copy..12 {
+                for i in n_copy..seed_warp.len() {
                     seed_warp[i] = 0.0;
                 }
             }
 
             // --- Sequential reference update. ----------------------------
-            if cfg.sequential {
+            if cfg.options.sequential {
                 f_index = g_index - 1;
-                f_img = Image::from_file(&self.image_paths[f_index], cfg.border)?;
-                if cfg.sync {
+                f_img = Arc::clone(&g_img);
+                if cfg.options.sync {
                     sync_sol = None;
                 }
             }
         }
+
+        pb_seq.finish_and_clear();
+        pb_mesh.finish_and_clear();
 
         Ok(SequenceSolution {
             mesh_solutions,
@@ -390,21 +435,6 @@ impl Sequence {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    fn generate_mesh(&self) -> Result<Mesh, Error> {
-        Mesh::generate(
-            self.mesh_cfg.borders.view(),
-            self.mesh_cfg.segments.view(),
-            &self.mesh_cfg.curves,
-            self.mesh_cfg.size_lower,
-            self.mesh_cfg.size_upper,
-            self.mesh_cfg.target_nodes,
-            self.mesh_cfg.mesh_order,
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +466,7 @@ pub fn deformation_preconditioning(
         2,        // 2 frames → 1 increment
         mesh_order,
         true,     // Lagrangian
+        None,
     );
 
     let mut particle = match particle_result {
@@ -681,12 +712,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn dummy_mesh_cfg() -> SequenceMeshConfig {
+        let boundary = ndarray::array![[0.0f64, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         SequenceMeshConfig {
-            borders: ndarray::Array2::zeros((3, 2)),
-            segments: ndarray::Array2::zeros((3, 2)),
-            curves: vec![],
-            size_lower: 1.0,
-            size_upper: 100.0,
+            boundary_nodes: boundary,
+            boundary_hard: false,
+            exclusion_nodes: vec![],
+            exclusions_hard: vec![],
+            size: (1.0, 100.0),
             target_nodes: 10,
             mesh_order: 1,
         }
@@ -702,8 +734,7 @@ mod tests {
     #[test]
     fn test_sequence_new_size_lower_ge_upper() {
         let mut cfg = dummy_mesh_cfg();
-        cfg.size_lower = 100.0;
-        cfg.size_upper = 10.0;
+        cfg.size = (100.0, 10.0);
         let paths = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         assert!(Sequence::new(paths, cfg).is_err());
     }
@@ -711,7 +742,7 @@ mod tests {
     #[test]
     fn test_sequence_new_zero_size_lower() {
         let mut cfg = dummy_mesh_cfg();
-        cfg.size_lower = 0.0;
+        cfg.size.0 = 0.0;
         let paths = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         assert!(Sequence::new(paths, cfg).is_err());
     }

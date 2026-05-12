@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-pub use geopyv_dev::templates::TemplateShape;
+pub use geopyv_dev::masks::MaskShape;
 
 // ---------------------------------------------------------------------------
 // TemplateConfig — lightweight GUI representation saved to /Templates/*.json
@@ -12,7 +12,7 @@ pub use geopyv_dev::templates::TemplateShape;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateConfig {
     pub name: String,
-    pub shape: TemplateShape,
+    pub shape: MaskShape,
     /// Radius (Circle) or half-side (Square), in pixels.
     pub size: u32,
 }
@@ -21,7 +21,7 @@ impl TemplateConfig {
     /// Count of pixels in the template mask.
     pub fn n_px(&self) -> u32 {
         match self.shape {
-            TemplateShape::Circle => {
+            MaskShape::Circle => {
                 let r = self.size as i32;
                 let mut n = 0u32;
                 for dy in -r..=r {
@@ -33,7 +33,7 @@ impl TemplateConfig {
                 }
                 n
             }
-            TemplateShape::Square => {
+            MaskShape::Square => {
                 let s = 2 * self.size + 1;
                 s * s
             }
@@ -58,10 +58,10 @@ impl TemplateConfig {
 // Label helper
 // ---------------------------------------------------------------------------
 
-pub fn shape_label(shape: &TemplateShape) -> &'static str {
+pub fn shape_label(shape: &MaskShape) -> &'static str {
     match shape {
-        TemplateShape::Circle => "Circle",
-        TemplateShape::Square => "Square",
+        MaskShape::Circle => "Circle",
+        MaskShape::Square => "Square",
     }
 }
 
@@ -73,7 +73,7 @@ pub fn shape_label(shape: &TemplateShape) -> &'static str {
 pub fn render_template_preview(
     painter: &egui::Painter,
     rect: egui::Rect,
-    shape: &TemplateShape,
+    shape: &MaskShape,
     size: u32,
 ) {
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(15, 15, 15));
@@ -87,10 +87,10 @@ pub fn render_template_preview(
 
     let mask_color = egui::Color32::from_rgb(210, 210, 210);
     match shape {
-        TemplateShape::Circle => {
+        MaskShape::Circle => {
             painter.circle_filled(center, draw_radius, mask_color);
         }
-        TemplateShape::Square => {
+        MaskShape::Square => {
             let sq = egui::Rect::from_center_size(
                 center,
                 egui::vec2(draw_radius * 2.0, draw_radius * 2.0),

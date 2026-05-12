@@ -17,14 +17,16 @@
 
 use std::collections::{BinaryHeap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    geometry::triangulation,
+    geometry::{meshing, triangulation},
     image::Image,
     subset::{Subset, SolveResult},
+    masks::LocalMask,
     Error,
 };
 
@@ -95,11 +97,23 @@ impl Default for SolveConfig {
         Self {
             max_norm: 1e-5,
             max_iterations: 50,
-            subset_order: 1,
+            subset_order: 2,
             tolerance: 0.75,
             method: SolveMethod::Icgn,
         }
     }
+}
+
+/// Seed-node parameters for reliability-guided DIC.
+#[derive(Debug, Clone)]
+pub struct SeedConfig {
+    /// Image coordinate `[x, y]` near a region of low deformation.
+    pub coord: [f64; 2],
+    /// Initial warp vector for the seed node (normalised to p_len before use).
+    pub warp: Vec<f64>,
+    /// Minimum acceptable C_ZNCC for the seed node (default 0.9).
+    /// Stricter than the propagated-node tolerance in SolveConfig.
+    pub tolerance: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,47 +128,70 @@ pub enum SolveMethod {
 
 /// Mesh-level DIC solver.
 ///
-/// Construct via [`Mesh::generate`].
+/// Construct via [`Mesh::new`].
 pub struct Mesh {
     nodes: Array2<f64>,
     elements: Array2<usize>,
     boundary: Vec<usize>,
     exclusions: Vec<Vec<usize>>,
     mesh_order: u8,
+    /// Binary image mask (`Some` after `Mesh::new`; `None` after `from_solution`).
+    mask: Option<Array2<u8>>,
+    pub f_img: Arc<Image>,
+    pub g_img: Arc<Image>,
 }
 
 impl Mesh {
-    /// Reconstruct a `Mesh` topology from a previous [`MeshSolution`].
+    /// Create a mesh: run `define_roi` + CDT, compute binary mask, store images.
     ///
-    /// Used by the sequence solver in `sync` mode to reuse the node/element
-    /// layout of the previous solved mesh rather than regenerating via CDT.
-    pub fn from_solution(sol: &MeshSolution) -> Self {
-        Mesh {
-            nodes: sol.nodes.clone(),
-            elements: sol.elements.clone(),
-            boundary: sol.boundary.clone(),
-            exclusions: sol.exclusions.clone(),
-            mesh_order: sol.mesh_order,
-        }
-    }
-
-    /// Create a mesh by running [`triangulation::generate_mesh`] and wrapping
-    /// the result.
-    pub fn generate(
-        borders: ArrayView2<f64>,
-        segments: ArrayView2<i32>,
-        curves: &[Vec<i32>],
-        size_lower: f64,
-        size_upper: f64,
+    /// This is the single Rust entry point that replaces the previous separate
+    /// `define_roi` + `Mesh::generate` call sequence.
+    ///
+    /// # Arguments
+    /// * `boundary_nodes` — `(N, 2)` boundary polygon vertices `[x, y]`.
+    /// * `boundary_hard`  — If `true`, fill only inside the boundary for the mask.
+    /// * `exclusion_nodes` — Exclusion polygon arrays.
+    /// * `exclusions_hard` — Per-exclusion hard flag (soft = meshing only, not mask).
+    /// * `size`           — `(size_lower, size_upper)` element edge lengths.
+    /// * `target_nodes`   — Target node count for binary-search sizing.
+    /// * `mesh_order`     — 1 (linear) or 2 (quadratic).
+    /// * `f_img`          — Reference image (shared ownership).
+    /// * `g_img`          — Target image (shared ownership).
+    pub fn new(
+        boundary_nodes: ArrayView2<f64>,
+        boundary_hard: bool,
+        exclusion_nodes: &[ArrayView2<f64>],
+        exclusions_hard: &[bool],
+        size: (f64, f64),
         target_nodes: usize,
         mesh_order: u8,
+        f_img: Arc<Image>,
+        g_img: Arc<Image>,
     ) -> Result<Self, Error> {
+        if size.0 <= 0.0 || size.0 >= size.1 {
+            return Err(Error::InvalidInput(
+                "size.0 must be > 0 and < size.1".to_string(),
+            ));
+        }
+        if target_nodes < 1 {
+            return Err(Error::InvalidInput(
+                "target_nodes must be >= 1".to_string(),
+            ));
+        }
+        let img_shape = f_img.image_gs.dim(); // (height, width)
+        let roi = meshing::define_roi(
+            boundary_nodes,
+            boundary_hard,
+            exclusion_nodes,
+            exclusions_hard,
+            Some(img_shape),
+        );
         let tm = triangulation::generate_mesh(
-            borders,
-            segments,
-            curves,
-            size_lower,
-            size_upper,
+            roi.borders.view(),
+            roi.segments.view(),
+            &roi.curves,
+            size.0,
+            size.1,
             target_nodes,
             mesh_order,
         )?;
@@ -165,44 +202,57 @@ impl Mesh {
             boundary: tm.boundary,
             exclusions: tm.exclusions,
             mesh_order: order,
+            mask: roi.mask,
+            f_img,
+            g_img,
         })
+    }
+
+    /// Reconstruct a `Mesh` topology from a previous [`MeshSolution`].
+    ///
+    /// Used by the sequence solver in `sync` mode. `mask` is `None` because
+    /// the polygon data is not available; subsets are unmasked in this mode.
+    pub fn from_solution(sol: &MeshSolution, f_img: Arc<Image>, g_img: Arc<Image>) -> Self {
+        Mesh {
+            nodes: sol.nodes.clone(),
+            elements: sol.elements.clone(),
+            boundary: sol.boundary.clone(),
+            exclusions: sol.exclusions.clone(),
+            mesh_order: sol.mesh_order,
+            mask: None,
+            f_img,
+            g_img,
+        }
     }
 
     /// Run the reliability-guided DIC solver.
     ///
+    /// Images are taken from `self.f_img` / `self.g_img` (set at construction).
+    ///
     /// # Arguments
-    /// * `f_img` — Reference [`Image`].
-    /// * `g_img` — Target [`Image`].
-    /// * `template_coords` — Subset template pixel coordinates (from
-    ///   `templates::Circle` or `templates::Square`).
-    /// * `seed_coord`  — Image coordinate near region of low deformation.
-    /// * `seed_warp`   — Initial warp vector for the seed subset.
-    /// * `cfg`         — Solver configuration.
+    /// * `local_mask` — Subset local mask (cloned per node when a global mask is present).
+    /// * `seed`       — Seed-node parameters (coord, initial warp, tolerance).
+    /// * `cfg`        — Solver configuration.
+    /// * `progress`   — Optional external progress bar (used by Sequence).
     pub fn solve(
         &self,
-        f_img: &Image,
-        g_img: &Image,
-        template_coords: &Array2<f64>,
-        seed_coord: [f64; 2],
-        seed_warp: &[f64],
+        local_mask: &LocalMask,
+        seed: &SeedConfig,
         cfg: &SolveConfig,
-        f_img_path: PathBuf,
-        g_img_path: PathBuf,
+        progress: Option<&indicatif::ProgressBar>,
     ) -> Result<MeshSolution, Error> {
         let n_nodes = self.nodes.nrows();
         let p_len = 6 * cfg.subset_order;
 
-        // Normalise seed_warp to exactly p_len elements: truncate if too long,
-        // zero-pad if too short.  Prevents solve_icgn from inferring the wrong
-        // warp order when the caller passes a full 12-element warp with order-1.
+        // Normalise seed.warp to exactly p_len elements.
         let seed_warp_norm: Vec<f64> = {
-            let mut w = seed_warp.to_vec();
+            let mut w = seed.warp.clone();
             w.resize(p_len, 0.0);
             w
         };
 
-        let mut stored = vec![false; n_nodes];    // result has been written
-        let mut propagated = vec![false; n_nodes]; // node has been used as source
+        let mut stored = vec![false; n_nodes];
+        let mut propagated = vec![false; n_nodes];
         let mut c_zncc = Array1::<f64>::zeros(n_nodes);
         let mut queue: BinaryHeap<(u64, usize)> = BinaryHeap::new();
         let mut p = Array2::<f64>::zeros((n_nodes, p_len));
@@ -210,23 +260,47 @@ impl Mesh {
         let mut iterations = Array1::<u32>::zeros(n_nodes);
         let mut norms = Array1::<f64>::zeros(n_nodes);
 
-        // Build per-node subsets (no masking in pure-Rust path).
+        // Build per-node subsets, delegating masking to Subset::new.
         let subsets: Vec<Subset> = (0..n_nodes)
             .map(|i| {
                 let coord = [self.nodes[[i, 0]], self.nodes[[i, 1]]];
-                Subset::new(coord, template_coords, &f_img.qcqt)
+                Subset::new(
+                    coord,
+                    local_mask,
+                    self.mask.as_ref().map(|m| m.view()),
+                    Arc::clone(&self.f_img),
+                    Arc::clone(&self.g_img),
+                    cfg.subset_order,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // --- Seed node.
-        let seed_node = find_seed_node(&self.nodes, seed_coord);
-        let seed_result = self.solve_one(
+        // Progress bar: use provided one, or create a local one.
+        let own_pb;
+        let pb: &indicatif::ProgressBar = if let Some(p) = progress {
+            p
+        } else {
+            own_pb = indicatif::ProgressBar::new(n_nodes as u64);
+            own_pb.set_style(
+                indicatif::ProgressStyle::with_template(
+                    "  Solving mesh:  [{bar:40.cyan}] {pos}/{len} subsets  eta {eta}"
+                )
+                .unwrap()
+                .progress_chars("█░"),
+            );
+            &own_pb
+        };
+
+        // --- Seed node (uses seed.tolerance, stricter than cfg.tolerance).
+        let seed_node = find_seed_node(&self.nodes, seed.coord);
+        let seed_result = self.solve_one_with_tolerance(
             &subsets[seed_node],
-            g_img,
             &seed_warp_norm,
+            seed.tolerance,
             cfg,
         )?;
         store_result(seed_node, &seed_result, &mut c_zncc, &mut p, &mut displacements, &mut iterations, &mut norms);
+        pb.inc(1);
         stored[seed_node] = true;
         propagated[seed_node] = true;
         queue.push((c_zncc[seed_node].to_bits(), seed_node));
@@ -237,8 +311,8 @@ impl Mesh {
             seed_node,
             &seed_p,
             &subsets,
-            g_img,
             cfg,
+            pb,
             &mut stored,
             &mut c_zncc,
             &mut queue,
@@ -248,10 +322,10 @@ impl Mesh {
             &mut norms,
         )?;
 
-        // --- Reliability-guided queue: highest-C_ZNCC first (priority queue, lazy deletion).
+        // --- Reliability-guided queue: highest-C_ZNCC first.
         while let Some((_, cur_idx)) = queue.pop() {
             if propagated[cur_idx] {
-                continue; // stale entry
+                continue;
             }
             propagated[cur_idx] = true;
             let p_0: Vec<f64> = p.row(cur_idx).to_vec();
@@ -259,8 +333,8 @@ impl Mesh {
                 cur_idx,
                 &p_0,
                 &subsets,
-                g_img,
                 cfg,
+                pb,
                 &mut stored,
                 &mut c_zncc,
                 &mut queue,
@@ -274,8 +348,8 @@ impl Mesh {
         // --- Corrections (outlier re-solve).
         self.corrections(
             &subsets,
-            g_img,
             cfg,
+            pb,
             &mut stored,
             &mut c_zncc,
             &mut p,
@@ -283,6 +357,10 @@ impl Mesh {
             &mut iterations,
             &mut norms,
         )?;
+
+        if progress.is_none() {
+            pb.finish_and_clear();
+        }
 
         // --- Element areas and strains.
         let areas = element_area(&self.nodes, &self.elements);
@@ -295,6 +373,9 @@ impl Mesh {
 
         // --- Compatibility check.
         self.check_compatibility(&warps)?;
+
+        let f_img_path = self.f_img.filepath.clone().unwrap_or_default();
+        let g_img_path = self.g_img.filepath.clone().unwrap_or_default();
 
         Ok(MeshSolution {
             nodes: self.nodes.clone(),
@@ -320,21 +401,26 @@ impl Mesh {
     // Internal solver helpers
     // -----------------------------------------------------------------------
 
-    fn solve_one(
+    fn solve_one_with_tolerance(
         &self,
         subset: &Subset,
-        g_img: &Image,
         warp_0: &[f64],
+        tolerance: f64,
         cfg: &SolveConfig,
     ) -> Result<SolveResult, Error> {
         match cfg.method {
-            SolveMethod::Icgn => {
-                subset.solve_icgn(&g_img.qcqt, warp_0, cfg.max_norm, cfg.max_iterations)
-            }
-            SolveMethod::Fagn => {
-                subset.solve_fagn(&g_img.qcqt, warp_0, cfg.max_norm, cfg.max_iterations)
-            }
+            SolveMethod::Icgn => subset.solve_icgn(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
+            SolveMethod::Fagn => subset.solve_fagn(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
         }
+    }
+
+    fn solve_one(
+        &self,
+        subset: &Subset,
+        warp_0: &[f64],
+        cfg: &SolveConfig,
+    ) -> Result<SolveResult, Error> {
+        self.solve_one_with_tolerance(subset, warp_0, cfg.tolerance, cfg)
     }
 
     /// Solve all unsolved neighbours of `cur_idx`, applying warp extrapolation
@@ -344,8 +430,8 @@ impl Mesh {
         cur_idx: usize,
         p_0: &[f64],
         subsets: &[Subset],
-        g_img: &Image,
         cfg: &SolveConfig,
+        pb: &indicatif::ProgressBar,
         stored: &mut Vec<bool>,
         c_zncc: &mut Array1<f64>,
         queue: &mut BinaryHeap<(u64, usize)>,
@@ -360,26 +446,29 @@ impl Mesh {
                 continue;
             }
             // Attempt 1: use current p_0 as-is (nearest-neighbour preconditioning).
-            let r1 = self.solve_one(&subsets[nb_idx], g_img, p_0, cfg)?;
+            let r1 = self.solve_one(&subsets[nb_idx], p_0, cfg)?;
             if r1.c_zncc >= cfg.tolerance {
                 store_result(nb_idx, &r1, c_zncc, p, displacements, iterations, norms);
+                pb.inc(1);
                 stored[nb_idx] = true;
                 queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
                 continue;
             }
             // Attempt 2: projected preconditioning (Taylor expansion from cur_idx).
             let p_proj = project_warp(p_0, &self.nodes, cur_idx, nb_idx);
-            let r2 = self.solve_one(&subsets[nb_idx], g_img, &p_proj, cfg)?;
+            let r2 = self.solve_one(&subsets[nb_idx], &p_proj, cfg)?;
             if r2.c_zncc >= cfg.tolerance {
                 store_result(nb_idx, &r2, c_zncc, p, displacements, iterations, norms);
+                pb.inc(1);
                 stored[nb_idx] = true;
                 queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
                 continue;
             }
             // Attempt 3: zero initial guess.
             let zeros = vec![0.0f64; p_0.len()];
-            let r3 = self.solve_one(&subsets[nb_idx], g_img, &zeros, cfg)?;
+            let r3 = self.solve_one(&subsets[nb_idx], &zeros, cfg)?;
             store_result(nb_idx, &r3, c_zncc, p, displacements, iterations, norms);
+            pb.inc(1);
             stored[nb_idx] = true;
             queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
         }
@@ -390,8 +479,8 @@ impl Mesh {
     fn corrections(
         &self,
         subsets: &[Subset],
-        g_img: &Image,
         cfg: &SolveConfig,
+        pb: &indicatif::ProgressBar,
         solved: &mut Vec<bool>,
         c_zncc: &mut Array1<f64>,
         p: &mut Array2<f64>,
@@ -468,7 +557,7 @@ impl Mesh {
                 }
             };
 
-            let result = self.solve_one(&subsets[j], g_img, &warp, cfg)?;
+            let result = self.solve_one(&subsets[j], &warp, cfg)?;
             // Force the warp regardless of convergence (matches Python behaviour).
             let forced = SolveResult {
                 p: warp.clone(),
@@ -476,9 +565,13 @@ impl Mesh {
                 c_znssd: result.c_znssd,
                 iterations: result.iterations,
                 converged: result.converged,
+                solved: result.solved,
                 history: result.history,
+                max_norm: result.max_norm,
+                tolerance: result.tolerance,
             };
             store_result(j, &forced, c_zncc, p, displacements, iterations, norms);
+            pb.inc(1);
             solved[j] = true;
         }
         Ok(())
@@ -521,6 +614,12 @@ impl Mesh {
 
     /// Mesh element order (1 or 2).
     pub fn mesh_order(&self) -> u8 { self.mesh_order }
+
+    /// Reference image (shared ownership).
+    pub fn f_img(&self) -> &Arc<Image> { &self.f_img }
+
+    /// Target image (shared ownership).
+    pub fn g_img(&self) -> &Arc<Image> { &self.g_img }
 }
 
 // ---------------------------------------------------------------------------

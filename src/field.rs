@@ -24,6 +24,8 @@
 //!   at the mesh level; `Field` accepts pre-distributed coordinates or calls
 //!   `distribute_particles` after building a triangulation mesh.
 
+use std::path::PathBuf;
+
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -96,6 +98,9 @@ pub struct FieldSolution {
     /// Increment indices at which the reference mesh was updated.
     /// Derived from the `ref_updates` slice passed to `solve`.
     pub reference_update_register: Vec<usize>,
+    /// Path of the initial (reference) image.
+    #[serde(default)]
+    pub image_0_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +124,8 @@ pub struct Field {
     pub inc_no: usize,
     /// Set to `true` after a successful [`Field::solve`].
     pub solved: bool,
+    /// Path of the initial (reference) image.
+    pub image_0_path: Option<PathBuf>,
 }
 
 impl Field {
@@ -130,12 +137,14 @@ impl Field {
     /// * `track`       — Lagrangian (`true`) or Eulerian (`false`)
     /// * `depth`       — depth multiplier; must be > 0
     /// * `inc_no`      — number of frames (≥ 2; `inc_no - 1` mesh increments)
+    /// * `image_0_path` — path to the initial (reference) image
     pub fn new(
         coordinates: Array2<f64>,
         volumes: Array1<f64>,
         track: bool,
         depth: f64,
         inc_no: usize,
+        image_0_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
         if coordinates.ncols() != 2 {
             return Err(Error::InvalidInput(
@@ -169,6 +178,7 @@ impl Field {
             depth,
             inc_no,
             solved: false,
+            image_0_path,
         })
     }
 
@@ -234,6 +244,7 @@ impl Field {
                     self.inc_no,
                     mesh_order,
                     self.track,
+                    self.image_0_path.clone(),
                 )?;
 
                 // Solve increment by increment so ref_update can vary per step.
@@ -269,6 +280,7 @@ impl Field {
             particles: particle_solutions,
             vol_totals,
             reference_update_register,
+            image_0_path: self.image_0_path.clone(),
         })
     }
 }
@@ -370,7 +382,7 @@ mod tests {
     fn test_field_new_valid() {
         let (nodes, elems) = unit_square_mesh();
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        let f = Field::new(coords, vols, true, 1.0, 3);
+        let f = Field::new(coords, vols, true, 1.0, 3, None);
         assert!(f.is_ok());
         let f = f.unwrap();
         assert_eq!(f.n_particles(), 2);
@@ -382,7 +394,7 @@ mod tests {
         let (nodes, elems) = unit_square_mesh();
         let (coords, _) = distribute_particles(&nodes, &elems, 1.0);
         let vols = array![0.5]; // 1 volume for 2 particles
-        assert!(Field::new(coords, vols, true, 1.0, 3).is_err());
+        assert!(Field::new(coords, vols, true, 1.0, 3, None).is_err());
     }
 
     #[test]
@@ -390,14 +402,14 @@ mod tests {
         let (nodes, elems) = unit_square_mesh();
         let (coords, _) = distribute_particles(&nodes, &elems, 1.0);
         let vols = array![0.0, 0.5]; // zero volume
-        assert!(Field::new(coords, vols, true, 1.0, 3).is_err());
+        assert!(Field::new(coords, vols, true, 1.0, 3, None).is_err());
     }
 
     #[test]
     fn test_field_new_inc_no_too_small() {
         let (nodes, elems) = unit_square_mesh();
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        assert!(Field::new(coords, vols, true, 1.0, 1).is_err()); // inc_no = 1 < 2
+        assert!(Field::new(coords, vols, true, 1.0, 1, None).is_err()); // inc_no = 1 < 2
     }
 
     // -----------------------------------------------------------------------
@@ -407,7 +419,7 @@ mod tests {
     fn make_field(inc_no: usize) -> Field {
         let (nodes, elems) = unit_square_mesh();
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        Field::new(coords, vols, true, 1.0, inc_no).unwrap()
+        Field::new(coords, vols, true, 1.0, inc_no, None).unwrap()
     }
 
     fn make_mesh_data<'a>(
@@ -455,7 +467,7 @@ mod tests {
         // Track = true (Lagrangian) → coordinates move
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
         let initial_coords = coords.clone();
-        let mut field = Field::new(coords, vols, true, 1.0, 2).unwrap();
+        let mut field = Field::new(coords, vols, true, 1.0, 2, None).unwrap();
         let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true).unwrap();
 
         for (pi, p) in sol.particles.iter().enumerate() {
@@ -475,7 +487,7 @@ mod tests {
 
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
         let initial_coords = coords.clone();
-        let mut field = Field::new(coords, vols, false, 1.0, 2).unwrap(); // track = false
+        let mut field = Field::new(coords, vols, false, 1.0, 2, None).unwrap(); // track = false
         let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true).unwrap();
 
         for (pi, p) in sol.particles.iter().enumerate() {
@@ -507,7 +519,7 @@ mod tests {
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
         let total_initial = vols.sum();
 
-        let mut field = Field::new(coords, vols, true, 1.0, 2).unwrap();
+        let mut field = Field::new(coords, vols, true, 1.0, 2, None).unwrap();
         let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 0.0, true).unwrap();
 
         // vol_totals[0] and [1] should both ≈ total_initial
@@ -566,7 +578,7 @@ mod tests {
         let disps = array![[0.0, 0.0_f64], [0.1, 0.0], [0.0, 0.0], [0.1, 0.0]];
 
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        let mut field = Field::new(coords, vols, true, 1.0, 2).unwrap();
+        let mut field = Field::new(coords, vols, true, 1.0, 2, None).unwrap();
         let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 0.0, true).unwrap();
 
         // For a uniform x-stretch of 10%, warp_inc[2] = du/dx ≈ 0.1 for each particle

@@ -314,23 +314,25 @@ pub(crate) fn extract_region(obj: &Bound<'_, PyAny>) -> PyResult<(Array2<f64>, b
 /// -------
 /// np.ndarray (H, W), dtype uint8
 #[pyfunction]
-#[pyo3(signature = (img_shape, boundary_nodes, boundary_hard=true, exclusion_nodes=None))]
+#[pyo3(signature = (img_shape, boundary_nodes, boundary_hard=true, exclusion_nodes=None, exclusions_hard=None))]
 pub fn mask_image<'py>(
     py: Python<'py>,
     img_shape: (usize, usize),
     boundary_nodes: PyReadonlyArray2<f64>,
     boundary_hard: bool,
     exclusion_nodes: Option<Vec<PyReadonlyArray2<f64>>>,
+    exclusions_hard: Option<Vec<bool>>,
 ) -> Bound<'py, PyArray2<u8>> {
     let bn = boundary_nodes.as_array();
-    let excl_owned: Vec<Array2<f64>> = exclusion_nodes
-        .unwrap_or_default()
+    let excl_list = exclusion_nodes.unwrap_or_default();
+    let excl_owned: Vec<Array2<f64>> = excl_list
         .iter()
         .map(|a| a.as_array().to_owned())
         .collect();
     let excl_views: Vec<ArrayView2<f64>> =
         excl_owned.iter().map(|a: &Array2<f64>| a.view()).collect();
-    let mask = meshing::mask_image(img_shape, bn, boundary_hard, &excl_views);
+    let excl_hard = exclusions_hard.unwrap_or_else(|| vec![false; excl_owned.len()]);
+    let mask = meshing::mask_image(img_shape, bn, boundary_hard, &excl_views, &excl_hard);
     mask.into_pyarray_bound(py)
 }
 

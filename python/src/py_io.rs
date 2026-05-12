@@ -5,8 +5,9 @@ use geopyv_dev::io::{self, GeopyvObject};
 
 use crate::{
     py_field::PyFieldSolution,
-    py_mesh::PyMeshSolution,
+    py_mesh::PyMesh,
     py_sequence::PySequenceSolution,
+    py_subset::PySubset,
     Error,
 };
 
@@ -14,23 +15,36 @@ use crate::{
 // save
 // ---------------------------------------------------------------------------
 
-/// Serialise a ``MeshSolution``, ``FieldSolution``, or ``SequenceSolution``
-/// to a ``.pyv`` file.
+/// Serialise a ``Subset``, ``Mesh``, ``FieldSolution``, or
+/// ``SequenceSolution`` to a ``.pyv`` file.
 ///
 /// The file format is: 4-byte magic ``b"GPYV"`` + 1-byte version ``0x01`` +
 /// bincode v2 payload. This format is intentionally incompatible with the
 /// Python ``pickle``-based format used by the original ``geopyv`` package.
 #[pyfunction]
 pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
-    let gobj = if let Ok(m) = obj.extract::<PyRef<PyMeshSolution>>() {
-        GeopyvObject::Mesh(m.inner.clone())
+    let py = obj.py();
+    let gobj = if let Ok(m) = obj.extract::<PyRef<PyMesh>>() {
+        if m.solution.is_none() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Mesh has not been solved; cannot save.",
+            ));
+        }
+        GeopyvObject::Mesh(m.solution.clone().unwrap())
     } else if let Ok(f) = obj.extract::<PyRef<PyFieldSolution>>() {
         GeopyvObject::Field(f.inner.clone())
     } else if let Ok(s) = obj.extract::<PyRef<PySequenceSolution>>() {
         GeopyvObject::Sequence(s.inner.clone())
+    } else if let Ok(s) = obj.extract::<PyRef<PySubset>>() {
+        if s.result.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "Subset has not been solved; cannot save.",
+            ));
+        }
+        GeopyvObject::Subset(s.to_subset_solution(py)?)
     } else {
         return Err(PyRuntimeError::new_err(
-            "expected MeshSolution, FieldSolution, or SequenceSolution",
+            "expected Subset, Mesh, FieldSolution, or SequenceSolution",
         ));
     };
     io::save(path, &gobj).map_err(Error::from)?;
@@ -41,8 +55,8 @@ pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
 // load
 // ---------------------------------------------------------------------------
 
-/// Load a ``MeshSolution``, ``FieldSolution``, or ``SequenceSolution`` from a
-/// ``.pyv`` file.
+/// Load a ``Subset``, ``Mesh``, ``FieldSolution``, or
+/// ``SequenceSolution`` from a ``.pyv`` file.
 ///
 /// Returns the appropriate Python object depending on the type tag embedded in
 /// the file.
@@ -53,12 +67,12 @@ pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
 pub fn load(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     let obj = io::load(path).map_err(Error::from)?;
     match obj {
-        GeopyvObject::Mesh(m) => Ok(PyMeshSolution { inner: m }.into_py(py)),
-        GeopyvObject::Field(f) => Ok(PyFieldSolution { inner: f, image_0_path: None }.into_py(py)),
+        GeopyvObject::Mesh(m) => Ok(Py::new(py, PyMesh::from_solution(py, m)?)?.into_py(py)),
+        GeopyvObject::Field(f) => Ok(PyFieldSolution { inner: f }.into_py(py)),
         GeopyvObject::Sequence(s) => Ok(PySequenceSolution { inner: s }.into_py(py)),
-        GeopyvObject::Subset(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "loading Subset objects is not yet supported via Python",
-        )),
+        GeopyvObject::Subset(s) => {
+            Ok(Py::new(py, PySubset::from_solution(py, s)?)?.into_py(py))
+        }
         GeopyvObject::Particle(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
             "loading Particle objects is not yet supported via Python",
         )),

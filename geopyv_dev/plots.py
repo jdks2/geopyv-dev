@@ -160,12 +160,10 @@ def inspect_field(field, particle_idx=None, show=True, block=True, save=False, *
 
 
 def convergence_subset(subset, show=True, block=True, save=False, **kwargs):
-    solve_result = getattr(subset, 'solve_result', None)
-    if solve_result is None:
+    history = getattr(subset, 'history', None)
+    if not getattr(subset, 'solved', False) or history is None:
         raise ValueError("Subset has not been solved.")
-    history = solve_result["history"]
-    max_norm = solve_result.get("max_norm", 1e-3)
-    max_iterations = solve_result.get("max_iterations", 50)
+    max_norm = 1e-3
 
     iters = [h[0] for h in history]
     norms = [h[1] for h in history]

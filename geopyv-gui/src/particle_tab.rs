@@ -837,6 +837,7 @@ fn run_solve(
         inc_no,
         mesh_order,
         params.track,
+        None,
     ) {
         Ok(p) => p,
         Err(e) => {

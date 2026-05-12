@@ -1,7 +1,8 @@
 //! PyO3 wrapper for `geopyv_dev::sequence`.
 //!
 //! Exposes:
-//! - `Sequence` class: constructed with image paths + mesh config, runs `solve`.
+//! - `SequenceOptions` class: temporal coupling options for `Sequence.solve`.
+//! - `Sequence` class: constructed with image directory + mesh config, runs `solve`.
 //! - `SequenceSolution` class: read-only result from `Sequence.solve`.
 //! - `sequence_deformation_preconditioning` free function.
 
@@ -9,22 +10,75 @@ use std::path::PathBuf;
 
 use ndarray::{Array1, Array2};
 use numpy::IntoPyArray;
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use geopyv_dev::{
-    geometry::meshing,
-    mesh::{SolveConfig, SolveMethod},
-    sequence::{self, Sequence, SequenceMeshConfig, SequenceSolveConfig},
+    mesh::{SeedConfig, SolveConfig, SolveMethod},
+    sequence::{self, Sequence, SequenceMeshConfig, SequenceOptions, SequenceSolveConfig},
+    masks::LocalMask,
 };
 
 use crate::{
     py_geometry::extract_region,
-    py_mesh::PyMeshSolution,
-    py_templates::PyTemplate,
+    py_mesh::PyMesh,
+    py_mask::PyMask,
     Error,
 };
+
+// ---------------------------------------------------------------------------
+// SequenceOptions class
+// ---------------------------------------------------------------------------
+
+/// Temporal coupling options for :meth:`Sequence.solve`.
+///
+/// Parameters
+/// ----------
+/// guide : bool, optional
+///     Particle-based warp preconditioning between pairs. Default ``True``.
+/// sequential : bool, optional
+///     Advance reference after each successful solve. Default ``False``.
+/// sync : bool, optional
+///     Reuse previous mesh geometry for next pair (skips CDT). Default ``True``.
+/// override_ : bool, optional
+///     Relax tolerance on retry after a failed non-consecutive pair. Default ``False``.
+#[pyclass(name = "SequenceOptions")]
+#[derive(Clone)]
+pub struct PySequenceOptions {
+    pub guide: bool,
+    pub sequential: bool,
+    pub sync: bool,
+    pub override_: bool,
+}
+
+#[pymethods]
+impl PySequenceOptions {
+    #[new]
+    #[pyo3(signature = (guide=true, sequential=false, sync=true, override_=false))]
+    fn new(guide: bool, sequential: bool, sync: bool, override_: bool) -> Self {
+        PySequenceOptions { guide, sequential, sync, override_ }
+    }
+
+    #[getter]
+    fn guide(&self) -> bool { self.guide }
+
+    #[getter]
+    fn sequential(&self) -> bool { self.sequential }
+
+    #[getter]
+    fn sync(&self) -> bool { self.sync }
+
+    #[getter]
+    fn override_(&self) -> bool { self.override_ }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SequenceOptions(guide={}, sequential={}, sync={}, override_={})",
+            self.guide, self.sequential, self.sync, self.override_,
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SequenceSolution class
@@ -41,11 +95,11 @@ impl PySequenceSolution {
     /// Per-pair DIC solutions; ``mesh_solutions[i]`` is for pair ``(i, i+1)``.
     /// Empty when the sequence was solved with ``save`` set to a directory path.
     #[getter]
-    fn mesh_solutions(&self) -> Vec<PyMeshSolution> {
+    fn mesh_solutions(&self, py: Python<'_>) -> PyResult<Vec<Py<PyMesh>>> {
         self.inner
             .mesh_solutions
             .iter()
-            .map(|s| PyMeshSolution { inner: s.clone() })
+            .map(|s| Py::new(py, PyMesh::from_solution(py, s.clone())?))
             .collect()
     }
 
@@ -79,12 +133,14 @@ impl PySequenceSolution {
     }
 
     fn __repr__(&self) -> String {
-        let n = self.inner.mesh_solutions.len() + self.inner.mesh_paths.len();
+        let n_pairs = self.inner.mesh_solutions.len() + self.inner.mesh_paths.len();
+        let geom = self.inner.mesh_solutions.first().map(|m| {
+            format!(", nodes={}, mesh_order={}, subset_order={}",
+                m.nodes.nrows(), m.mesh_order, m.subset_order)
+        }).unwrap_or_default();
         format!(
-            "SequenceSolution(pairs={}, solved={}, unsolvable={})",
-            n,
-            self.inner.solved,
-            self.inner.unsolvable,
+            "SequenceSolution(pairs={}{}, solved={})",
+            n_pairs, geom, self.inner.solved,
         )
     }
 }
@@ -97,20 +153,21 @@ impl PySequenceSolution {
 ///
 /// Parameters
 /// ----------
-/// image_paths : list[str]
-///     Ordered list of image file paths (≥ 2).
+/// image_dir : str
+///     Directory containing the images.  All ``*.jpg``, ``*.jpeg``, and
+///     ``*.png`` files are collected and sorted by trailing integer in
+///     their filename stem.
 /// boundary : CircleRegion, PathRegion, or numpy.ndarray (N, 2)
 ///     Boundary region or raw polygon vertices. Raw arrays imply ``boundary_hard=False``.
-/// size_lower : float
-///     Minimum element edge length.
-/// size_upper : float
-///     Maximum element edge length.
 /// target_nodes : int
 ///     Target node count for binary-search sizing.
+/// size : tuple[float, float], optional
+///     ``(size_lower, size_upper)`` element edge lengths. Default ``(1.0, 1000.0)``.
 /// exclusions : list[CircleRegion | PathRegion | numpy.ndarray], optional
-///     Exclusion regions or raw polygon arrays. Default None.
+///     Exclusion regions. Hard/soft flag is taken from each region object;
+///     raw arrays default to soft. Default None.
 /// mesh_order : int, optional
-///     1 (linear) or 2 (quadratic). Default 1.
+///     1 (linear) or 2 (quadratic). Default 2.
 #[pyclass(name = "Sequence")]
 pub struct PySequence {
     inner: Sequence,
@@ -119,77 +176,30 @@ pub struct PySequence {
 #[pymethods]
 impl PySequence {
     #[new]
-    #[pyo3(signature = (image_paths, boundary, size_lower, size_upper, target_nodes,
-                         exclusions=None, mesh_order=1))]
+    #[pyo3(signature = (image_dir, boundary, target_nodes,
+                         size=(1.0, 1000.0), exclusions=None, mesh_order=2))]
     fn new(
-        image_paths: Vec<String>,
-        boundary: &Bound<'_, PyAny>,
-        size_lower: f64,
-        size_upper: f64,
-        target_nodes: usize,
-        exclusions: Option<Vec<Bound<'_, PyAny>>>,
-        mesh_order: u8,
-    ) -> PyResult<Self> {
-        let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
-        let excl_owned: Vec<Array2<f64>> = exclusions
-            .unwrap_or_default()
-            .iter()
-            .map(|obj| extract_region(obj).map(|(nodes, _)| nodes))
-            .collect::<PyResult<Vec<_>>>()?;
-        let excl_views: Vec<_> = excl_owned.iter().map(|a| a.view()).collect();
-        let roi = meshing::define_roi(boundary_nodes.view(), boundary_hard, &excl_views, None);
-        let paths: Vec<PathBuf> = image_paths.into_iter().map(PathBuf::from).collect();
-        let mesh_cfg = SequenceMeshConfig {
-            borders: roi.borders,
-            segments: roi.segments,
-            curves: roi.curves,
-            size_lower,
-            size_upper,
-            target_nodes,
-            mesh_order,
-        };
-        let seq = Sequence::new(paths, mesh_cfg).map_err(Error::from)?;
-        Ok(PySequence { inner: seq })
-    }
-
-    /// Construct a Sequence by scanning a directory for image files.
-    ///
-    /// Parameters
-    /// ----------
-    /// image_dir : str
-    ///     Directory containing the images.  All ``*.jpg``, ``*.jpeg``, and
-    ///     ``*.png`` files are collected and sorted by trailing integer in
-    ///     their filename stem.
-    /// boundary : CircleRegion, PathRegion, or numpy.ndarray (N, 2)
-    ///     Boundary region.
-    /// size_lower, size_upper, target_nodes, exclusions, mesh_order
-    ///     Same as :meth:`__init__`.
-    #[staticmethod]
-    #[pyo3(signature = (image_dir, boundary, size_lower, size_upper, target_nodes,
-                         exclusions=None, mesh_order=1))]
-    fn from_dir(
         image_dir: &str,
         boundary: &Bound<'_, PyAny>,
-        size_lower: f64,
-        size_upper: f64,
         target_nodes: usize,
+        size: (f64, f64),
         exclusions: Option<Vec<Bound<'_, PyAny>>>,
         mesh_order: u8,
     ) -> PyResult<Self> {
         let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
-        let excl_owned: Vec<Array2<f64>> = exclusions
-            .unwrap_or_default()
+        let excl_list = exclusions.unwrap_or_default();
+        let (excl_owned, excl_hard): (Vec<Array2<f64>>, Vec<bool>) = excl_list
             .iter()
-            .map(|obj| extract_region(obj).map(|(nodes, _)| nodes))
-            .collect::<PyResult<Vec<_>>>()?;
-        let excl_views: Vec<_> = excl_owned.iter().map(|a| a.view()).collect();
-        let roi = meshing::define_roi(boundary_nodes.view(), boundary_hard, &excl_views, None);
+            .map(|obj| extract_region(obj))
+            .collect::<PyResult<Vec<_>>>()?
+            .into_iter()
+            .unzip();
         let mesh_cfg = SequenceMeshConfig {
-            borders: roi.borders,
-            segments: roi.segments,
-            curves: roi.curves,
-            size_lower,
-            size_upper,
+            boundary_nodes,
+            boundary_hard,
+            exclusion_nodes: excl_owned,
+            exclusions_hard: excl_hard,
+            size,
             target_nodes,
             mesh_order,
         };
@@ -206,52 +216,45 @@ impl PySequence {
     ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Initial ``[x, y]`` seed coordinate near low-deformation region.
-    /// seed_warp : list[float]
-    ///     Initial warp vector for seed node (length 6 or 12).
+    /// seed_warp : list[float], optional
+    ///     Initial warp vector for seed node (length 6 or 12). Defaults to zeros.
     /// max_norm : float, optional
     ///     Convergence criterion. Default 1e-5.
     /// max_iterations : int, optional
     ///     Iteration limit per subset node. Default 50.
     /// subset_order : int, optional
-    ///     1 (affine) or 2 (quadratic). Default 1.
+    ///     1 (affine) or 2 (quadratic). Default 2.
     /// tolerance : float, optional
-    ///     Minimum acceptable C_ZNCC. Default 0.75.
+    ///     Minimum acceptable C_ZNCC for propagated nodes. Default 0.75.
+    /// seed_tolerance : float, optional
+    ///     Minimum acceptable C_ZNCC for the seed node. Default 0.9.
     /// method : str, optional
     ///     ``"icgn"`` (default) or ``"fagn"``.
-    /// guide : bool, optional
-    ///     Particle-based warp preconditioning between pairs. Default ``True``.
-    /// sequential : bool, optional
-    ///     Advance reference after each successful solve. Default ``False``.
-    /// sync : bool, optional
-    ///     Reuse previous mesh geometry in sync mode. Default ``True``.
-    /// override_ : bool, optional
-    ///     Relax tolerance on retry after a failed non-consecutive pair. Default ``False``.
+    /// options : SequenceOptions, optional
+    ///     Temporal coupling strategy. Default ``SequenceOptions()``.
     /// border : int, optional
     ///     Image border (pixels) for B-spline precomputation. Default 20.
     ///
     /// Returns
     /// -------
     /// SequenceSolution
-    #[pyo3(signature = (template, seed_coord, seed_warp,
-                         max_norm=1e-5, max_iterations=50, subset_order=1,
-                         tolerance=0.75, method="icgn",
-                         guide=true, sequential=false, sync=true,
-                         override_=false, border=20, save=None))]
+    #[pyo3(signature = (local_mask, seed_coord, seed_warp=None,
+                         max_norm=1e-5, max_iterations=50, subset_order=2,
+                         tolerance=0.75, seed_tolerance=0.9, method="icgn",
+                         options=None, border=20, save=None))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &self,
-        template: &Bound<'_, PyAny>,
+        local_mask: &Bound<'_, PyAny>,
         seed_coord: [f64; 2],
-        seed_warp: Vec<f64>,
+        seed_warp: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
         subset_order: usize,
         tolerance: f64,
+        seed_tolerance: f64,
         method: &str,
-        guide: bool,
-        sequential: bool,
-        sync: bool,
-        override_: bool,
+        options: Option<PyRef<'_, PySequenceOptions>>,
         border: usize,
         save: Option<&str>,
     ) -> PyResult<PySequenceSolution> {
@@ -260,10 +263,18 @@ impl PySequence {
         } else {
             SolveMethod::Icgn
         };
-        let tmpl = template
-            .extract::<PyRef<'_, PyTemplate>>()
-            .map_err(|_| PyTypeError::new_err("template must be a Template"))?;
-        let template_coords = tmpl.inner.coords.clone();
+        let tmpl = local_mask
+            .extract::<PyRef<'_, PyMask>>()
+            .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
+        let local_mask: LocalMask = tmpl.local_mask_ref()?.clone();
+        let warp_len = 6 * subset_order;
+        let warp = seed_warp.unwrap_or_else(|| vec![0.0; warp_len]);
+        let seq_options = options.map(|o| SequenceOptions {
+            guide: o.guide,
+            sequential: o.sequential,
+            sync: o.sync,
+            override_: o.override_,
+        }).unwrap_or_default();
         let cfg = SequenceSolveConfig {
             mesh_cfg: SolveConfig {
                 max_norm,
@@ -272,13 +283,13 @@ impl PySequence {
                 tolerance,
                 method: solve_method,
             },
-            template_coords,
-            seed_coord,
-            seed_warp,
-            guide,
-            sequential,
-            sync,
-            override_,
+            local_mask,
+            seed: SeedConfig {
+                coord: seed_coord,
+                warp,
+                tolerance: seed_tolerance,
+            },
+            options: seq_options,
             border,
             save: save.map(PathBuf::from),
         };
@@ -292,7 +303,7 @@ impl PySequence {
         self.inner.n_pairs()
     }
 
-    /// Ordered list of image file paths.
+    /// Ordered list of image file paths discovered from the directory.
     #[getter]
     fn image_paths(&self) -> Vec<String> {
         self.inner
@@ -304,7 +315,7 @@ impl PySequence {
 
     fn __repr__(&self) -> String {
         format!(
-            "Sequence(n_images={}, n_pairs={})",
+            "Sequence(images={}, pairs={})",
             self.inner.image_paths.len(),
             self.inner.n_pairs(),
         )
@@ -321,7 +332,7 @@ impl PySequence {
 ///
 /// Parameters
 /// ----------
-/// sol : MeshSolution
+/// mesh : Mesh
 ///     Solved mesh result from the previous pair.
 /// seed_coord : list[float]
 ///     ``[x, y]`` seed coordinate.
@@ -336,16 +347,19 @@ impl PySequence {
 ///     seed_displacement – shape ``(2,)`` float64
 ///     seed_warp         – shape ``(6*subset_order,)`` float64
 #[pyfunction]
-#[pyo3(signature = (sol, seed_coord, mesh_order, subset_order))]
+#[pyo3(signature = (mesh, seed_coord, mesh_order, subset_order))]
 fn sequence_deformation_preconditioning<'py>(
     py: Python<'py>,
-    sol: PyRef<'_, PyMeshSolution>,
+    mesh: PyRef<'_, PyMesh>,
     seed_coord: [f64; 2],
     mesh_order: u8,
     subset_order: u8,
 ) -> PyResult<Bound<'py, PyTuple>> {
+    let sol = mesh.solution.as_ref().ok_or_else(|| {
+        PyRuntimeError::new_err("Mesh has not been solved")
+    })?;
     let (disp, warp) =
-        sequence::deformation_preconditioning(&sol.inner, seed_coord, mesh_order, subset_order);
+        sequence::deformation_preconditioning(sol, seed_coord, mesh_order, subset_order);
     let disp_arr = Array1::from(vec![disp[0], disp[1]]);
     let warp_arr = Array1::from(warp);
     Ok(PyTuple::new_bound(
@@ -362,6 +376,7 @@ fn sequence_deformation_preconditioning<'py>(
 // ---------------------------------------------------------------------------
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PySequenceOptions>()?;
     m.add_class::<PySequence>()?;
     m.add_class::<PySequenceSolution>()?;
     m.add_function(wrap_pyfunction!(sequence_deformation_preconditioning, m)?)?;

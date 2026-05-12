@@ -1383,7 +1383,7 @@ fn run_solve(
 
     let inc_no = n_meshes + 1;
     let depth = params.depth.max(f64::MIN_POSITIVE);
-    let mut field = match Field::new(coords, vols, params.track, depth, inc_no) {
+    let mut field = match Field::new(coords, vols, params.track, depth, inc_no, None) {
         Ok(f) => f,
         Err(e) => {
             set_error(&state, format!("Field init error: {e}"));

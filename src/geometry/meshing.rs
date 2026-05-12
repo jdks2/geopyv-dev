@@ -49,6 +49,9 @@ pub struct RoiData {
 /// * `boundary_hard`    - If `true`, fill only inside the boundary polygon;
 ///                        if `false`, fill the entire image.
 /// * `exclusion_nodes`  - Slice of exclusion polygon vertex arrays; each is `(K, 2)`.
+/// * `exclusions_hard`  - Per-exclusion hard flag; soft exclusions (`false`) affect
+///                        mesh generation only and do not clip the pixel mask.
+///                        Length must match `exclusion_nodes`.
 ///
 /// Returns a `(height, width)` array with values 0 (masked) or 1 (active).
 pub fn mask_image(
@@ -56,6 +59,7 @@ pub fn mask_image(
     boundary_nodes: ArrayView2<f64>,
     boundary_hard: bool,
     exclusion_nodes: &[ArrayView2<f64>],
+    exclusions_hard: &[bool],
 ) -> Array2<u8> {
     let (height, width) = img_shape;
     let mut mask = Array2::<u8>::zeros((height, width));
@@ -82,8 +86,11 @@ pub fn mask_image(
         }
     }
 
-    // Zero out exclusion regions.
-    for exc in exclusion_nodes {
+    // Zero out hard exclusion regions only (soft exclusions affect meshing, not the mask).
+    for (exc, &hard) in exclusion_nodes.iter().zip(exclusions_hard.iter()) {
+        if !hard {
+            continue;
+        }
         let exc_poly: Vec<[f64; 2]> = exc.outer_iter().map(|r| [r[0], r[1]]).collect();
         for row in 0..height {
             for col in 0..width {
@@ -112,11 +119,14 @@ pub fn mask_image(
 /// * `boundary_nodes`   - `(N, 2)` boundary polygon vertices `[x, y]`.
 /// * `boundary_hard`    - Passed through to `mask_image` if `img_shape` is supplied.
 /// * `exclusion_nodes`  - Exclusion polygon arrays.
+/// * `exclusions_hard`  - Per-exclusion hard flag (soft = affects meshing only, not mask).
+///                        Length must match `exclusion_nodes`.
 /// * `img_shape`        - Optional image `(height, width)` for mask generation.
 pub fn define_roi(
     boundary_nodes: ArrayView2<f64>,
     boundary_hard: bool,
     exclusion_nodes: &[ArrayView2<f64>],
+    exclusions_hard: &[bool],
     img_shape: Option<(usize, usize)>,
 ) -> RoiData {
     let n_boundary = boundary_nodes.nrows();
@@ -162,7 +172,7 @@ pub fn define_roi(
     let segments = Array2::from_shape_fn((n_seg, 2), |(i, j)| seg_rows[i][j]);
 
     let mask = img_shape.map(|shape| {
-        mask_image(shape, boundary_nodes, boundary_hard, exclusion_nodes)
+        mask_image(shape, boundary_nodes, boundary_hard, exclusion_nodes, exclusions_hard)
     });
 
     RoiData { borders, segments, curves, mask }
@@ -226,7 +236,7 @@ mod tests {
     #[test]
     fn mask_image_interior_is_one() {
         let poly = square_poly();
-        let mask = mask_image((30, 30), poly.view(), true, &[]);
+        let mask = mask_image((30, 30), poly.view(), true, &[], &[]);
         // Centre of the square (row=15, col=15) should be 1.
         assert_eq!(mask[[15, 15]], 1);
     }
@@ -234,7 +244,7 @@ mod tests {
     #[test]
     fn mask_image_exterior_is_zero() {
         let poly = square_poly();
-        let mask = mask_image((30, 30), poly.view(), true, &[]);
+        let mask = mask_image((30, 30), poly.view(), true, &[], &[]);
         // Outside the square, e.g. (0, 0).
         assert_eq!(mask[[0, 0]], 0);
     }
@@ -242,7 +252,7 @@ mod tests {
     #[test]
     fn mask_image_soft_boundary_fills_all() {
         let poly = square_poly();
-        let mask = mask_image((30, 30), poly.view(), false, &[]);
+        let mask = mask_image((30, 30), poly.view(), false, &[], &[]);
         // Soft boundary: entire image is 1.
         assert!(mask.iter().all(|&v| v == 1));
     }
@@ -252,7 +262,7 @@ mod tests {
         // Boundary: 30×30 image. Exclusion: 5×5 square at (12..17, 12..17).
         let boundary = array![[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]];
         let exclusion = array![[12.0, 12.0], [17.0, 12.0], [17.0, 17.0], [12.0, 17.0]];
-        let mask = mask_image((30, 30), boundary.view(), true, &[exclusion.view()]);
+        let mask = mask_image((30, 30), boundary.view(), true, &[exclusion.view()], &[true]);
         // Well inside exclusion → 0.
         assert_eq!(mask[[14, 14]], 0);
         // Well outside exclusion → 1.
@@ -260,10 +270,19 @@ mod tests {
     }
 
     #[test]
+    fn mask_image_soft_exclusion_does_not_clip() {
+        let boundary = array![[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]];
+        let exclusion = array![[12.0, 12.0], [17.0, 12.0], [17.0, 17.0], [12.0, 17.0]];
+        let mask = mask_image((30, 30), boundary.view(), true, &[exclusion.view()], &[false]);
+        // Soft exclusion: pixel inside exclusion region stays 1.
+        assert_eq!(mask[[14, 14]], 1);
+    }
+
+    #[test]
     fn define_roi_segment_count() {
         // Boundary with N nodes should produce N segments.
         let boundary = square_poly(); // 4 nodes
-        let roi = define_roi(boundary.view(), true, &[], None);
+        let roi = define_roi(boundary.view(), true, &[], &[], None);
         assert_eq!(roi.segments.nrows(), 4);
         assert_eq!(roi.curves.len(), 1);
         assert_eq!(roi.curves[0].len(), 4);
@@ -273,7 +292,7 @@ mod tests {
     fn define_roi_exclusion_appended() {
         let boundary = square_poly(); // 4 nodes
         let exclusion = array![[12.0, 12.0], [17.0, 12.0], [17.0, 17.0], [12.0, 17.0]];
-        let roi = define_roi(boundary.view(), true, &[exclusion.view()], None);
+        let roi = define_roi(boundary.view(), true, &[exclusion.view()], &[true], None);
         assert_eq!(roi.borders.nrows(), 8); // 4 + 4
         assert_eq!(roi.segments.nrows(), 8); // 4 + 4
         assert_eq!(roi.curves.len(), 2);
@@ -282,7 +301,7 @@ mod tests {
     #[test]
     fn define_roi_with_mask() {
         let boundary = array![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]];
-        let roi = define_roi(boundary.view(), true, &[], Some((20, 20)));
+        let roi = define_roi(boundary.view(), true, &[], &[], Some((20, 20)));
         assert!(roi.mask.is_some());
         let mask = roi.mask.unwrap();
         assert_eq!(mask.dim(), (20, 20));

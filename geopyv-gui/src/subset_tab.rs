@@ -7,8 +7,8 @@ use egui_plot::{HLine, Legend, Line, LineStyle, Plot, Points};
 
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::subset::{Subset, SubsetSolution, TemplateSummary};
-use geopyv_dev::templates::{Template, TemplateShape};
+use geopyv_dev::subset::{Subset, SubsetSolution, MaskSummary};
+use geopyv_dev::masks::{LocalMask, MaskShape};
 
 use crate::draw::{ActiveDrawMode, ImageCoord};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
@@ -92,7 +92,7 @@ pub struct NewSubsetForm {
     pub name: String,
     pub ref_idx: Option<usize>,
     pub target_idx: Option<usize>,
-    pub template_shape: TemplateShape,
+    pub template_shape: MaskShape,
     pub template_size_text: String,
     pub template_size: u32,
     pub template_size_error: Option<String>,
@@ -107,7 +107,7 @@ impl Default for NewSubsetForm {
             name: String::new(),
             ref_idx: None,
             target_idx: None,
-            template_shape: TemplateShape::Circle,
+            template_shape: MaskShape::Circle,
             template_size_text: "20".to_string(),
             template_size: 20,
             template_size_error: None,
@@ -191,7 +191,7 @@ pub struct SubsetSpawnParams {
     pub name: String,
     pub ref_path: PathBuf,
     pub target_path: PathBuf,
-    pub template_shape: TemplateShape,
+    pub template_shape: MaskShape,
     pub template_size: u32,
     pub coord: [f64; 2],
     pub method: SolveMethod,
@@ -409,14 +409,14 @@ impl SubsetTabState {
                             ));
                             if viewer_rect.contains(screen_pt) {
                                 paint_crosshair_x(ui.painter(), screen_pt);
-                                let screen_r = sol.template.size as f32 * coord.zoom;
+                                let screen_r = sol.mask.size as f32 * coord.zoom;
 
                                 // Original template — hard boundary, no fill.
                                 paint_template_outline_color(
                                     ui.painter(),
                                     screen_pt,
                                     screen_r,
-                                    &sol.template.shape,
+                                    &sol.mask.shape,
                                     egui::Color32::from_rgba_unmultiplied(255, 200, 0, 200),
                                 );
 
@@ -428,7 +428,7 @@ impl SubsetTabState {
                                         ui.painter(),
                                         screen_pt,
                                         screen_r,
-                                        &sol.template.shape,
+                                        &sol.mask.shape,
                                         alpha,
                                     );
                                     paint_deformed_template(
@@ -497,7 +497,7 @@ impl SubsetTabState {
             .map(|&(iter, _, zncc, _)| [iter as f64, zncc])
             .collect();
 
-        let max_norm_log = sol.max_norm.log10();
+        let max_norm_log = sol.result.max_norm.log10();
 
         // ── Norm plot (top) ──────────────────────────────────────────────────
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(norm_rect), |ui| {
@@ -608,7 +608,7 @@ impl SubsetTabState {
 
         let caption = format!(
             "Size: {} px  ·  σ_s = {:.2}  ·  SSSIG = {:.2E}",
-            sol.template.size,
+            sol.mask.size,
             sol.std_dev,
             sol.sssig,
         );
@@ -708,9 +708,9 @@ impl SubsetTabState {
         let tar_name = sol.target_image.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let shape_str = match sol.template.shape {
-            TemplateShape::Circle => "Circle",
-            TemplateShape::Square => "Square",
+        let shape_str = match sol.mask.shape {
+            MaskShape::Circle => "Circle",
+            MaskShape::Square => "Square",
         };
 
         meta_row(ui, "Reference", &ref_name);
@@ -718,7 +718,7 @@ impl SubsetTabState {
         meta_row(
             ui,
             "Template",
-            &format!("{}, size {} px", shape_str, sol.template.size),
+            &format!("{}, size {} px", shape_str, sol.mask.size),
         );
         meta_row(
             ui,
@@ -918,8 +918,8 @@ impl SubsetTabState {
                         .color(ui.visuals().weak_text_color()),
                 );
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut form.template_shape, TemplateShape::Circle, "Circle");
-                    ui.radio_value(&mut form.template_shape, TemplateShape::Square, "Square");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Circle, "Circle");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Square, "Square");
                 });
                 ui.end_row();
 
@@ -1281,14 +1281,14 @@ fn run_solve(
     state: Arc<Mutex<SubsetSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    let template = match params.template_shape {
-        TemplateShape::Circle => Template::circle(params.template_size as usize),
-        TemplateShape::Square => Template::square(params.template_size as usize),
+    let local_mask = match params.template_shape {
+        MaskShape::Circle => LocalMask::circle(params.template_size as usize),
+        MaskShape::Square => LocalMask::square(params.template_size as usize),
     };
-    let template = match template {
+    let local_mask = match local_mask {
         Ok(t) => t,
         Err(e) => {
-            set_error(&state, format!("Template build error: {e}"));
+            set_error(&state, format!("Mask build error: {e}"));
             return;
         }
     };
@@ -1300,7 +1300,7 @@ fn run_solve(
 
     set_progress(&state, 0.1, "Loading reference image…");
     let ref_img = match Image::from_file(&params.ref_path, 20) {
-        Ok(img) => img,
+        Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Reference image error: {e}"));
             return;
@@ -1312,8 +1312,32 @@ fn run_solve(
         return;
     }
 
-    set_progress(&state, 0.3, "Creating subset…");
-    let subset = match Subset::new(params.coord, &template.coords, &ref_img.qcqt) {
+    set_progress(&state, 0.3, "Loading target image…");
+    let target_img = match Image::from_file(&params.target_path, 20) {
+        Ok(img) => Arc::new(img),
+        Err(e) => {
+            set_error(&state, format!("Target image error: {e}"));
+            return;
+        }
+    };
+
+    if cancel.load(Ordering::Relaxed) {
+        if let Ok(mut s) = state.lock() { s.running = false; }
+        return;
+    }
+
+    let n_params = if matches!(params.order, SubsetOrder::First) { 6 } else { 12 };
+    let subset_order = n_params / 6;
+
+    set_progress(&state, 0.5, "Creating subset…");
+    let subset = match Subset::new(
+        params.coord,
+        &local_mask,
+        None,
+        Arc::clone(&ref_img),
+        Arc::clone(&target_img),
+        subset_order,
+    ) {
         Ok(s) => s,
         Err(e) => {
             set_error(&state, format!("Subset error: {e}"));
@@ -1321,8 +1345,8 @@ fn run_solve(
         }
     };
 
-    // Capture quality metrics before solving (solve takes &self so subset is not moved).
-    let n_px = subset.n_px();
+    // Capture quality metrics before solving.
+    let n_px = subset.mask.n_px;
     let std_dev = if n_px > 0 {
         subset.delta_f / (n_px as f64).sqrt()
     } else {
@@ -1335,30 +1359,15 @@ fn run_solve(
         return;
     }
 
-    set_progress(&state, 0.5, "Loading target image…");
-    let target_img = match Image::from_file(&params.target_path, 20) {
-        Ok(img) => img,
-        Err(e) => {
-            set_error(&state, format!("Target image error: {e}"));
-            return;
-        }
-    };
-
-    if cancel.load(Ordering::Relaxed) {
-        if let Ok(mut s) = state.lock() { s.running = false; }
-        return;
-    }
-
     set_progress(&state, 0.7, "Solving…");
-    let n_params = if matches!(params.order, SubsetOrder::First) { 6 } else { 12 };
     let p_0 = vec![0.0f64; n_params];
 
     let solve_result = match params.method {
         SolveMethod::Icgn => {
-            subset.solve_icgn(&target_img.qcqt, &p_0, params.max_norm, params.max_iterations)
+            subset.solve_icgn(Some(&p_0), 0.75, params.max_norm, params.max_iterations)
         }
         SolveMethod::Fagn => {
-            subset.solve_fagn(&target_img.qcqt, &p_0, params.max_norm, params.max_iterations)
+            subset.solve_fagn(Some(&p_0), 0.75, params.max_norm, params.max_iterations)
         }
     };
 
@@ -1366,7 +1375,7 @@ fn run_solve(
         Ok(result) => {
             let solution = SubsetSolution {
                 coord: params.coord,
-                template: TemplateSummary {
+                mask: MaskSummary {
                     shape: params.template_shape,
                     size: params.template_size as usize,
                     n_px,
@@ -1376,7 +1385,7 @@ fn run_solve(
                 result,
                 std_dev,
                 sssig,
-                max_norm: params.max_norm,
+                delta_f: subset.delta_f,
             };
             if let Ok(mut s) = state.lock() {
                 s.result = Some(Ok(solution));
@@ -1407,11 +1416,11 @@ fn paint_deformed_template(
     }
     let cx = sol.coord[0];
     let cy = sol.coord[1];
-    let r = sol.template.size as f64;
+    let r = sol.mask.size as f64;
     let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 60, 60));
 
-    let screen_pts: Vec<egui::Pos2> = match sol.template.shape {
-        TemplateShape::Circle => {
+    let screen_pts: Vec<egui::Pos2> = match sol.mask.shape {
+        MaskShape::Circle => {
             const N: usize = 64;
             (0..=N)
                 .map(|i| {
@@ -1428,7 +1437,7 @@ fn paint_deformed_template(
                 })
                 .collect()
         }
-        TemplateShape::Square => {
+        MaskShape::Square => {
             let corners = [
                 (-r, -r),
                 ( r, -r),
@@ -1479,7 +1488,7 @@ fn build_inspect_texture(
     // coord[0] = x (column), coord[1] = y (row)
     let cx = sol.coord[0].round() as i64;
     let cy = sol.coord[1].round() as i64;
-    let r = sol.template.size as i64;
+    let r = sol.mask.size as i64;
     let full = (2 * r + 1) as usize;
 
     let mut rgba = vec![0u8; full * full * 4];
@@ -1493,9 +1502,9 @@ fn build_inspect_texture(
                 continue; // stays transparent
             }
 
-            let inside = match sol.template.shape {
-                TemplateShape::Circle => dx * dx + dy * dy <= r * r,
-                TemplateShape::Square => true,
+            let inside = match sol.mask.shape {
+                MaskShape::Circle => dx * dx + dy * dy <= r * r,
+                MaskShape::Square => true,
             };
             if !inside {
                 continue; // stays transparent
@@ -1539,15 +1548,15 @@ fn paint_template_outline_color(
     painter: &egui::Painter,
     center: egui::Pos2,
     screen_radius: f32,
-    shape: &TemplateShape,
+    shape: &MaskShape,
     color: egui::Color32,
 ) {
     let stroke = egui::Stroke::new(1.5, color);
     match shape {
-        TemplateShape::Circle => {
+        MaskShape::Circle => {
             painter.circle_stroke(center, screen_radius, stroke);
         }
-        TemplateShape::Square => {
+        MaskShape::Square => {
             let rect = egui::Rect::from_center_size(
                 center,
                 egui::vec2(screen_radius * 2.0, screen_radius * 2.0),
@@ -1561,15 +1570,15 @@ fn paint_template_fill(
     painter: &egui::Painter,
     center: egui::Pos2,
     screen_radius: f32,
-    shape: &TemplateShape,
+    shape: &MaskShape,
     alpha: u8,
 ) {
     let fill = egui::Color32::from_rgba_unmultiplied(255, 200, 0, alpha);
     match shape {
-        TemplateShape::Circle => {
+        MaskShape::Circle => {
             painter.circle_filled(center, screen_radius, fill);
         }
-        TemplateShape::Square => {
+        MaskShape::Square => {
             let rect = egui::Rect::from_center_size(
                 center,
                 egui::vec2(screen_radius * 2.0, screen_radius * 2.0),

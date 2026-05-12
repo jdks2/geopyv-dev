@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use ndarray::Array2;
 
-use geopyv_dev::geometry::meshing::define_roi;
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::mesh::{Mesh, MeshSolution, SolveConfig};
+use geopyv_dev::mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
-use geopyv_dev::templates::{Template, TemplateShape};
+use geopyv_dev::masks::{LocalMask, MaskShape};
 
 use crate::colormap::{self, ColormapType};
 use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
@@ -132,7 +131,7 @@ pub struct NewMeshForm {
     pub name: String,
     pub ref_idx: Option<usize>,
     pub target_idx: Option<usize>,
-    pub template_shape: TemplateShape,
+    pub template_shape: MaskShape,
     pub template_size_text: String,
     pub template_size: u32,
     pub template_size_error: Option<String>,
@@ -148,7 +147,7 @@ impl Default for NewMeshForm {
             name: String::new(),
             ref_idx: None,
             target_idx: None,
-            template_shape: TemplateShape::Circle,
+            template_shape: MaskShape::Circle,
             template_size_text: "20".to_string(),
             template_size: 20,
             template_size_error: None,
@@ -258,7 +257,7 @@ pub struct MeshSpawnParams {
     pub name: String,
     pub ref_path: PathBuf,
     pub target_path: PathBuf,
-    pub template_shape: TemplateShape,
+    pub template_shape: MaskShape,
     pub template_size: u32,
     pub boundary: Vec<[f64; 2]>,
     pub exclusions: Vec<Vec<[f64; 2]>>,
@@ -900,8 +899,8 @@ impl MeshTabState {
                         .color(ui.visuals().weak_text_color()),
                 );
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut form.template_shape, TemplateShape::Circle, "Circle");
-                    ui.radio_value(&mut form.template_shape, TemplateShape::Square, "Square");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Circle, "Circle");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Square, "Square");
                 });
                 ui.end_row();
 
@@ -1364,15 +1363,15 @@ fn run_solve(
     state: Arc<Mutex<MeshSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    set_progress(&state, 0.05, "Building template\u{2026}");
-    let template = match params.template_shape {
-        TemplateShape::Circle => Template::circle(params.template_size as usize),
-        TemplateShape::Square => Template::square(params.template_size as usize),
+    set_progress(&state, 0.05, "Building local mask\u{2026}");
+    let local_mask = match params.template_shape {
+        MaskShape::Circle => LocalMask::circle(params.template_size as usize),
+        MaskShape::Square => LocalMask::square(params.template_size as usize),
     };
-    let template = match template {
+    let local_mask = match local_mask {
         Ok(t) => t,
         Err(e) => {
-            set_error(&state, format!("Template build error: {e}"));
+            set_error(&state, format!("Mask build error: {e}"));
             return;
         }
     };
@@ -1384,7 +1383,7 @@ fn run_solve(
 
     set_progress(&state, 0.15, "Loading reference image\u{2026}");
     let ref_img = match Image::from_file(&params.ref_path, 20) {
-        Ok(img) => img,
+        Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Reference image error: {e}"));
             return;
@@ -1396,7 +1395,21 @@ fn run_solve(
         return;
     }
 
-    set_progress(&state, 0.30, "Generating mesh\u{2026}");
+    set_progress(&state, 0.35, "Loading target image\u{2026}");
+    let target_img = match Image::from_file(&params.target_path, 20) {
+        Ok(img) => Arc::new(img),
+        Err(e) => {
+            set_error(&state, format!("Target image error: {e}"));
+            return;
+        }
+    };
+
+    if cancel.load(Ordering::Relaxed) {
+        if let Ok(mut s) = state.lock() { s.running = false; }
+        return;
+    }
+
+    set_progress(&state, 0.50, "Generating mesh\u{2026}");
     let boundary_arr = Array2::from_shape_fn(
         (params.boundary.len(), 2),
         |(i, j)| params.boundary[i][j],
@@ -1407,16 +1420,18 @@ fn run_solve(
         .map(|ex| Array2::from_shape_fn((ex.len(), 2), |(i, j)| ex[i][j]))
         .collect();
     let exclusion_views: Vec<_> = exclusion_arrs.iter().map(|a| a.view()).collect();
-    let roi = define_roi(boundary_arr.view(), true, &exclusion_views, None);
+    let excl_hard = vec![false; exclusion_arrs.len()];
 
-    let mesh = match Mesh::generate(
-        roi.borders.view(),
-        roi.segments.view(),
-        &roi.curves,
-        params.size_lower,
-        params.size_upper,
+    let mesh = match Mesh::new(
+        boundary_arr.view(),
+        true,
+        &exclusion_views,
+        &excl_hard,
+        (params.size_lower, params.size_upper),
         params.target_nodes,
         params.mesh_order,
+        Arc::clone(&ref_img),
+        Arc::clone(&target_img),
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -1426,20 +1441,6 @@ fn run_solve(
     };
 
     let n_nodes = mesh.nodes().nrows();
-
-    if cancel.load(Ordering::Relaxed) {
-        if let Ok(mut s) = state.lock() { s.running = false; }
-        return;
-    }
-
-    set_progress(&state, 0.55, "Loading target image\u{2026}");
-    let target_img = match Image::from_file(&params.target_path, 20) {
-        Ok(img) => img,
-        Err(e) => {
-            set_error(&state, format!("Target image error: {e}"));
-            return;
-        }
-    };
 
     if cancel.load(Ordering::Relaxed) {
         if let Ok(mut s) = state.lock() { s.running = false; }
@@ -1459,17 +1460,13 @@ fn run_solve(
         },
     };
     let seed_warp = vec![0.0f64; 6 * p_len];
+    let seed_cfg = SeedConfig {
+        coord: params.seed,
+        warp: seed_warp,
+        tolerance: 0.9,
+    };
 
-    match mesh.solve(
-        &ref_img,
-        &target_img,
-        &template.coords,
-        params.seed,
-        &seed_warp,
-        &cfg,
-        params.ref_path.clone(),
-        params.target_path.clone(),
-    ) {
+    match mesh.solve(&local_mask, &seed_cfg, &cfg, None) {
         Ok(solution) => {
             if let Ok(mut s) = state.lock() {
                 s.result = Some(Ok(solution));
