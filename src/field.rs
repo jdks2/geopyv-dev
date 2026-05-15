@@ -25,13 +25,16 @@
 //!   `distribute_particles` after building a triangulation mesh.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    particle::{MeshData, Particle, ParticleConfig, ParticleSolution},
+    calibration::CalibrationParams,
+    particle::{Particle, ParticleConfig, ParticleSource, ParticleSolution},
+    sequence::SequenceSolution,
     Error,
 };
 
@@ -85,6 +88,28 @@ pub fn distribute_particles(
 }
 
 // ---------------------------------------------------------------------------
+// FieldDistribution
+// ---------------------------------------------------------------------------
+
+/// How initial particle positions and volumes are determined.
+pub enum FieldDistribution {
+    /// Explicit initial positions and volumes — used as-is.
+    Explicit {
+        coordinates: Array2<f64>,
+        volumes: Array1<f64>,
+    },
+    /// Generate by triangulating the supplied boundary/exclusion polygons.
+    FromBoundary {
+        boundary_nodes: Array2<f64>,
+        exclusion_nodes: Vec<Array2<f64>>,
+        target_particles: usize,
+    },
+    /// Derive from the SequenceSolution: place particles at element centroids
+    /// of the first mesh in the sequence.
+    FromSequence,
+}
+
+// ---------------------------------------------------------------------------
 // FieldSolution
 // ---------------------------------------------------------------------------
 
@@ -93,14 +118,18 @@ pub fn distribute_particles(
 pub struct FieldSolution {
     /// Per-particle strain-path solutions.
     pub particles: Vec<ParticleSolution>,
+    /// Initial coordinates of all particles `(N, 2)`.
+    pub initial_coordinates: Array2<f64>,
     /// Sum of volumes across all particles at each increment `(inc_no,)`.
     pub vol_totals: Array1<f64>,
     /// Increment indices at which the reference mesh was updated.
-    /// Derived from the `ref_updates` slice passed to `solve`.
     pub reference_update_register: Vec<usize>,
     /// Path of the initial (reference) image.
     #[serde(default)]
     pub image_0_path: Option<PathBuf>,
+    /// Whether calibration was applied during solve.
+    #[serde(default)]
+    pub calibrated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,192 +138,205 @@ pub struct FieldSolution {
 
 /// Distributed particle field for strain-path tracking.
 ///
-/// Construct with [`Field::new`] supplying per-particle initial positions and
-/// volumes; then call [`Field::solve`].
+/// Construct with [`Field::new`]; then call [`Field::solve`].
 pub struct Field {
+    pub source: Arc<SequenceSolution>,
     /// Initial particle coordinates `(n_particles, 2)`.
     pub coordinates: Array2<f64>,
     /// Initial particle volumes `(n_particles,)`.
     pub volumes: Array1<f64>,
-    /// `true` for Lagrangian tracking (coordinates move with material).
     pub track: bool,
-    /// Depth multiplier (used when computing distributed volumes).
     pub depth: f64,
-    /// Total number of frames, including the initial state.
-    pub inc_no: usize,
-    /// Set to `true` after a successful [`Field::solve`].
-    pub solved: bool,
-    /// Path of the initial (reference) image.
-    pub image_0_path: Option<PathBuf>,
+    solution: Option<FieldSolution>,
 }
 
 impl Field {
     /// Construct a new Field.
-    ///
-    /// # Arguments
-    /// * `coordinates` — `(n_particles, 2)` initial positions
-    /// * `volumes`     — `(n_particles,)` initial volumes; all must be > 0
-    /// * `track`       — Lagrangian (`true`) or Eulerian (`false`)
-    /// * `depth`       — depth multiplier; must be > 0
-    /// * `inc_no`      — number of frames (≥ 2; `inc_no - 1` mesh increments)
-    /// * `image_0_path` — path to the initial (reference) image
     pub fn new(
-        coordinates: Array2<f64>,
-        volumes: Array1<f64>,
+        source: Arc<SequenceSolution>,
+        distribution: FieldDistribution,
         track: bool,
         depth: f64,
-        inc_no: usize,
-        image_0_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
-        if coordinates.ncols() != 2 {
-            return Err(Error::InvalidInput(
-                "coordinates must have 2 columns".to_string(),
-            ));
-        }
-        if volumes.len() != coordinates.nrows() {
-            return Err(Error::InvalidInput(format!(
-                "volumes length {} does not match coordinates rows {}",
-                volumes.len(),
-                coordinates.nrows()
-            )));
-        }
-        if volumes.iter().any(|&v| v <= 0.0) {
-            return Err(Error::InvalidInput(
-                "all volumes must be > 0".to_string(),
-            ));
-        }
         if depth <= 0.0 {
             return Err(Error::InvalidInput("depth must be > 0".to_string()));
         }
-        if inc_no < 2 {
+        if source.n_meshes() == 0 {
             return Err(Error::InvalidInput(
-                "inc_no must be >= 2".to_string(),
+                "source sequence has no mesh solutions".to_string(),
             ));
         }
-        Ok(Field {
-            coordinates,
-            volumes,
-            track,
-            depth,
-            inc_no,
-            solved: false,
-            image_0_path,
-        })
-    }
 
-    /// Number of particles.
-    pub fn n_particles(&self) -> usize {
-        self.coordinates.nrows()
-    }
-
-    /// Solve strain paths for all particles over a sequence of mesh increments.
-    ///
-    /// Replicates `Field.solve` (minus geomat sections, minus alive_bar).
-    ///
-    /// # Arguments
-    /// * `meshes`      — one entry per increment; `meshes[m]` supplies the DIC
-    ///                   solve between frame `m` and `m+1`.  Length must equal
-    ///                   `inc_no - 1`.
-    /// * `ref_updates` — one `bool` per increment; `true` if the reference mesh
-    ///                   changed at step `m` (replaces `_check_update`).
-    ///                   May be empty (treated as all-`false`).
-    /// * `factor`      — volumetric correction factor passed to `strain_def`
-    /// * `true_incs`   — logarithmic strain increments
-    pub fn solve(
-        &mut self,
-        meshes: &[MeshData<'_>],
-        ref_updates: &[bool],
-        factor: f64,
-        true_incs: bool,
-    ) -> Result<FieldSolution, Error> {
-        let expected = self.inc_no - 1;
-        if meshes.len() != expected {
-            return Err(Error::InvalidInput(format!(
-                "expected {} meshes for {} increments, got {}",
-                expected,
-                self.inc_no,
-                meshes.len()
-            )));
-        }
-        if !ref_updates.is_empty() && ref_updates.len() != expected {
-            return Err(Error::InvalidInput(format!(
-                "ref_updates length {} does not match {} increments",
-                ref_updates.len(),
-                expected
-            )));
-        }
-
-        let n = self.n_particles();
-        let cfg = ParticleConfig { factor, true_incs };
-
-        // Build per-particle initial warps (all zeros) and solve in parallel.
-        let initial_warps: Vec<[f64; 6]> = vec![[0.0; 6]; n];
-
-        let results: Vec<Result<ParticleSolution, Error>> = (0..n)
-            .into_par_iter()
-            .map(|pi| {
-                let coord = [self.coordinates[[pi, 0]], self.coordinates[[pi, 1]]];
-                let vol = self.volumes[pi];
-                let mesh_order = if meshes.is_empty() { 1 } else { meshes[0].mesh_order };
-
-                let mut particle = Particle::new(
-                    coord,
-                    &initial_warps[pi],
-                    vol,
-                    self.inc_no,
-                    mesh_order,
-                    self.track,
-                    self.image_0_path.clone(),
-                )?;
-
-                // Solve increment by increment so ref_update can vary per step.
-                for m in 0..expected {
-                    let ref_update = ref_updates.get(m).copied().unwrap_or(false);
-                    particle.solve_increment(m, &meshes[m], ref_update);
+        let (coordinates, volumes) = match distribution {
+            FieldDistribution::Explicit { coordinates, volumes } => {
+                if coordinates.ncols() != 2 {
+                    return Err(Error::InvalidInput(
+                        "coordinates must have 2 columns".to_string(),
+                    ));
                 }
-                particle.solved = true;
-                Ok(particle.finalize(&cfg))
+                if volumes.len() != coordinates.nrows() {
+                    return Err(Error::InvalidInput(format!(
+                        "volumes length {} does not match coordinates rows {}",
+                        volumes.len(), coordinates.nrows()
+                    )));
+                }
+                if volumes.iter().any(|&v| v <= 0.0) {
+                    return Err(Error::InvalidInput(
+                        "all volumes must be > 0".to_string(),
+                    ));
+                }
+                (coordinates, volumes)
+            }
+            FieldDistribution::FromBoundary { .. } => {
+                return Err(Error::InvalidInput(
+                    "FromBoundary distribution requires triangulation (not yet implemented at this level)".to_string(),
+                ));
+            }
+            FieldDistribution::FromSequence => {
+                let first = source.load_mesh_at(0)
+                    .map_err(|e| Error::InvalidInput(
+                        format!("failed to load first mesh: {e}"),
+                    ))?;
+                distribute_particles(&first.nodes, &first.elements, depth)
+            }
+        };
+
+        Ok(Field { source, coordinates, volumes, track, depth, solution: None })
+    }
+
+    pub fn n_particles(&self) -> usize { self.coordinates.nrows() }
+    pub fn inc_no(&self) -> usize {
+        if let Some(sol) = &self.solution { return sol.vol_totals.len(); }
+        self.source.n_meshes() + 1
+    }
+    pub fn image_0_path(&self) -> Option<&PathBuf> {
+        if let Some(sol) = &self.solution {
+            if sol.image_0_path.is_some() { return sol.image_0_path.as_ref(); }
+        }
+        self.source.first_f_img_path.as_ref()
+    }
+    pub fn solved(&self) -> bool { self.solution.is_some() }
+    pub fn solution(&self) -> Option<&FieldSolution> { self.solution.as_ref() }
+
+    /// Reconstruct a `Field` shell from a saved [`FieldSolution`].
+    ///
+    /// The resulting field is marked as solved.  The source is set to a dummy
+    /// `SequenceSolution` (no mesh data); only solution getters work.
+    pub fn from_solution(sol: FieldSolution) -> Self {
+        let dummy_source = Arc::new(SequenceSolution {
+            mesh_solutions: Vec::new(),
+            mesh_paths: Vec::new(),
+            solved: true,
+            unsolvable: false,
+            override_log: Vec::new(),
+            reference_updates: Vec::new(),
+            mesh_order: 1,
+            first_f_img_path: sol.image_0_path.clone(),
+        });
+        let n = sol.initial_coordinates.nrows();
+        let mut volumes = Array1::<f64>::zeros(n);
+        for (i, p) in sol.particles.iter().enumerate().take(n) {
+            if !p.volumes.is_empty() { volumes[i] = p.volumes[0]; }
+        }
+        let coordinates = sol.initial_coordinates.clone();
+        Field { source: dummy_source, coordinates, volumes, track: true, depth: 1.0,
+                solution: Some(sol) }
+    }
+
+    /// Solve strain paths for all particles.
+    ///
+    /// Iterates over increments sequentially, loading one mesh at a time.  For
+    /// saved-by-reference sequences each mesh file is read exactly once; all
+    /// particles advance their increment in parallel (rayon), then the mesh is
+    /// dropped before the next file is opened.
+    pub fn solve(&mut self, factor: f64, true_incs: bool, calibration: Option<&CalibrationParams>) -> Result<(), Error> {
+        let n = self.n_particles();
+        let n_meshes = self.source.n_meshes();
+        let cfg = ParticleConfig { factor, true_incs };
+        let mesh_order = self.source.mesh_order;
+        let initial_warp = vec![0.0f64; 6 * mesh_order as usize];
+        let source = Arc::clone(&self.source);
+
+        // Phase 1: create all particles with correctly-sized state arrays.
+        let mut particles: Vec<Particle> = (0..n)
+            .map(|pi| {
+                Particle::new(
+                    ParticleSource::Sequence(Arc::clone(&source)),
+                    [self.coordinates[[pi, 0]], self.coordinates[[pi, 1]]],
+                    &initial_warp,
+                    self.volumes[pi],
+                    self.track,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Convert initial coordinates to object space when calibration is active.
+        if let Some(params) = calibration {
+            for p in &mut particles {
+                let img = ndarray::array![[p.coordinates[[0, 0]], p.coordinates[[0, 1]]]];
+                let obj = params.i2o(img.view());
+                p.coordinates[[0, 0]] = obj[[0, 0]];
+                p.coordinates[[0, 1]] = obj[[0, 1]];
+            }
+        }
+
+        // Phase 2: one mesh at a time — load, solve all particles, drop.
+        for m in 0..n_meshes {
+            let mesh = source.load_mesh_at(m)?;
+            particles.par_iter_mut().for_each(|p| {
+                p.solve_increment(m, &mesh, calibration);
+            });
+        }
+
+        // Phase 3: finalize strain paths.
+        let calibrated = calibration.is_some();
+        let particle_solutions: Vec<ParticleSolution> = particles.iter()
+            .map(|p| {
+                let mut sol = p.finalize(&cfg);
+                sol.calibrated = calibrated;
+                sol
             })
             .collect();
 
-        // Propagate first error, if any.
-        let particle_solutions: Vec<ParticleSolution> = results
-            .into_iter()
-            .collect::<Result<_, _>>()?;
-
-        // Sum volumes across particles at each increment.
-        let mut vol_totals = Array1::<f64>::zeros(self.inc_no);
+        let mut vol_totals = Array1::<f64>::zeros(n_meshes + 1);
         for sol in &particle_solutions {
             for (i, &v) in sol.volumes.iter().enumerate() {
                 vol_totals[i] += v;
             }
         }
 
-        // Derive reference_update_register from ref_updates slice.
-        let reference_update_register: Vec<usize> = (0..expected)
-            .filter(|&m| ref_updates.get(m).copied().unwrap_or(false))
+        let reference_update_register: Vec<usize> = source
+            .reference_updates
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b)
+            .map(|(i, _)| i)
             .collect();
 
-        self.solved = true;
-        Ok(FieldSolution {
+        self.solution = Some(FieldSolution {
             particles: particle_solutions,
+            initial_coordinates: self.coordinates.clone(),
             vol_totals,
             reference_update_register,
-            image_0_path: self.image_0_path.clone(),
-        })
+            image_0_path: self.image_0_path().cloned(),
+            calibrated,
+        });
+        Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests (Phase 2)
+// Unit tests (Phase 6 — updated for new API)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{mesh::compute_centroids, sequence::SequenceSolution};
     use ndarray::array;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
-    // Shared test mesh: 4 nodes, 2 right-triangle elements (unit square)
     fn unit_square_mesh() -> (Array2<f64>, Array2<usize>) {
         let nodes = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let elems = array![[0usize, 1, 2], [1, 3, 2]];
@@ -303,6 +345,47 @@ mod tests {
 
     fn pure_translation_disps(u: f64, v: f64) -> Array2<f64> {
         array![[u, v], [u, v], [u, v], [u, v]]
+    }
+
+    fn make_mesh_sol(nodes: &Array2<f64>, elems: &Array2<usize>, disps: &Array2<f64>)
+        -> crate::mesh::MeshSolution
+    {
+        let centroids = compute_centroids(nodes, elems);
+        let n = nodes.nrows();
+        crate::mesh::MeshSolution {
+            nodes: nodes.clone(),
+            elements: elems.clone(),
+            boundary: (0..n).collect(),
+            exclusions: vec![],
+            centroids,
+            areas: Array1::from_vec(vec![0.5; elems.nrows()]),
+            warps: Array2::zeros((elems.nrows(), 12)),
+            displacements: disps.clone(),
+            c_zncc: Array1::ones(n),
+            p: Array2::zeros((n, 6)),
+            seed_node: 0,
+            mesh_order: 1,
+            subset_order: 1,
+            iterations: Array1::zeros(n),
+            norms: Array1::zeros(n),
+            f_img_path: PathBuf::new(),
+            g_img_path: PathBuf::new(),
+        }
+    }
+
+    fn make_seq(mesh_sols: Vec<crate::mesh::MeshSolution>, ref_updates: Vec<bool>)
+        -> Arc<SequenceSolution>
+    {
+        Arc::new(SequenceSolution {
+            mesh_solutions: mesh_sols,
+            mesh_paths: vec![],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: ref_updates,
+            mesh_order: 1,
+            first_f_img_path: None,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -325,7 +408,6 @@ mod tests {
     fn test_distribute_particles_volumes_unit_square() {
         let (nodes, elems) = unit_square_mesh();
         let (_, vols) = distribute_particles(&nodes, &elems, 1.0);
-        // Two right triangles tiling unit square → each area = 0.5
         assert!((vols[0] - 0.5).abs() < 1e-12, "vol[0]={}", vols[0]);
         assert!((vols[1] - 0.5).abs() < 1e-12, "vol[1]={}", vols[1]);
     }
@@ -349,22 +431,18 @@ mod tests {
 
     #[test]
     fn test_distribute_particles_single_triangle() {
-        // Equilateral-ish: (0,0),(2,0),(1,1) → area = 1.0
         let nodes = array![[0.0, 0.0], [2.0, 0.0], [1.0, 1.0]];
         let elems = array![[0usize, 1, 2]];
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        let expected_centroid = [1.0, 1.0 / 3.0];
-        assert!((coords[[0, 0]] - expected_centroid[0]).abs() < 1e-12);
-        assert!((coords[[0, 1]] - expected_centroid[1]).abs() < 1e-12);
+        assert!((coords[[0, 0]] - 1.0).abs() < 1e-12);
+        assert!((coords[[0, 1]] - 1.0/3.0).abs() < 1e-12);
         assert!((vols[0] - 1.0).abs() < 1e-12, "area={}", vols[0]);
     }
 
     #[test]
     fn test_distribute_particles_uses_only_corner_nodes() {
-        // Order-2 element columns: only first 3 used
         let (nodes, _) = unit_square_mesh();
         let elems_o1 = array![[0usize, 1, 2], [1, 3, 2]];
-        // Fabricate order-2 elements with dummy midpoint columns
         let elems_o2 = array![[0usize, 1, 2, 0, 0, 0], [1, 3, 2, 0, 0, 0]];
         let (coords_o1, vols_o1) = distribute_particles(&nodes, &elems_o1, 1.0);
         let (coords_o2, vols_o2) = distribute_particles(&nodes, &elems_o2, 1.0);
@@ -378,81 +456,73 @@ mod tests {
     // Field::new validation
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_field_new_valid() {
+    fn single_mesh_seq(disps: &Array2<f64>) -> Arc<SequenceSolution> {
         let (nodes, elems) = unit_square_mesh();
-        let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        let f = Field::new(coords, vols, true, 1.0, 3, None);
+        make_seq(vec![make_mesh_sol(&nodes, &elems, disps)], vec![false])
+    }
+
+    fn two_mesh_seq(disps: &Array2<f64>, ref_updates: Vec<bool>) -> Arc<SequenceSolution> {
+        let (nodes, elems) = unit_square_mesh();
+        make_seq(
+            vec![make_mesh_sol(&nodes, &elems, disps), make_mesh_sol(&nodes, &elems, disps)],
+            ref_updates,
+        )
+    }
+
+    #[test]
+    fn test_field_new_from_sequence_valid() {
+        let seq = single_mesh_seq(&Array2::<f64>::zeros((4, 2)));
+        let f = Field::new(Arc::clone(&seq), FieldDistribution::FromSequence, true, 1.0);
         assert!(f.is_ok());
         let f = f.unwrap();
         assert_eq!(f.n_particles(), 2);
-        assert!(!f.solved);
+        assert!(!f.solved());
     }
 
     #[test]
-    fn test_field_new_wrong_volumes_length() {
+    fn test_field_new_explicit_wrong_volumes_length() {
+        let seq = single_mesh_seq(&Array2::<f64>::zeros((4, 2)));
         let (nodes, elems) = unit_square_mesh();
         let (coords, _) = distribute_particles(&nodes, &elems, 1.0);
-        let vols = array![0.5]; // 1 volume for 2 particles
-        assert!(Field::new(coords, vols, true, 1.0, 3, None).is_err());
+        let vols = array![0.5f64];
+        let dist = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
+        assert!(Field::new(seq, dist, true, 1.0).is_err());
     }
 
     #[test]
-    fn test_field_new_zero_volume() {
+    fn test_field_new_explicit_zero_volume() {
+        let seq = single_mesh_seq(&Array2::<f64>::zeros((4, 2)));
         let (nodes, elems) = unit_square_mesh();
         let (coords, _) = distribute_particles(&nodes, &elems, 1.0);
-        let vols = array![0.0, 0.5]; // zero volume
-        assert!(Field::new(coords, vols, true, 1.0, 3, None).is_err());
+        let vols = array![0.0f64, 0.5];
+        let dist = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
+        assert!(Field::new(seq, dist, true, 1.0).is_err());
     }
 
     #[test]
-    fn test_field_new_inc_no_too_small() {
-        let (nodes, elems) = unit_square_mesh();
-        let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        assert!(Field::new(coords, vols, true, 1.0, 1, None).is_err()); // inc_no = 1 < 2
+    fn test_field_new_bad_depth() {
+        let seq = single_mesh_seq(&Array2::<f64>::zeros((4, 2)));
+        assert!(Field::new(seq, FieldDistribution::FromSequence, true, 0.0).is_err());
     }
 
     // -----------------------------------------------------------------------
     // Field::solve integration tests — Tier B (rtol = 1e-8)
     // -----------------------------------------------------------------------
 
-    fn make_field(inc_no: usize) -> Field {
-        let (nodes, elems) = unit_square_mesh();
-        let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        Field::new(coords, vols, true, 1.0, inc_no, None).unwrap()
-    }
-
-    fn make_mesh_data<'a>(
-        nodes: &'a Array2<f64>,
-        elements: &'a Array2<usize>,
-        disps: &'a Array2<f64>,
-    ) -> MeshData<'a> {
-        MeshData {
-            nodes,
-            elements,
-            displacements: disps,
-            mesh_order: 1,
-        }
+    fn make_field_from_seq(seq: Arc<SequenceSolution>, track: bool) -> Field {
+        Field::new(seq, FieldDistribution::FromSequence, track, 1.0).unwrap()
     }
 
     #[test]
     fn test_field_solve_pure_translation_no_strain() {
-        let (nodes, elems) = unit_square_mesh();
         let disps = pure_translation_disps(0.3, 0.1);
-        let cm = make_mesh_data(&nodes, &elems, &disps);
-        let meshes = vec![cm];
-
-        let mut field = make_field(2); // 2 frames → 1 increment
-        let sol = field.solve(&meshes, &[], 1.0, true).unwrap();
-
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        field.solve(1.0, true, None).unwrap();
+        let sol = field.solution().unwrap();
         assert_eq!(sol.particles.len(), 2);
         for p in &sol.particles {
-            // Pure translation → all strain components ≈ 0
             for j in 2..6 {
-                assert!(
-                    p.warps[[1, j]].abs() < 1e-10,
-                    "warp[1,{j}]={}", p.warps[[1, j]]
-                );
+                assert!(p.warps[[1, j]].abs() < 1e-10, "warp[1,{j}]={}", p.warps[[1, j]]);
             }
         }
     }
@@ -462,20 +532,17 @@ mod tests {
         let (nodes, elems) = unit_square_mesh();
         let u = 0.25_f64;
         let disps = pure_translation_disps(u, 0.0);
-        let cm = make_mesh_data(&nodes, &elems, &disps);
-
-        // Track = true (Lagrangian) → coordinates move
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
         let initial_coords = coords.clone();
-        let mut field = Field::new(coords, vols, true, 1.0, 2, None).unwrap();
-        let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true).unwrap();
-
+        let seq = single_mesh_seq(&disps);
+        let dist = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
+        let mut field = Field::new(Arc::clone(&seq), dist, true, 1.0).unwrap();
+        field.solve(1.0, true, None).unwrap();
+        let sol = field.solution().unwrap();
         for (pi, p) in sol.particles.iter().enumerate() {
             assert!(
                 (p.coordinates[[1, 0]] - (initial_coords[[pi, 0]] + u)).abs() < 1e-10,
-                "particle {pi} x={}, expected {}",
-                p.coordinates[[1, 0]],
-                initial_coords[[pi, 0]] + u
+                "particle {pi} x={}", p.coordinates[[1, 0]]
             );
         }
     }
@@ -484,12 +551,13 @@ mod tests {
     fn test_field_solve_eulerian_coordinates_fixed() {
         let (nodes, elems) = unit_square_mesh();
         let disps = pure_translation_disps(0.3, -0.1);
-
         let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
         let initial_coords = coords.clone();
-        let mut field = Field::new(coords, vols, false, 1.0, 2, None).unwrap(); // track = false
-        let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true).unwrap();
-
+        let seq = single_mesh_seq(&disps);
+        let dist = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
+        let mut field = Field::new(seq, dist, false, 1.0).unwrap();
+        field.solve(1.0, true, None).unwrap();
+        let sol = field.solution().unwrap();
         for (pi, p) in sol.particles.iter().enumerate() {
             assert!(
                 (p.coordinates[[1, 0]] - initial_coords[[pi, 0]]).abs() < 1e-12,
@@ -500,109 +568,211 @@ mod tests {
 
     #[test]
     fn test_field_solve_vol_totals_shape() {
-        let (nodes, elems) = unit_square_mesh();
         let disps = Array2::<f64>::zeros((4, 2));
-        let mut field = make_field(3); // 3 frames → 2 increments
-        let meshes = vec![
-            make_mesh_data(&nodes, &elems, &disps),
-            make_mesh_data(&nodes, &elems, &disps),
-        ];
-        let sol = field.solve(&meshes, &[], 0.0, true).unwrap();
-        assert_eq!(sol.vol_totals.len(), 3);
+        let mut field = make_field_from_seq(two_mesh_seq(&disps, vec![false, false]), true);
+        field.solve(1.0, true, None).unwrap();
+        assert_eq!(field.solution().unwrap().vol_totals.len(), 3);
     }
 
     #[test]
     fn test_field_solve_vol_totals_pure_translation() {
-        // Pure translation → volume unchanged per particle → vol_totals constant
         let (nodes, elems) = unit_square_mesh();
         let disps = pure_translation_disps(0.2, 0.0);
-        let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
+        let (_, vols) = distribute_particles(&nodes, &elems, 1.0);
         let total_initial = vols.sum();
-
-        let mut field = Field::new(coords, vols, true, 1.0, 2, None).unwrap();
-        let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 0.0, true).unwrap();
-
-        // vol_totals[0] and [1] should both ≈ total_initial
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        field.solve(1.0, true, None).unwrap();
+        let sol = field.solution().unwrap();
         assert!((sol.vol_totals[0] - total_initial).abs() < 1e-10, "vt[0]={}", sol.vol_totals[0]);
         assert!((sol.vol_totals[1] - total_initial).abs() < 1e-10, "vt[1]={}", sol.vol_totals[1]);
     }
 
     #[test]
     fn test_field_solve_sets_solved_flag() {
-        let (nodes, elems) = unit_square_mesh();
         let disps = Array2::<f64>::zeros((4, 2));
-        let mut field = make_field(2);
-        assert!(!field.solved);
-        field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true).unwrap();
-        assert!(field.solved);
-    }
-
-    #[test]
-    fn test_field_solve_wrong_mesh_count() {
-        let (nodes, elems) = unit_square_mesh();
-        let disps = Array2::<f64>::zeros((4, 2));
-        let mut field = make_field(3); // needs 2 meshes
-        // Supply only 1 mesh → error
-        let result = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true);
-        assert!(result.is_err());
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        assert!(!field.solved());
+        field.solve(1.0, true, None).unwrap();
+        assert!(field.solved());
     }
 
     #[test]
     fn test_field_solve_ref_update_register() {
-        let (nodes, elems) = unit_square_mesh();
         let disps = Array2::<f64>::zeros((4, 2));
-        let meshes = vec![
-            make_mesh_data(&nodes, &elems, &disps),
-            make_mesh_data(&nodes, &elems, &disps),
-        ];
-        let mut field = make_field(3);
-        // Mark step 1 as a reference update
-        let sol = field.solve(&meshes, &[false, true], 1.0, true).unwrap();
-        assert_eq!(sol.reference_update_register, vec![1]);
+        let mut field = make_field_from_seq(two_mesh_seq(&disps, vec![false, true]), true);
+        field.solve(1.0, true, None).unwrap();
+        assert_eq!(field.solution().unwrap().reference_update_register, vec![1]);
     }
 
     #[test]
     fn test_field_solve_particle_count() {
-        let (nodes, elems) = unit_square_mesh();
         let disps = Array2::<f64>::zeros((4, 2));
-        let mut field = make_field(2);
-        let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 1.0, true).unwrap();
-        assert_eq!(sol.particles.len(), 2);
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        field.solve(1.0, true, None).unwrap();
+        assert_eq!(field.solution().unwrap().particles.len(), 2);
     }
 
     #[test]
     fn test_field_solve_x_stretch_eps_xx() {
-        // 10% x-stretch: node displacement proportional to x coordinate
         let nodes = array![[0.0, 0.0_f64], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let elems = array![[0usize, 1, 2], [1, 3, 2]];
         let disps = array![[0.0, 0.0_f64], [0.1, 0.0], [0.0, 0.0], [0.1, 0.0]];
-
-        let (coords, vols) = distribute_particles(&nodes, &elems, 1.0);
-        let mut field = Field::new(coords, vols, true, 1.0, 2, None).unwrap();
-        let sol = field.solve(&[make_mesh_data(&nodes, &elems, &disps)], &[], 0.0, true).unwrap();
-
-        // For a uniform x-stretch of 10%, warp_inc[2] = du/dx ≈ 0.1 for each particle
+        let seq = make_seq(vec![make_mesh_sol(&nodes, &elems, &disps)], vec![false]);
+        let mut field = make_field_from_seq(seq, true);
+        field.solve(1.0, true, None).unwrap();
+        let sol = field.solution().unwrap();
         for p in &sol.particles {
-            assert!(
-                (p.incs[[1, 2]] - 0.1).abs() < 1e-8,
-                "incs[1,2]={}", p.incs[[1, 2]]
-            );
+            assert!((p.incs[[1, 2]] - 0.1).abs() < 1e-8, "incs[1,2]={}", p.incs[[1, 2]]);
         }
     }
 
     #[test]
     fn test_field_solve_two_increments() {
-        let (nodes, elems) = unit_square_mesh();
         let disps = pure_translation_disps(0.1, 0.0);
-        let meshes = vec![
-            make_mesh_data(&nodes, &elems, &disps),
-            make_mesh_data(&nodes, &elems, &disps),
-        ];
-        let mut field = make_field(3); // 3 frames → 2 increments
-        let sol = field.solve(&meshes, &[], 1.0, true).unwrap();
-        // Each particle: 3 frames → coordinates (3, 2)
+        let mut field = make_field_from_seq(two_mesh_seq(&disps, vec![false, false]), true);
+        field.solve(1.0, true, None).unwrap();
+        let sol = field.solution().unwrap();
         for p in &sol.particles {
             assert_eq!(p.coordinates.nrows(), 3);
         }
+    }
+
+    #[test]
+    fn test_field_solution_initial_coordinates() {
+        let disps = Array2::<f64>::zeros((4, 2));
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        let initial = field.coordinates.clone();
+        field.solve(1.0, true, None).unwrap();
+        assert_eq!(field.solution().unwrap().initial_coordinates, initial);
+    }
+
+    // -----------------------------------------------------------------------
+    // Saved-by-reference: Field::new and Field::solve load from disk
+    // -----------------------------------------------------------------------
+
+    fn make_saved_by_ref_field_seq(
+        tag: &str,
+        mesh_sols: Vec<crate::mesh::MeshSolution>,
+        ref_updates: Vec<bool>,
+    ) -> (Arc<SequenceSolution>, Vec<std::path::PathBuf>) {
+        let paths: Vec<_> = mesh_sols.iter().enumerate().map(|(i, _)| {
+            std::env::temp_dir().join(format!("geopyv_test_field_{tag}_{i}.pyv"))
+        }).collect();
+        for (i, ms) in mesh_sols.iter().enumerate() {
+            crate::io::save(&paths[i], &crate::io::GeopyvObject::Mesh(ms.clone())).unwrap();
+        }
+        let sol = Arc::new(SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: paths.clone(),
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: ref_updates,
+            mesh_order: 1,
+            first_f_img_path: None,
+        });
+        (sol, paths)
+    }
+
+    #[test]
+    fn test_field_new_saved_by_reference() {
+        let (nodes, elems) = unit_square_mesh();
+        let disps = pure_translation_disps(0.0, 0.0);
+        let ms = make_mesh_sol(&nodes, &elems, &disps);
+        let (seq, paths) = make_saved_by_ref_field_seq("new_sbr", vec![ms], vec![false]);
+
+        let f = Field::new(Arc::clone(&seq), FieldDistribution::FromSequence, true, 1.0);
+        assert!(f.is_ok(), "Field::new should succeed for saved-by-reference sequence");
+        assert_eq!(f.unwrap().n_particles(), 2);
+
+        for p in paths { let _ = std::fs::remove_file(p); }
+    }
+
+    #[test]
+    fn test_field_new_empty_saved_by_reference_returns_err() {
+        let seq = Arc::new(SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: vec![],
+            solved: false,
+            unsolvable: true,
+            override_log: vec![],
+            reference_updates: vec![],
+            mesh_order: 1,
+            first_f_img_path: None,
+        });
+        assert!(Field::new(seq, FieldDistribution::FromSequence, true, 1.0).is_err());
+    }
+
+    #[test]
+    fn test_field_solve_saved_by_reference_pure_translation() {
+        let (nodes, elems) = unit_square_mesh();
+        let u = 0.25_f64;
+        let disps = pure_translation_disps(u, 0.0);
+        let ms = make_mesh_sol(&nodes, &elems, &disps);
+        let (seq, paths) = make_saved_by_ref_field_seq("pt_sbr", vec![ms], vec![false]);
+
+        let mut field = make_field_from_seq(Arc::clone(&seq), true);
+        field.solve(1.0, true, None).unwrap();
+
+        let sol = field.solution().unwrap();
+        assert_eq!(sol.particles.len(), 2);
+        for p in &sol.particles {
+            for j in 2..6 {
+                assert!(p.warps[[1, j]].abs() < 1e-9, "warp[1,{j}]={}", p.warps[[1, j]]);
+            }
+        }
+
+        for path in paths { let _ = std::fs::remove_file(path); }
+    }
+
+    #[test]
+    fn test_field_solve_saved_by_reference_two_increments() {
+        let (nodes, elems) = unit_square_mesh();
+        let disps = pure_translation_disps(0.1, 0.0);
+        let ms0 = make_mesh_sol(&nodes, &elems, &disps);
+        let ms1 = make_mesh_sol(&nodes, &elems, &disps);
+        let (seq, paths) =
+            make_saved_by_ref_field_seq("two_incr", vec![ms0, ms1], vec![false, false]);
+
+        let mut field = make_field_from_seq(Arc::clone(&seq), true);
+        field.solve(1.0, true, None).unwrap();
+
+        let sol = field.solution().unwrap();
+        for p in &sol.particles {
+            assert_eq!(p.coordinates.nrows(), 3);
+        }
+
+        for path in paths { let _ = std::fs::remove_file(path); }
+    }
+
+    #[test]
+    fn test_field_solve_matches_in_memory_and_saved_by_reference() {
+        // Both modes must produce identical strain increments.
+        let (nodes, elems) = unit_square_mesh();
+        let disps = array![[0.0, 0.0_f64], [0.1, 0.0], [0.0, 0.0], [0.1, 0.0]];
+        let ms = make_mesh_sol(&nodes, &elems, &disps);
+
+        // In-memory solve
+        let seq_mem = make_seq(vec![ms.clone()], vec![false]);
+        let mut field_mem = make_field_from_seq(seq_mem, true);
+        field_mem.solve(0.0, true, None).unwrap();
+        let sol_mem = field_mem.solution().unwrap();
+
+        // Saved-by-reference solve
+        let (seq_sbr, paths) =
+            make_saved_by_ref_field_seq("match_sbr", vec![ms], vec![false]);
+        let mut field_sbr = make_field_from_seq(Arc::clone(&seq_sbr), true);
+        field_sbr.solve(0.0, true, None).unwrap();
+        let sol_sbr = field_sbr.solution().unwrap();
+
+        for (pm, ps) in sol_mem.particles.iter().zip(sol_sbr.particles.iter()) {
+            for j in 0..6 {
+                assert!((pm.incs[[1, j]] - ps.incs[[1, j]]).abs() < 1e-12,
+                    "particle incs mismatch at j={j}: mem={} sbr={}",
+                    pm.incs[[1, j]], ps.incs[[1, j]]);
+            }
+        }
+
+        for path in paths { let _ = std::fs::remove_file(path); }
     }
 }

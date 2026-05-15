@@ -1,4 +1,6 @@
+mod py_calibration;
 mod py_image;
+mod py_speckle;
 mod py_mask;
 mod py_geometry;
 mod py_subset;
@@ -35,6 +37,7 @@ impl From<Error> for PyErr {
 /// geopyv_dev extension module.
 #[pymodule]
 fn _geopyv_dev(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    py_calibration::register(m)?;
     py_image::register(m)?;
     py_mask::register(m)?;
     py_geometry::register(m)?;
@@ -45,5 +48,6 @@ fn _geopyv_dev(m: &Bound<'_, PyModule>) -> PyResult<()> {
     py_sequence::register(m)?;
     py_io::register(m)?;
     py_validation::register(m)?;
+    py_speckle::register(m)?;
     Ok(())
 }

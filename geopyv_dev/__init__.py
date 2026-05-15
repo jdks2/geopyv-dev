@@ -1,6 +1,8 @@
 from ._geopyv_dev import *
 import geopyv_dev._geopyv_dev as _core
 
+from .calibration import Calibration, CalibrationParams
+
 from .plots import (
     inspect_subset,
     inspect_mesh,
@@ -12,13 +14,17 @@ from .plots import (
     convergence_sequence,
     contour_mesh,
     contour_field,
+    standard_error_validation,
+    mean_error_validation,
+    noise_standard_error_validation,
+    noise_mean_error_validation,
+    strain_error_validation,
+    spatial_error_validation,
 )
 from .wrappers import (
     SubsetWrapper,
     MeshWrapper,
-    SequenceSolutionWrapper,
     ParticleWrapper,
-    FieldWrapper,
 )
 
 
@@ -32,10 +38,12 @@ def _wrap(raw):
         return Subset._new_from_inner(raw)
     if isinstance(raw, _core.Mesh):
         return Mesh._new_from_inner(raw)
-    if isinstance(raw, _core.SequenceSolution):
-        return SequenceSolutionWrapper(raw)
-    if isinstance(raw, _core.FieldSolution):
-        return FieldWrapper(raw)
+    if isinstance(raw, _core.Sequence):
+        return Sequence._new_from_inner(raw)
+    if isinstance(raw, _core.Particle):
+        return Particle._new_from_inner(raw)
+    if isinstance(raw, _core.Field):
+        return Field._new_from_inner(raw)
     if isinstance(raw, _core.ParticleSolution):
         return ParticleWrapper(raw)
     return raw
@@ -166,7 +174,7 @@ class Mesh:
 
 
 class Sequence:
-    """Multi-pair DIC sequence. solve() returns a SequenceSolutionWrapper."""
+    """Multi-pair DIC sequence. solve() mutates in place and returns None."""
 
     def __init__(self, image_dir, boundary, target_nodes,
                  size=(1.0, 1000.0), exclusions=None, mesh_order=2):
@@ -175,6 +183,12 @@ class Sequence:
             size=size, exclusions=exclusions, mesh_order=mesh_order,
         )
 
+    @classmethod
+    def _new_from_inner(cls, inner):
+        obj = cls.__new__(cls)
+        obj._inner = inner
+        return obj
+
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
@@ -182,14 +196,56 @@ class Sequence:
         return repr(self._inner)
 
     def solve(self, *args, **kwargs):
-        return SequenceSolutionWrapper(self._inner.solve(*args, **kwargs))
+        self._inner.solve(*args, **kwargs)
+
+    @property
+    def mesh_solutions(self):
+        return [MeshWrapper(m) for m in self._inner.mesh_solutions]
+
+    @property
+    def solved(self):
+        return self._inner.solved
+
+    @property
+    def unsolvable(self):
+        return self._inner.unsolvable
+
+    @property
+    def override_log(self):
+        return self._inner.override_log
+
+    @property
+    def reference_updates(self):
+        return self._inner.reference_updates
+
+    @property
+    def mesh_paths(self):
+        return self._inner.mesh_paths
+
+    def inspect(self, mesh_idx, **kwargs):
+        return inspect_sequence(self, mesh_idx=mesh_idx, **kwargs)
+
+    def convergence(self, mesh_idx=None, quantity="C_ZNCC", **kwargs):
+        return convergence_sequence(self, mesh_idx=mesh_idx, quantity=quantity, **kwargs)
+
+    def save(self, path):
+        _core.save(path, self._inner)
 
 
 class Field:
-    """Particle field. solve() returns a FieldWrapper with inspect/contour."""
+    """Particle field built from a solved Sequence. solve() mutates in place and returns None."""
 
-    def __init__(self, *args, **kwargs):
-        self._inner = _core.Field(*args, **kwargs)
+    def __init__(self, sequence_solution, track=True, depth=1.0,
+                 coordinates=None, volumes=None):
+        raw = getattr(sequence_solution, '_inner', sequence_solution)
+        self._inner = _core.Field(raw, track=track, depth=depth,
+                                  coordinates=coordinates, volumes=volumes)
+
+    @classmethod
+    def _new_from_inner(cls, inner):
+        obj = cls.__new__(cls)
+        obj._inner = inner
+        return obj
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -197,15 +253,36 @@ class Field:
     def __repr__(self):
         return repr(self._inner)
 
-    def solve(self, *args, **kwargs):
-        return FieldWrapper(self._inner.solve(*args, **kwargs))
+    def solve(self, factor=0.0, true_incs=True, calibration=None):
+        cal = getattr(calibration, '_inner', calibration)
+        self._inner.solve(factor=factor, true_incs=true_incs, calibration=cal)
+
+    @property
+    def particles(self):
+        return [ParticleWrapper(p) for p in self._inner.particles]
+
+    def inspect(self, **kwargs):
+        return inspect_field(self, **kwargs)
+
+    def contour(self, quantity, **kwargs):
+        return contour_field(self, quantity, **kwargs)
+
+    def save(self, path):
+        _core.save(path, self._inner)
 
 
 class Particle:
-    """Lagrangian/Eulerian particle. solve() returns a ParticleWrapper."""
+    """Lagrangian/Eulerian particle. solve() mutates in place and returns None."""
 
-    def __init__(self, *args, **kwargs):
-        self._inner = _core.Particle(*args, **kwargs)
+    def __init__(self, source, coordinate, initial_warp=None, track=True):
+        raw = getattr(source, '_inner', source)
+        self._inner = _core.Particle(raw, coordinate, initial_warp=initial_warp, track=track)
+
+    @classmethod
+    def _new_from_inner(cls, inner):
+        obj = cls.__new__(cls)
+        obj._inner = inner
+        return obj
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -213,8 +290,59 @@ class Particle:
     def __repr__(self):
         return repr(self._inner)
 
-    def solve(self, *args, **kwargs):
-        return ParticleWrapper(self._inner.solve(*args, **kwargs))
+    def solve(self, factor=0.0, true_incs=True, calibration=None):
+        cal = getattr(calibration, '_inner', calibration)
+        self._inner.solve(factor=factor, true_incs=true_incs, calibration=cal)
 
-    def solve_increment(self, *args, **kwargs):
-        return self._inner.solve_increment(*args, **kwargs)
+    def solve_increment(self, m):
+        return self._inner.solve_increment(m)
+
+    def inspect(self, **kwargs):
+        return inspect_particle(self._inner, **kwargs)
+
+    def save(self, path):
+        _core.save(path, self._inner)
+
+
+class Validation:
+    """Validation of DIC results against ground-truth Speckle warps."""
+
+    def __init__(self, speckle, fields, labels):
+        raw_speckle = getattr(speckle, '_inner', speckle)
+        raw_fields  = [getattr(f, '_inner', f) for f in fields]
+        self._inner = _core.Validation(raw_speckle, raw_fields, labels)
+        self._solution = None
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def solve(self, cumulative=True, skim=None):
+        self._solution = self._inner.solve(cumulative=cumulative, skim=skim)
+
+    def standard_error(self, component, **kwargs):
+        self._check_solved()
+        return standard_error_validation(self._solution, component, **kwargs)
+
+    def mean_error(self, component, **kwargs):
+        self._check_solved()
+        return mean_error_validation(self._solution, component, **kwargs)
+
+    def noise_standard_error(self, component, **kwargs):
+        self._check_solved()
+        return noise_standard_error_validation(self._solution, component, **kwargs)
+
+    def noise_mean_error(self, component, **kwargs):
+        self._check_solved()
+        return noise_mean_error_validation(self._solution, component, **kwargs)
+
+    def strain_error(self, **kwargs):
+        self._check_solved()
+        return strain_error_validation(self._solution, **kwargs)
+
+    def spatial_error(self, field_index, time_index, **kwargs):
+        self._check_solved()
+        return spatial_error_validation(self._solution, field_index, time_index, **kwargs)
+
+    def _check_solved(self):
+        if self._solution is None:
+            raise RuntimeError("call solve() first")

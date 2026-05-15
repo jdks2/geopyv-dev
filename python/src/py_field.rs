@@ -1,22 +1,16 @@
 //! PyO3 wrapper for `geopyv_dev::field`.
-//!
-//! Exposes:
-//! - `Field` class: constructed with initial particle state, runs `solve`.
-//! - `FieldSolution` class: read-only result from `Field.solve`.
-//! - `field_distribute_particles` free function.
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
-use geopyv_dev::{
-    field::{self, Field, FieldSolution},
-    particle::MeshData,
-};
+use geopyv_dev::field::{self, Field, FieldDistribution, FieldSolution};
+use ndarray::Array2;
 
-use crate::{py_particle::PyParticleSolution, Error};
+use geopyv_dev::sequence::SequenceSolution;
+
+use crate::{py_calibration::PyCalibrationParams, py_mesh::PyMesh, py_particle::PyParticleSolution, py_sequence::PySequence, Error};
 
 // ---------------------------------------------------------------------------
 // FieldSolution class
@@ -30,50 +24,35 @@ pub struct PyFieldSolution {
 
 #[pymethods]
 impl PyFieldSolution {
-    /// Per-particle solutions as a list of :class:`ParticleSolution`.
     #[getter]
     fn particles(&self) -> Vec<PyParticleSolution> {
-        self.inner
-            .particles
-            .iter()
-            .map(|p| PyParticleSolution { inner: p.clone() })
-            .collect()
+        self.inner.particles.iter().map(|p| PyParticleSolution { inner: p.clone() }).collect()
     }
 
-    /// Sum of all particle volumes at each increment, shape ``(inc_no,)``.
     #[getter]
     fn vol_totals<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.vol_totals.clone().into_pyarray_bound(py)
     }
 
-    /// Increment indices at which the reference mesh was updated.
     #[getter]
     fn reference_update_register(&self) -> Vec<i64> {
-        self.inner
-            .reference_update_register
-            .iter()
-            .map(|&x| x as i64)
-            .collect()
+        self.inner.reference_update_register.iter().map(|&x| x as i64).collect()
     }
 
-    /// Initial coordinates of all particles (row 0 of each particle's coordinate array), shape ``(N, 2)``.
+    /// Initial coordinates of all particles ``(N, 2)``.
     #[getter]
     fn coordinates<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let n = self.inner.particles.len();
-        let mut coords = ndarray::Array2::<f64>::zeros((n, 2));
-        for (i, p) in self.inner.particles.iter().enumerate() {
-            if p.coordinates.nrows() > 0 {
-                coords[[i, 0]] = p.coordinates[[0, 0]];
-                coords[[i, 1]] = p.coordinates[[0, 1]];
-            }
-        }
-        coords.into_pyarray_bound(py)
+        self.inner.initial_coordinates.clone().into_pyarray_bound(py)
     }
 
-    /// Path of the initial (reference) image, or ``None``.
     #[getter]
     fn image_0_path(&self) -> Option<String> {
         self.inner.image_0_path.as_ref().map(|p| p.to_string_lossy().into_owned())
+    }
+
+    #[getter]
+    fn calibrated(&self) -> bool {
+        self.inner.calibrated
     }
 
     fn __repr__(&self) -> String {
@@ -93,162 +72,168 @@ impl PyFieldSolution {
 ///
 /// Parameters
 /// ----------
-/// coordinates : numpy.ndarray, shape (N, 2), float64
-///     Initial particle positions.
-/// volumes : numpy.ndarray, shape (N,), float64
-///     Initial particle volumes; all must be > 0.
+/// sequence_solution : Sequence or Mesh
+///     Solved sequence or single solved mesh providing the DIC increment data.
+///     A ``Mesh`` is wrapped internally as a one-increment sequence.
 /// track : bool, optional
 ///     ``True`` for Lagrangian (coordinates move). Default ``True``.
 /// depth : float, optional
 ///     Depth multiplier; must be > 0. Default 1.0.
-/// inc_no : int
-///     Total number of frames (≥ 2).
+/// coordinates : numpy.ndarray (N, 2), optional
+///     Explicit initial particle positions.
+/// volumes : numpy.ndarray (N,), optional
+///     Explicit initial particle volumes (required with ``coordinates``).
 #[pyclass(name = "Field")]
 pub struct PyField {
-    inner: Field,
+    pub(crate) inner: Field,
 }
 
 #[pymethods]
 impl PyField {
     #[new]
-    #[pyo3(signature = (coordinates, volumes, inc_no, track=true, depth=1.0, image_0_path=None))]
+    #[pyo3(signature = (sequence_solution, track=true, depth=1.0,
+                         coordinates=None, volumes=None))]
     fn new(
-        coordinates: PyReadonlyArray2<f64>,
-        volumes: PyReadonlyArray1<f64>,
-        inc_no: usize,
+        sequence_solution: &Bound<'_, PyAny>,
         track: bool,
         depth: f64,
-        image_0_path: Option<String>,
+        coordinates: Option<PyReadonlyArray2<f64>>,
+        volumes: Option<PyReadonlyArray1<f64>>,
     ) -> PyResult<Self> {
-        let c = coordinates.as_array().to_owned();
-        let v = volumes.as_array().to_owned();
-        let path = image_0_path.map(PathBuf::from);
-        let f = Field::new(c, v, track, depth, inc_no, path).map_err(Error::from)?;
+        let source: Arc<SequenceSolution> =
+            if let Ok(seq) = sequence_solution.extract::<PyRef<PySequence>>() {
+                let sol = seq.solution.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Sequence has not been solved")
+                })?;
+                Arc::new(sol.clone())
+            } else if let Ok(mesh) = sequence_solution.extract::<PyRef<PyMesh>>() {
+                let mesh_sol = mesh.solution.as_ref().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err("Mesh has not been solved")
+                })?;
+                Arc::new(SequenceSolution {
+                    mesh_solutions: vec![mesh_sol.clone()],
+                    mesh_paths: vec![],
+                    solved: true,
+                    unsolvable: false,
+                    override_log: vec![],
+                    reference_updates: vec![false],
+                    mesh_order: mesh_sol.mesh_order,
+                    first_f_img_path: Some(mesh_sol.f_img_path.clone()),
+                })
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "sequence_solution must be a solved Sequence or a solved Mesh",
+                ));
+            };
+        let distribution = match (coordinates, volumes) {
+            (Some(c), Some(v)) => FieldDistribution::Explicit {
+                coordinates: c.as_array().to_owned(),
+                volumes: v.as_array().to_owned(),
+            },
+            (None, None) => FieldDistribution::FromSequence,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                "coordinates and volumes must both be supplied or both omitted",
+            )),
+        };
+        let f = Field::new(source, distribution, track, depth).map_err(Error::from)?;
         Ok(PyField { inner: f })
     }
 
-    /// Solve strain paths for all particles over a sequence of mesh increments.
+    /// Solve strain paths for all particles.
     ///
     /// Parameters
     /// ----------
-    /// nodes_list : list[numpy.ndarray]
-    ///     One ``(N_m, 2)`` float64 array per increment.
-    /// elements_list : list[numpy.ndarray]
-    ///     One ``(M_m, 3 or 6)`` int64 array per increment.
-    /// displacements_list : list[numpy.ndarray]
-    ///     One ``(N_m, 2)`` float64 array per increment.
-    /// mesh_order_list : list[int]
-    ///     One ``mesh_order`` (1 or 2) per increment.
-    /// ref_updates : list[bool], optional
-    ///     One ``bool`` per increment; ``True`` if the reference mesh changed.
-    ///     If empty or omitted, all steps use ``False``. Default ``[]``.
     /// factor : float, optional
-    ///     Volumetric correction factor passed to strain computation. Default 1.0.
+    ///     Volumetric correction factor. Default 0.0.
     /// true_incs : bool, optional
     ///     Logarithmic strain increments. Default ``True``.
-    ///
-    /// Returns
-    /// -------
-    /// FieldSolution
-    #[pyo3(signature = (nodes_list, elements_list, displacements_list, mesh_order_list,
-                         ref_updates=None, factor=1.0, true_incs=true))]
+    #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None))]
     fn solve(
         &mut self,
-        nodes_list: Vec<PyReadonlyArray2<f64>>,
-        elements_list: Vec<PyReadonlyArray2<i64>>,
-        displacements_list: Vec<PyReadonlyArray2<f64>>,
-        mesh_order_list: Vec<u8>,
-        ref_updates: Option<Vec<bool>>,
         factor: f64,
         true_incs: bool,
-    ) -> PyResult<PyFieldSolution> {
-        let n_inc = nodes_list.len();
-        let nodes_owned: Vec<ndarray::Array2<f64>> =
-            nodes_list.iter().map(|a| a.as_array().to_owned()).collect();
-        let elements_owned: Vec<Array2<usize>> = elements_list
-            .iter()
-            .map(|a| a.as_array().map(|&x| x as usize))
-            .collect();
-        let displacements_owned: Vec<ndarray::Array2<f64>> = displacements_list
-            .iter()
-            .map(|a| a.as_array().to_owned())
-            .collect();
-
-        let mesh_data: Vec<MeshData<'_>> = (0..n_inc)
-            .map(|i| MeshData {
-                nodes: &nodes_owned[i],
-                elements: &elements_owned[i],
-                displacements: &displacements_owned[i],
-                mesh_order: mesh_order_list[i],
-            })
-            .collect();
-
-        let ru: Vec<bool> = ref_updates.unwrap_or_default();
-        let sol = self
-            .inner
-            .solve(&mesh_data, &ru, factor, true_incs)
-            .map_err(Error::from)?;
-        Ok(PyFieldSolution { inner: sol })
+        calibration: Option<Bound<'_, PyCalibrationParams>>,
+    ) -> PyResult<()> {
+        let borrowed = calibration.as_ref().map(|b| b.borrow());
+        let cal = borrowed.as_ref().map(|b| &b.inner);
+        Ok(self.inner.solve(factor, true_incs, cal).map_err(Error::from)?)
     }
 
-    // --- Getters ---
-
-    /// Initial particle coordinates ``(N, 2)``.
     #[getter]
     fn coordinates<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         self.inner.coordinates.clone().into_pyarray_bound(py)
     }
 
-    /// Initial particle volumes ``(N,)``.
     #[getter]
     fn volumes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.volumes.clone().into_pyarray_bound(py)
     }
 
-    /// Number of particles.
     #[getter]
-    fn n_particles(&self) -> usize {
-        self.inner.n_particles()
-    }
+    fn n_particles(&self) -> usize { self.inner.n_particles() }
 
-    /// ``True`` if Lagrangian.
     #[getter]
-    fn track(&self) -> bool {
-        self.inner.track
-    }
+    fn track(&self) -> bool { self.inner.track }
 
-    /// Depth multiplier.
     #[getter]
-    fn depth(&self) -> f64 {
-        self.inner.depth
-    }
+    fn depth(&self) -> f64 { self.inner.depth }
 
-    /// Total number of frames.
     #[getter]
-    fn inc_no(&self) -> usize {
-        self.inner.inc_no
-    }
+    fn inc_no(&self) -> usize { self.inner.inc_no() }
 
-    /// Whether :meth:`solve` has been called.
     #[getter]
-    fn solved(&self) -> bool {
-        self.inner.solved
-    }
+    fn solved(&self) -> bool { self.inner.solved() }
 
-    /// Path of the initial (reference) image, or ``None``.
     #[getter]
     fn image_0_path(&self) -> Option<String> {
-        self.inner.image_0_path.as_ref().map(|p| p.to_string_lossy().into_owned())
+        let s = self.inner.image_0_path()?.to_string_lossy().into_owned();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    #[getter]
+    fn particles(&self) -> PyResult<Vec<PyParticleSolution>> {
+        Ok(self.require_solved()?.particles.iter()
+            .map(|p| PyParticleSolution { inner: p.clone() })
+            .collect())
+    }
+
+    #[getter]
+    fn vol_totals<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        Ok(self.require_solved()?.vol_totals.clone().into_pyarray_bound(py))
+    }
+
+    #[getter]
+    fn reference_update_register(&self) -> PyResult<Vec<i64>> {
+        Ok(self.require_solved()?.reference_update_register.iter().map(|&x| x as i64).collect())
+    }
+
+    #[getter]
+    fn calibrated(&self) -> PyResult<bool> {
+        Ok(self.require_solved()?.calibrated)
     }
 
     fn __repr__(&self) -> String {
         format!(
             "Field(n_particles={}, inc_no={}, track={}, solved={})",
             self.inner.n_particles(),
-            self.inner.inc_no,
+            self.inner.inc_no(),
             self.inner.track,
-            self.inner.solved,
+            self.inner.solved(),
         )
+    }
+}
+
+impl PyField {
+    fn require_solved(&self) -> PyResult<&geopyv_dev::field::FieldSolution> {
+        self.inner.solution().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Field has not been solved; call solve() first",
+            )
+        })
+    }
+
+    pub fn from_solution(sol: geopyv_dev::field::FieldSolution) -> PyResult<Self> {
+        Ok(PyField { inner: geopyv_dev::field::Field::from_solution(sol) })
     }
 }
 
@@ -256,24 +241,6 @@ impl PyField {
 // Free function
 // ---------------------------------------------------------------------------
 
-/// Distribute particles at element centroids and compute representative volumes.
-///
-/// Replicates ``Field._distribute_particles``.
-///
-/// Parameters
-/// ----------
-/// nodes : numpy.ndarray, shape (N, 2), float64
-///     Mesh node coordinates.
-/// elements : numpy.ndarray, shape (M, 3) or (M, 6), int64
-///     Element connectivity; only the first 3 columns (corner nodes) are used.
-/// depth : float, optional
-///     Depth multiplier for volume. Default 1.0.
-///
-/// Returns
-/// -------
-/// tuple (coordinates, volumes):
-///     coordinates – shape ``(M, 2)``
-///     volumes     – shape ``(M,)``
 #[pyfunction]
 #[pyo3(signature = (nodes, elements, depth=1.0))]
 fn field_distribute_particles<'py>(

@@ -447,15 +447,19 @@ impl PyMeshSolution {
         g_img_path: Option<String>,
     ) -> Self {
         let n_nodes = nodes.as_array().nrows();
+        let nodes_owned = nodes.as_array().to_owned();
+        let elements_owned: Array2<usize> = elements.as_array().map(|&x| x as usize);
+        let centroids = geopyv_dev::mesh::compute_centroids(&nodes_owned, &elements_owned);
         PyMeshSolution {
             inner: MeshSolution {
-                nodes: nodes.as_array().to_owned(),
-                elements: elements.as_array().map(|&x| x as usize),
+                nodes: nodes_owned,
+                elements: elements_owned,
                 boundary: boundary.iter().map(|&x| x as usize).collect(),
                 exclusions: exclusions
                     .iter()
                     .map(|g| g.iter().map(|&x| x as usize).collect())
                     .collect(),
+                centroids,
                 areas: areas.as_array().to_owned(),
                 warps: warps.as_array().to_owned(),
                 displacements: displacements.as_array().to_owned(),

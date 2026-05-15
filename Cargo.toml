@@ -19,3 +19,5 @@ bincode = { version = "2", features = ["serde"] }
 spade = "2"
 zstd = "0.13"
 indicatif = "0.17"
+rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"

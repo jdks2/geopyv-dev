@@ -54,6 +54,8 @@ pub struct MeshSolution {
     pub boundary: Vec<usize>,
     /// Exclusion node index groups.
     pub exclusions: Vec<Vec<usize>>,
+    /// Element centroids `(M, 2)`, computed at solve time.
+    pub centroids: Array2<f64>,
     /// Signed element areas `(M,)`.
     pub areas: Array1<f64>,
     /// Element warp vectors `(M, 12)`.
@@ -362,7 +364,8 @@ impl Mesh {
             pb.finish_and_clear();
         }
 
-        // --- Element areas and strains.
+        // --- Element areas, centroids and strains.
+        let centroids = compute_centroids(&self.nodes, &self.elements);
         let areas = element_area(&self.nodes, &self.elements);
         let warps = element_strains(
             &self.nodes,
@@ -382,6 +385,7 @@ impl Mesh {
             elements: self.elements.clone(),
             boundary: self.boundary.clone(),
             exclusions: self.exclusions.clone(),
+            centroids,
             areas,
             warps,
             displacements,
@@ -480,7 +484,7 @@ impl Mesh {
         &self,
         subsets: &[Subset],
         cfg: &SolveConfig,
-        pb: &indicatif::ProgressBar,
+        _pb: &indicatif::ProgressBar,
         solved: &mut Vec<bool>,
         c_zncc: &mut Array1<f64>,
         p: &mut Array2<f64>,
@@ -571,7 +575,6 @@ impl Mesh {
                 tolerance: result.tolerance,
             };
             store_result(j, &forced, c_zncc, p, displacements, iterations, norms);
-            pb.inc(1);
             solved[j] = true;
         }
         Ok(())
@@ -828,6 +831,20 @@ pub fn element_strains(
     Ok(warps)
 }
 
+/// Compute element centroids (mean of corner node positions).
+pub fn compute_centroids(nodes: &Array2<f64>, elements: &Array2<usize>) -> Array2<f64> {
+    let n_elem = elements.nrows();
+    let mut centroids = Array2::<f64>::zeros((n_elem, 2));
+    for i in 0..n_elem {
+        let n0 = elements[[i, 0]];
+        let n1 = elements[[i, 1]];
+        let n2 = elements[[i, 2]];
+        centroids[[i, 0]] = (nodes[[n0, 0]] + nodes[[n1, 0]] + nodes[[n2, 0]]) / 3.0;
+        centroids[[i, 1]] = (nodes[[n0, 1]] + nodes[[n1, 1]] + nodes[[n2, 1]]) / 3.0;
+    }
+    centroids
+}
+
 /// Find the node index closest to `seed_coord`.
 pub fn find_seed_node(nodes: &Array2<f64>, seed_coord: [f64; 2]) -> usize {
     (0..nodes.nrows())
@@ -922,8 +939,8 @@ pub fn corr(c_zncc: ArrayView1<f64>) -> Vec<usize> {
 }
 
 pub fn corr_1d(vals: &[f64]) -> Vec<usize> {
-    let mut sorted = vals.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut sorted: Vec<f64> = vals.iter().copied().filter(|v| v.is_finite()).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lq = percentile(&sorted, 25.0);
     let uq = percentile(&sorted, 75.0);
     let iqr = uq - lq;
@@ -955,10 +972,14 @@ pub fn flow_calc(
 ) -> f64 {
     let disp = displacement_override
         .unwrap_or([displacements[[idx, 0]], displacements[[idx, 1]]]);
+    if !disp[0].is_finite() || !disp[1].is_finite() {
+        return -1.0;
+    }
     let neighbours = connectivity(elements, mesh_order, idx, true);
     let valid: Vec<usize> = neighbours
         .into_iter()
         .filter(|nb| !exclude.contains(nb))
+        .filter(|nb| displacements[[*nb, 0]].is_finite() && displacements[[*nb, 1]].is_finite())
         .collect();
     if valid.is_empty() {
         return -1.0;
@@ -1001,8 +1022,8 @@ fn flow_stats(
     let flow: Vec<f64> = (0..n)
         .map(|i| flow_calc(i, elements, mesh_order, displacements, &empty, None))
         .collect();
-    let mut sorted = flow.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut sorted: Vec<f64> = flow.iter().copied().filter(|f| f.is_finite()).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let lq = percentile(&sorted, 25.0);
     let uq = percentile(&sorted, 75.0);
     let iqr = uq - lq;

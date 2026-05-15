@@ -50,7 +50,7 @@ pub fn generate_mesh(
 ) -> Result<TriMesh, Error> {
     validate_order(mesh_order)?;
     let poly = PolyData::from_arrays(borders, segments, curves);
-    let best_size = bisect_size(&poly, target_nodes, size_lower, size_upper)?;
+    let best_size = bisect_size(&poly, target_nodes, size_lower, size_upper, mesh_order)?;
     let max_area = equilateral_area(best_size).max(equilateral_area(size_lower));
     build_trimesh(&poly, max_area, size_lower, mesh_order)
 }
@@ -319,20 +319,39 @@ fn cdt_pipeline(
 // Binary search for target node count
 // ---------------------------------------------------------------------------
 
-fn count_nodes_for_size(poly: &PolyData, size: f64, size_lower: f64) -> Result<usize, Error> {
+/// Count nodes that would result from meshing at `size`, including midside nodes
+/// for order-2 meshes.  This is the function the bisector probes.
+fn count_nodes_for_size(
+    poly: &PolyData,
+    size: f64,
+    size_lower: f64,
+    mesh_order: u8,
+) -> Result<usize, Error> {
     let max_area = equilateral_area(size).max(equilateral_area(size_lower));
-    let (nodes, ..) = cdt_pipeline(poly, max_area, size_lower)?;
-    Ok(nodes.nrows())
+    let (nodes, elems, ..) = cdt_pipeline(poly, max_area, size_lower)?;
+    let n = if mesh_order == 2 {
+        let (n2, _) = insert_midpoints(&nodes, &elems);
+        n2.nrows()
+    } else {
+        nodes.nrows()
+    };
+    Ok(n)
 }
 
-/// Bisect `size ∈ [lo, hi]` to hit `target` node count.
-/// Larger size → coarser mesh → fewer nodes.
-fn bisect_size(poly: &PolyData, target: usize, lo: f64, hi: f64) -> Result<f64, Error> {
+/// Bisect `size ∈ [lo, hi]` to hit `target` node count (including midside nodes
+/// for order-2).  Larger size → coarser mesh → fewer nodes.
+fn bisect_size(
+    poly: &PolyData,
+    target: usize,
+    lo: f64,
+    hi: f64,
+    mesh_order: u8,
+) -> Result<f64, Error> {
     let mut lo = lo;
     let mut hi = hi;
 
-    let n_lo = count_nodes_for_size(poly, lo, lo)?;
-    let n_hi = count_nodes_for_size(poly, hi, lo)?;
+    let n_lo = count_nodes_for_size(poly, lo, lo, mesh_order)?;
+    let n_hi = count_nodes_for_size(poly, hi, lo, mesh_order)?;
     if n_lo <= target {
         return Ok(lo);
     }
@@ -342,7 +361,7 @@ fn bisect_size(poly: &PolyData, target: usize, lo: f64, hi: f64) -> Result<f64, 
 
     for _ in 0..20 {
         let mid = (lo + hi) * 0.5;
-        let n = count_nodes_for_size(poly, mid, lo)?;
+        let n = count_nodes_for_size(poly, mid, lo, mesh_order)?;
         if n > target {
             lo = mid;
         } else {

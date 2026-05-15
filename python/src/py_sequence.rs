@@ -2,11 +2,12 @@
 //!
 //! Exposes:
 //! - `SequenceOptions` class: temporal coupling options for `Sequence.solve`.
-//! - `Sequence` class: constructed with image directory + mesh config, runs `solve`.
-//! - `SequenceSolution` class: read-only result from `Sequence.solve`.
+//! - `Sequence` class: constructed with image directory + mesh config, runs `solve`
+//!   (mutates in place; solution stored on the object).
 //! - `sequence_deformation_preconditioning` free function.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 use numpy::IntoPyArray;
@@ -15,6 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use geopyv_dev::{
+    image::Image,
     mesh::{SeedConfig, SolveConfig, SolveMethod},
     sequence::{self, Sequence, SequenceMeshConfig, SequenceOptions, SequenceSolveConfig},
     masks::LocalMask,
@@ -22,6 +24,7 @@ use geopyv_dev::{
 
 use crate::{
     py_geometry::extract_region,
+    py_image::PyImage,
     py_mesh::PyMesh,
     py_mask::PyMask,
     Error,
@@ -81,71 +84,6 @@ impl PySequenceOptions {
 }
 
 // ---------------------------------------------------------------------------
-// SequenceSolution class
-// ---------------------------------------------------------------------------
-
-/// Read-only result from :meth:`Sequence.solve`.
-#[pyclass(name = "SequenceSolution")]
-pub struct PySequenceSolution {
-    pub(crate) inner: geopyv_dev::sequence::SequenceSolution,
-}
-
-#[pymethods]
-impl PySequenceSolution {
-    /// Per-pair DIC solutions; ``mesh_solutions[i]`` is for pair ``(i, i+1)``.
-    /// Empty when the sequence was solved with ``save`` set to a directory path.
-    #[getter]
-    fn mesh_solutions(&self, py: Python<'_>) -> PyResult<Vec<Py<PyMesh>>> {
-        self.inner
-            .mesh_solutions
-            .iter()
-            .map(|s| Py::new(py, PyMesh::from_solution(py, s.clone())?))
-            .collect()
-    }
-
-    /// File paths of per-frame ``.pyv`` files when solved with ``save`` set.
-    /// Empty list when meshes are held in memory.
-    #[getter]
-    fn mesh_paths(&self) -> Vec<String> {
-        self.inner
-            .mesh_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    /// ``True`` when all image pairs solved successfully.
-    #[getter]
-    fn solved(&self) -> bool {
-        self.inner.solved
-    }
-
-    /// ``True`` when a consecutive pair was unsolvable and the sequence was curtailed.
-    #[getter]
-    fn unsolvable(&self) -> bool {
-        self.inner.unsolvable
-    }
-
-    /// g-indices (1-based) at which tolerance override was active.
-    #[getter]
-    fn override_log(&self) -> Vec<i64> {
-        self.inner.override_log.iter().map(|&x| x as i64).collect()
-    }
-
-    fn __repr__(&self) -> String {
-        let n_pairs = self.inner.mesh_solutions.len() + self.inner.mesh_paths.len();
-        let geom = self.inner.mesh_solutions.first().map(|m| {
-            format!(", nodes={}, mesh_order={}, subset_order={}",
-                m.nodes.nrows(), m.mesh_order, m.subset_order)
-        }).unwrap_or_default();
-        format!(
-            "SequenceSolution(pairs={}{}, solved={})",
-            n_pairs, geom, self.inner.solved,
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Sequence class
 // ---------------------------------------------------------------------------
 
@@ -170,7 +108,8 @@ impl PySequenceSolution {
 ///     1 (linear) or 2 (quadratic). Default 2.
 #[pyclass(name = "Sequence")]
 pub struct PySequence {
-    inner: Sequence,
+    pub(crate) inner: Sequence,
+    pub(crate) solution: Option<geopyv_dev::sequence::SequenceSolution>,
 }
 
 #[pymethods]
@@ -205,14 +144,14 @@ impl PySequence {
         };
         let seq = Sequence::from_dir(std::path::Path::new(image_dir), mesh_cfg)
             .map_err(Error::from)?;
-        Ok(PySequence { inner: seq })
+        Ok(PySequence { inner: seq, solution: None })
     }
 
-    /// Solve all image pairs.
+    /// Solve all image pairs. Mutates in place; returns ``None``.
     ///
     /// Parameters
     /// ----------
-    /// template : Template
+    /// local_mask : Mask
     ///     Subset template whose pixel offsets define the subset shape.
     /// seed_coord : list[float]
     ///     Initial ``[x, y]`` seed coordinate near low-deformation region.
@@ -234,17 +173,13 @@ impl PySequence {
     ///     Temporal coupling strategy. Default ``SequenceOptions()``.
     /// border : int, optional
     ///     Image border (pixels) for B-spline precomputation. Default 20.
-    ///
-    /// Returns
-    /// -------
-    /// SequenceSolution
     #[pyo3(signature = (local_mask, seed_coord, seed_warp=None,
                          max_norm=1e-5, max_iterations=50, subset_order=2,
                          tolerance=0.75, seed_tolerance=0.9, method="icgn",
                          options=None, border=20, save=None))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
-        &self,
+        &mut self,
         local_mask: &Bound<'_, PyAny>,
         seed_coord: [f64; 2],
         seed_warp: Option<Vec<f64>>,
@@ -257,7 +192,7 @@ impl PySequence {
         options: Option<PyRef<'_, PySequenceOptions>>,
         border: usize,
         save: Option<&str>,
-    ) -> PyResult<PySequenceSolution> {
+    ) -> PyResult<()> {
         let solve_method = if method == "fagn" {
             SolveMethod::Fagn
         } else {
@@ -294,12 +229,69 @@ impl PySequence {
             save: save.map(PathBuf::from),
         };
         let sol = self.inner.solve(&cfg).map_err(Error::from)?;
-        Ok(PySequenceSolution { inner: sol })
+        self.solution = Some(sol);
+        Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Solution getters — guarded by require_solved()
+    // -----------------------------------------------------------------------
+
+    /// Per-pair DIC solutions; ``mesh_solutions[i]`` is for pair ``(i, i+1)``.
+    /// Empty list when the sequence was solved with ``save`` set to a directory path.
+    #[getter]
+    fn mesh_solutions(&self, py: Python<'_>) -> PyResult<Vec<Py<PyMesh>>> {
+        let sol = self.require_solved()?;
+        (0..sol.n_meshes())
+            .map(|i| {
+                let ms = sol.load_mesh_at(i).map_err(Error::from)?;
+                Py::new(py, PyMesh::from_solution(py, ms)?)
+            })
+            .collect()
+    }
+
+    /// File paths of per-frame ``.pyv`` files when solved with ``save`` set.
+    /// Empty list when meshes are held in memory.
+    #[getter]
+    fn mesh_paths(&self) -> PyResult<Vec<String>> {
+        let sol = self.require_solved()?;
+        Ok(sol.mesh_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+    }
+
+    /// ``True`` when all image pairs solved successfully.
+    #[getter]
+    fn solved(&self) -> bool {
+        self.solution.as_ref().map(|s| s.solved).unwrap_or(false)
+    }
+
+    /// ``True`` when a consecutive pair was unsolvable and the sequence was curtailed.
+    #[getter]
+    fn unsolvable(&self) -> PyResult<bool> {
+        Ok(self.require_solved()?.unsolvable)
+    }
+
+    /// g-indices (1-based) at which tolerance override was active.
+    #[getter]
+    fn override_log(&self) -> PyResult<Vec<i64>> {
+        Ok(self.require_solved()?.override_log.iter().map(|&x| x as i64).collect())
+    }
+
+    /// One entry per mesh pair; ``True`` if the reference image advanced at that step.
+    #[getter]
+    fn reference_updates(&self) -> PyResult<Vec<bool>> {
+        Ok(self.require_solved()?.reference_updates.clone())
+    }
+
+    // -----------------------------------------------------------------------
+    // Geometry / metadata getters — always available
+    // -----------------------------------------------------------------------
 
     /// Number of image pairs (= number of meshes to solve).
     #[getter]
     fn n_pairs(&self) -> usize {
+        if self.inner.image_paths.is_empty() {
+            return self.solution.as_ref().map(|s| s.n_meshes()).unwrap_or(0);
+        }
         self.inner.n_pairs()
     }
 
@@ -313,12 +305,309 @@ impl PySequence {
             .collect()
     }
 
+    // -----------------------------------------------------------------------
+    // Per-mesh field accessors — mirror PyMesh getters with mesh_index
+    // -----------------------------------------------------------------------
+
+    /// Node coordinates for mesh ``mesh_index``, shape ``(N, 2)``.
+    /// Pass ``subset_index`` to extract a single row ``(2,)``.
+    #[pyo3(signature = (mesh_index, subset_index=None))]
+    fn nodes<'py>(&self, py: Python<'py>, mesh_index: usize, subset_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match subset_index {
+            None => ms.nodes.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.nodes.nrows() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("subset_index {i} out of range (N={})", ms.nodes.nrows())
+                    ));
+                }
+                ms.nodes.row(i).to_owned().into_pyarray_bound(py).into_any()
+            }
+        })
+    }
+
+    /// Element connectivity for mesh ``mesh_index``, shape ``(M, 3)`` or ``(M, 6)``.
+    /// Pass ``element_index`` to extract a single row.
+    #[pyo3(signature = (mesh_index, element_index=None))]
+    fn elements<'py>(&self, py: Python<'py>, mesh_index: usize, element_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        if let Some(i) = element_index {
+            if i >= ms.elements.nrows() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    format!("element_index {i} out of range (M={})", ms.elements.nrows())
+                ));
+            }
+            return Ok(ms.elements.row(i).mapv(|x| x as i64).into_pyarray_bound(py).into_any());
+        }
+        let e: Array2<i64> = ms.elements.map(|&x| x as i64);
+        Ok(e.into_pyarray_bound(py).into_any())
+    }
+
+    /// Boundary node indices for mesh ``mesh_index``.
+    fn boundary(&self, mesh_index: usize) -> PyResult<Vec<i64>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(ms.boundary.iter().map(|&x| x as i64).collect())
+    }
+
+    /// Exclusion node index groups for mesh ``mesh_index``.
+    fn exclusions(&self, mesh_index: usize) -> PyResult<Vec<Vec<i64>>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(ms.exclusions.iter().map(|g| g.iter().map(|&x| x as i64).collect()).collect())
+    }
+
+    /// Signed element areas for mesh ``mesh_index``, shape ``(M,)``.
+    /// Pass ``element_index`` to get a single scalar.
+    #[pyo3(signature = (mesh_index, element_index=None))]
+    fn areas<'py>(&self, py: Python<'py>, mesh_index: usize, element_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match element_index {
+            None => ms.areas.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.areas.len() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("element_index {i} out of range (M={})", ms.areas.len())
+                    ));
+                }
+                pyo3::types::PyFloat::new_bound(py, ms.areas[i]).into_any()
+            }
+        })
+    }
+
+    /// Element warp vectors for mesh ``mesh_index``, shape ``(M, 12)``.
+    /// Pass ``element_index`` to extract a single row.
+    #[pyo3(signature = (mesh_index, element_index=None))]
+    fn warps<'py>(&self, py: Python<'py>, mesh_index: usize, element_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match element_index {
+            None => ms.warps.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.warps.nrows() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("element_index {i} out of range (M={})", ms.warps.nrows())
+                    ));
+                }
+                ms.warps.row(i).to_owned().into_pyarray_bound(py).into_any()
+            }
+        })
+    }
+
+    /// Per-node displacements for mesh ``mesh_index``, shape ``(N, 2)``.
+    /// Pass ``subset_index`` to extract a single row ``(2,)``.
+    #[pyo3(signature = (mesh_index, subset_index=None))]
+    fn displacements<'py>(&self, py: Python<'py>, mesh_index: usize, subset_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match subset_index {
+            None => ms.displacements.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.displacements.nrows() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("subset_index {i} out of range (N={})", ms.displacements.nrows())
+                    ));
+                }
+                ms.displacements.row(i).to_owned().into_pyarray_bound(py).into_any()
+            }
+        })
+    }
+
+    /// Per-node ZNCC scores for mesh ``mesh_index``, shape ``(N,)``.
+    /// Pass ``subset_index`` to get a single scalar.
+    #[pyo3(signature = (mesh_index, subset_index=None))]
+    fn c_zncc<'py>(&self, py: Python<'py>, mesh_index: usize, subset_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match subset_index {
+            None => ms.c_zncc.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.c_zncc.len() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("subset_index {i} out of range (N={})", ms.c_zncc.len())
+                    ));
+                }
+                pyo3::types::PyFloat::new_bound(py, ms.c_zncc[i]).into_any()
+            }
+        })
+    }
+
+    /// Per-node warp parameters for mesh ``mesh_index``, shape ``(N, 6)`` or ``(N, 12)``.
+    /// Pass ``subset_index`` to extract a single row.
+    #[pyo3(signature = (mesh_index, subset_index=None))]
+    fn p<'py>(&self, py: Python<'py>, mesh_index: usize, subset_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match subset_index {
+            None => ms.p.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.p.nrows() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("subset_index {i} out of range (N={})", ms.p.nrows())
+                    ));
+                }
+                ms.p.row(i).to_owned().into_pyarray_bound(py).into_any()
+            }
+        })
+    }
+
+    /// Per-node iteration counts for mesh ``mesh_index``, shape ``(N,)``.
+    /// Pass ``subset_index`` to get a single integer.
+    #[pyo3(signature = (mesh_index, subset_index=None))]
+    fn iterations<'py>(&self, py: Python<'py>, mesh_index: usize, subset_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match subset_index {
+            None => ms.iterations.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.iterations.len() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("subset_index {i} out of range (N={})", ms.iterations.len())
+                    ));
+                }
+                (ms.iterations[i] as i64).into_py(py).into_bound(py)
+            }
+        })
+    }
+
+    /// Per-node final Δnorm values for mesh ``mesh_index``, shape ``(N,)``.
+    /// Pass ``subset_index`` to get a single scalar.
+    #[pyo3(signature = (mesh_index, subset_index=None))]
+    fn norms<'py>(&self, py: Python<'py>, mesh_index: usize, subset_index: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(match subset_index {
+            None => ms.norms.clone().into_pyarray_bound(py).into_any(),
+            Some(i) => {
+                if i >= ms.norms.len() {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(
+                        format!("subset_index {i} out of range (N={})", ms.norms.len())
+                    ));
+                }
+                pyo3::types::PyFloat::new_bound(py, ms.norms[i]).into_any()
+            }
+        })
+    }
+
+    /// Seed node index for mesh ``mesh_index``.
+    fn seed_node(&self, mesh_index: usize) -> PyResult<i64> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(ms.seed_node as i64)
+    }
+
+    /// Mesh element order for mesh ``mesh_index`` (1 or 2).
+    fn mesh_order(&self, mesh_index: usize) -> PyResult<u8> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(ms.mesh_order)
+    }
+
+    /// Subset warp order for mesh ``mesh_index`` (1 or 2).
+    fn subset_order(&self, mesh_index: usize) -> PyResult<u8> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(ms.subset_order)
+    }
+
+    /// Reference image path for mesh ``mesh_index``, or ``None``.
+    fn f_img_path(&self, mesh_index: usize) -> PyResult<Option<String>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        let s = ms.f_img_path.to_string_lossy().into_owned();
+        Ok(if s.is_empty() { None } else { Some(s) })
+    }
+
+    /// Target image path for mesh ``mesh_index``, or ``None``.
+    fn g_img_path(&self, mesh_index: usize) -> PyResult<Option<String>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        let s = ms.g_img_path.to_string_lossy().into_owned();
+        Ok(if s.is_empty() { None } else { Some(s) })
+    }
+
+    /// Reference image for mesh ``mesh_index``, or ``None`` if path missing or unreadable.
+    fn f_img(&self, py: Python<'_>, mesh_index: usize) -> PyResult<Option<Py<PyImage>>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(load_image_opt(py, &ms.f_img_path))
+    }
+
+    /// Target image for mesh ``mesh_index``, or ``None`` if path missing or unreadable.
+    fn g_img(&self, py: Python<'_>, mesh_index: usize) -> PyResult<Option<Py<PyImage>>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(mesh_index).map_err(Error::from)?;
+        Ok(load_image_opt(py, &ms.g_img_path))
+    }
+
     fn __repr__(&self) -> String {
-        format!(
-            "Sequence(images={}, pairs={})",
-            self.inner.image_paths.len(),
-            self.inner.n_pairs(),
-        )
+        if let Some(sol) = &self.solution {
+            let n = sol.n_meshes();
+            let n_images = if self.inner.image_paths.is_empty() { n + 1 } else { self.inner.image_paths.len() };
+            format!("Sequence(images={}, pairs={}, solved={})", n_images, n, sol.solved)
+        } else {
+            format!(
+                "Sequence(images={}, pairs={})",
+                self.inner.image_paths.len(),
+                self.inner.n_pairs(),
+            )
+        }
+    }
+}
+
+fn load_image_opt(py: Python<'_>, path: &std::path::Path) -> Option<Py<PyImage>> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let img = Image::from_file(path, 20).ok()?;
+    let py_img = PyImage {
+        inner: Arc::new(img),
+        filepath: Some(path.to_string_lossy().into_owned()),
+    };
+    Py::new(py, py_img).ok()
+}
+
+impl PySequence {
+    fn require_solved(&self) -> PyResult<&geopyv_dev::sequence::SequenceSolution> {
+        self.solution.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("Sequence has not been solved; call solve() first")
+        })
+    }
+
+    /// Reconstruct a `PySequence` shell from a deserialised `SequenceSolution`.
+    ///
+    /// Used by `load()` in `py_io.rs`. `SequenceMeshConfig` cannot be fully recovered
+    /// from the solution (boundary polygon is not stored), so a minimal placeholder is
+    /// used — it is never consulted once a solution is already present.
+    pub(crate) fn from_solution(
+        sol: geopyv_dev::sequence::SequenceSolution,
+    ) -> PyResult<Self> {
+        let image_paths: Vec<PathBuf> = if !sol.mesh_solutions.is_empty() {
+            let mut paths: Vec<_> = sol.mesh_solutions.iter()
+                .map(|m| m.f_img_path.clone())
+                .collect();
+            if let Some(last) = sol.mesh_solutions.last() {
+                paths.push(last.g_img_path.clone());
+            }
+            paths
+        } else {
+            vec![]
+        };
+        let mesh_cfg = SequenceMeshConfig {
+            boundary_nodes: Array2::zeros((0, 2)),
+            boundary_hard: false,
+            exclusion_nodes: vec![],
+            exclusions_hard: vec![],
+            size: (1.0, 1000.0),
+            target_nodes: 0,
+            mesh_order: sol.mesh_order,
+        };
+        let inner = Sequence { image_paths, mesh_cfg };
+        Ok(PySequence { inner, solution: Some(sol) })
     }
 }
 
@@ -378,7 +667,6 @@ fn sequence_deformation_preconditioning<'py>(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySequenceOptions>()?;
     m.add_class::<PySequence>()?;
-    m.add_class::<PySequenceSolution>()?;
     m.add_function(wrap_pyfunction!(sequence_deformation_preconditioning, m)?)?;
     Ok(())
 }
