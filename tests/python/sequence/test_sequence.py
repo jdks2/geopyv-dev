@@ -15,11 +15,10 @@ import pytest
 
 from geopyv_dev import (
     Sequence,
-    SequenceSolution,
     SequenceOptions,
     Mask,
 )
-from geopyv_dev.wrappers import SequenceSolutionWrapper, MeshWrapper
+from geopyv_dev.wrappers import MeshWrapper
 
 # ---------------------------------------------------------------------------
 # Boundary for sequence construction tests
@@ -142,8 +141,8 @@ def test_sequence_repr():
 
 
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
-def test_sequence_solve_one_pair_returns_solution():
-    """Sequence with one image pair returns a valid SequenceSolution.
+def test_sequence_solve_one_pair_mutates_in_place():
+    """Sequence.solve() returns None and marks the sequence as solved.
 
     Uses a small ROI (200×200 px) centred at (500, 500) with a 10-pixel
     template so the solve completes quickly.
@@ -170,7 +169,7 @@ def test_sequence_solve_one_pair_returns_solution():
 
     template = Mask(mask_type="local", shape="circle", size=10)
 
-    sol = seq.solve(
+    result = seq.solve(
         local_mask=template,
         seed_coord=[cx, cy],
         max_norm=1e-3,
@@ -181,12 +180,13 @@ def test_sequence_solve_one_pair_returns_solution():
         border=20,
     )
 
-    assert isinstance(sol, SequenceSolutionWrapper)
+    assert result is None
+    assert seq.solved is True
 
 
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
 def test_sequence_solve_one_pair_result_shape():
-    """SequenceSolution.mesh_solutions has length 1 for a 2-image sequence."""
+    """seq.mesh_solutions has length 1 for a 2-image sequence."""
     cx, cy = 500.0, 500.0
     half = 100.0
     boundary = np.array(
@@ -207,7 +207,7 @@ def test_sequence_solve_one_pair_result_shape():
     )
 
     template = Mask(mask_type="local", shape="circle", size=10)
-    sol = seq.solve(
+    seq.solve(
         local_mask=template,
         seed_coord=[cx, cy],
         max_norm=1e-3,
@@ -217,13 +217,13 @@ def test_sequence_solve_one_pair_result_shape():
         border=20,
     )
 
-    assert len(sol.mesh_solutions) == 1
-    assert isinstance(sol.mesh_solutions[0], MeshWrapper)
+    assert len(seq.mesh_solutions) == 1
+    assert isinstance(seq.mesh_solutions[0], MeshWrapper)
 
 
 @pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
-def test_sequence_solution_repr():
-    """SequenceSolution.__repr__ includes solved/unsolvable info."""
+def test_sequence_repr_after_solve():
+    """repr(seq) includes 'Sequence' and 'solved' after solving."""
     cx, cy = 500.0, 500.0
     half = 100.0
     boundary = np.array(
@@ -244,7 +244,7 @@ def test_sequence_solution_repr():
     )
 
     template = Mask(mask_type="local", shape="circle", size=10)
-    sol = seq.solve(
+    seq.solve(
         local_mask=template,
         seed_coord=[cx, cy],
         max_norm=1e-3,
@@ -254,5 +254,6 @@ def test_sequence_solution_repr():
         border=20,
     )
 
-    r = repr(sol)
-    assert "SequenceSolution" in r
+    r = repr(seq)
+    assert "Sequence" in r
+    assert "solved" in r

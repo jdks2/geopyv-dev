@@ -161,13 +161,57 @@ macro_rules! impl_region_pymethods {
             }
 
             #[getter]
+            fn calibrated(&self) -> bool {
+                self.inner.calibrated
+            }
+
+            #[setter]
+            fn set_calibrated(&mut self, val: bool) {
+                self.inner.calibrated = val;
+            }
+
+            #[getter]
             fn current_nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
                 self.inner.current_nodes.clone().into_pyarray_bound(py)
+            }
+
+            #[setter]
+            fn set_current_nodes(&mut self, nodes: PyReadonlyArray2<f64>) {
+                self.inner.current_nodes = nodes.as_array().to_owned();
             }
 
             #[getter]
             fn current_centre<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
                 ndarray::arr1(&self.inner.current_centre).into_pyarray_bound(py)
+            }
+
+            #[setter]
+            fn set_current_centre(&mut self, centre: [f64; 2]) {
+                self.inner.current_centre = centre;
+            }
+
+            #[getter]
+            fn history_nodes<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+                self.inner.history_nodes.iter()
+                    .map(|n| n.clone().into_pyarray_bound(py))
+                    .collect()
+            }
+
+            #[setter]
+            fn set_history_nodes(&mut self, nodes_list: Vec<PyReadonlyArray2<f64>>) {
+                self.inner.history_nodes = nodes_list.iter()
+                    .map(|n| n.as_array().to_owned())
+                    .collect();
+            }
+
+            #[getter]
+            fn history_centres(&self) -> Vec<[f64; 2]> {
+                self.inner.history_centres.clone()
+            }
+
+            #[setter]
+            fn set_history_centres(&mut self, centres: Vec<[f64; 2]>) {
+                self.inner.history_centres = centres;
             }
 
             fn store_rigid(&mut self, warp: PyReadonlyArray1<f64>) -> PyResult<()> {

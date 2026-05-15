@@ -26,24 +26,81 @@
 //!   flag in `solve_increment`
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
+use crate::{
+    calibration::CalibrationParams,
+    mesh::MeshSolution,
+    sequence::SequenceSolution,
+    Error,
+};
 
 // ---------------------------------------------------------------------------
-// MeshData — thin view of the mesh arrays needed by a particle
+// ParticleSource — owned reference to mesh data
 // ---------------------------------------------------------------------------
 
-/// Minimal mesh data required for particle strain-path computation.
-///
-/// [`crate::field::Field`] constructs this from a [`crate::mesh::MeshSolution`].
-pub struct MeshData<'a> {
-    pub nodes: &'a Array2<f64>,
-    pub elements: &'a Array2<usize>,
-    pub displacements: &'a Array2<f64>,
-    pub mesh_order: u8,
+/// Source of mesh data for particle strain-path computation.
+pub enum ParticleSource {
+    Mesh(Arc<MeshSolution>),
+    Sequence(Arc<SequenceSolution>),
+    /// Reconstructed from a saved solution; mesh data is not available.
+    Loaded { inc_no: usize, mesh_order: u8 },
+}
+
+impl ParticleSource {
+    pub fn inc_no(&self) -> usize {
+        match self {
+            Self::Mesh(_) => 2,
+            Self::Sequence(s) => s.n_meshes() + 1,
+            Self::Loaded { inc_no, .. } => *inc_no,
+        }
+    }
+    pub fn mesh_order(&self) -> u8 {
+        match self {
+            Self::Mesh(m) => m.mesh_order,
+            Self::Sequence(s) => s.mesh_order,
+            Self::Loaded { mesh_order, .. } => *mesh_order,
+        }
+    }
+    pub fn image_0_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Mesh(m) => Some(&m.f_img_path),
+            Self::Sequence(s) => s.first_f_img_path.as_ref(),
+            Self::Loaded { .. } => None,
+        }
+    }
+    /// Load the mesh for increment `m`.
+    ///
+    /// For `Mesh` sources this clones the single in-memory solution.
+    /// For `Sequence` sources this delegates to [`SequenceSolution::load_mesh_at`],
+    /// which either clones from memory or deserialises from disk.
+    pub fn load_mesh_at(&self, m: usize) -> Result<MeshSolution, Error> {
+        match self {
+            Self::Mesh(ms) => Ok((**ms).clone()),
+            Self::Sequence(s) => s.load_mesh_at(m),
+            Self::Loaded { .. } => Err(Error::InvalidInput(
+                "cannot load mesh increments from a loaded Particle".to_string(),
+            )),
+        }
+    }
+    /// Number of mesh increments (1 for a single `Mesh` source; `n_pairs` for a sequence).
+    pub fn n_meshes(&self) -> usize {
+        match self {
+            Self::Mesh(_) => 1,
+            Self::Sequence(s) => s.n_meshes(),
+            Self::Loaded { inc_no, .. } => inc_no.saturating_sub(1),
+        }
+    }
+    pub fn ref_update_at(&self, m: usize) -> bool {
+        match self {
+            Self::Mesh(_) => false,
+            Self::Sequence(s) => s.reference_updates.get(m).copied().unwrap_or(false),
+            Self::Loaded { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,20 +328,6 @@ fn build_k_x_inv(dz: ArrayView2<f64>) -> Array2<f64> {
     ).unwrap()
 }
 
-/// Compute element centroids (mean of corner node positions).
-pub fn compute_centroids(nodes: &Array2<f64>, elements: &Array2<usize>) -> Array2<f64> {
-    let n_elem = elements.nrows();
-    let mut centroids = Array2::zeros((n_elem, 2));
-    for i in 0..n_elem {
-        let n0 = elements[[i, 0]];
-        let n1 = elements[[i, 1]];
-        let n2 = elements[[i, 2]];
-        centroids[[i, 0]] = (nodes[[n0, 0]] + nodes[[n1, 0]] + nodes[[n2, 0]]) / 3.0;
-        centroids[[i, 1]] = (nodes[[n0, 1]] + nodes[[n1, 1]] + nodes[[n2, 1]]) / 3.0;
-    }
-    centroids
-}
-
 /// Find the index of the element containing `coordinate`.
 ///
 /// Replicates `Particle._element_locator`.
@@ -292,14 +335,15 @@ pub fn compute_centroids(nodes: &Array2<f64>, elements: &Array2<usize>) -> Array
 /// Searches nearest centroids first, testing each with the barycentric
 /// sign test.  Falls back to the nearest centroid if no element contains
 /// the point (adrift case).
+/// Returns `(element_index, adrift)`.  `adrift` is `true` when the coordinate
+/// falls outside all mesh elements and the nearest centroid was used as fallback.
 pub fn element_locator(
     coordinate: [f64; 2],
     nodes: &Array2<f64>,
     elements: &Array2<usize>,
     centroids: &Array2<f64>,
-) -> usize {
+) -> (usize, bool) {
     let n_elem = centroids.nrows();
-    // Squared centroid distances → sorted indices
     let mut dists: Vec<(f64, usize)> = (0..n_elem)
         .map(|i| {
             let dx = centroids[[i, 0]] - coordinate[0];
@@ -309,16 +353,12 @@ pub fn element_locator(
         .collect();
     dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Check sorted elements; Python checks min(10, ceil(0.05*n_elem)) first
-    // via argpartition then the whole array. Sorting and iterating is equivalent.
-    let n_check = (n_elem * 5 / 100).max(1).min(10);
-    for &(_, idx) in dists.iter().take(n_check.max(n_elem)) {
+    for &(_, idx) in dists.iter() {
         if point_in_triangle(coordinate, nodes, elements, idx) {
-            return idx;
+            return (idx, false);
         }
     }
-    // Adrift fallback: nearest centroid
-    dists[0].1
+    (dists[0].1, true)
 }
 
 /// Returns true if `coordinate` is inside (or on the boundary of) triangle `idx`.
@@ -437,7 +477,7 @@ pub struct ParticleConfig {
 
 impl Default for ParticleConfig {
     fn default() -> Self {
-        Self { factor: 1.0, true_incs: true }
+        Self { factor: 0.0, true_incs: true }
     }
 }
 
@@ -463,70 +503,50 @@ pub struct ParticleSolution {
     /// Path of the initial (reference) image.
     #[serde(default)]
     pub image_0_path: Option<PathBuf>,
+    /// Whether calibration was applied during solve.
+    #[serde(default)]
+    pub calibrated: bool,
 }
 
 /// Lagrangian / Eulerian particle tracking and strain-path computation.
 ///
-/// Construct with [`Particle::new`]; then either:
-/// - call [`Particle::solve`] for a standalone sequence solve, or
-/// - call [`Particle::solve_increment`] per step from [`crate::field::Field`].
+/// Construct with [`Particle::new`]; then call [`Particle::solve`].
 pub struct Particle {
-    // --- Configuration ---
-    pub mesh_order: u8,
-    pub track: bool,   // true → Lagrangian (coordinate moves with material)
-
-    // --- Size ---
-    inc_no: usize,
+    pub source: ParticleSource,
+    pub track: bool,
 
     // --- Accumulated state arrays ---
-    /// Particle coordinates `(inc_no, 2)`.
     pub coordinates: Array2<f64>,
-    /// Accumulated warp vectors `(inc_no, 6*mesh_order)`.
     pub warps: Array2<f64>,
-    /// Warp increments `(inc_no, 6*mesh_order)`.
     pub incs: Array2<f64>,
-    /// Particle volumes `(inc_no,)`.
     pub volumes: Array1<f64>,
 
     // --- Reference tracking ---
     reference_index: usize,
     pub reference_update_register: Vec<usize>,
-    _adrift: bool,
+    pub _adrift: bool,
 
-    // --- Solve bookkeeping ---
-    pub current_step: usize,
-    pub solved: bool,
-
-    /// Path of the initial (reference) image.
-    pub image_0_path: Option<PathBuf>,
+    pub(crate) solution: Option<ParticleSolution>,
 }
 
 impl Particle {
     /// Construct a new particle.
     ///
-    /// # Arguments
-    /// * `coordinate`     — initial position [x, y]
-    /// * `initial_warp`   — initial warp vector (length 6 or 12); zero-padded
-    ///                       if shorter than `6 * mesh_order`
-    /// * `initial_volume` — initial volume
-    /// * `inc_no`         — total number of increments (= number of meshes + 1)
-    /// * `mesh_order`     — 1 or 2
-    /// * `track`          — `true` for Lagrangian tracking
-    /// * `image_0_path`   — path to the initial (reference) image
+    /// All metadata (`inc_no`, `mesh_order`, `image_0_path`) are derived from `source`.
     pub fn new(
+        source: ParticleSource,
         coordinate: [f64; 2],
         initial_warp: &[f64],
         initial_volume: f64,
-        inc_no: usize,
-        mesh_order: u8,
         track: bool,
-        image_0_path: Option<PathBuf>,
     ) -> Result<Self, Error> {
         if initial_volume <= 0.0 {
             return Err(Error::InvalidInput(
                 "initial_volume must be > 0".to_string(),
             ));
         }
+        let inc_no = source.inc_no();
+        let mesh_order = source.mesh_order();
         let p_len = 6 * mesh_order as usize;
         let mut warps = Array2::<f64>::zeros((inc_no, p_len));
         let copy_len = initial_warp.len().min(p_len);
@@ -540,9 +560,8 @@ impl Particle {
         volumes[0] = initial_volume;
 
         Ok(Particle {
-            mesh_order,
+            source,
             track,
-            inc_no,
             coordinates,
             warps,
             incs: Array2::zeros((inc_no, p_len)),
@@ -550,55 +569,113 @@ impl Particle {
             reference_index: 0,
             reference_update_register: Vec::new(),
             _adrift: false,
-            current_step: 0,
-            solved: false,
-            image_0_path,
+            solution: None,
         })
     }
 
-    /// Solve a single increment.
+    pub fn inc_no(&self) -> usize { self.source.inc_no() }
+    pub fn mesh_order(&self) -> u8 { self.source.mesh_order() }
+    pub fn image_0_path(&self) -> Option<&PathBuf> {
+        if let Some(sol) = &self.solution {
+            if sol.image_0_path.is_some() { return sol.image_0_path.as_ref(); }
+        }
+        self.source.image_0_path()
+    }
+    pub fn solved(&self) -> bool { self.solution.is_some() }
+    pub fn solution(&self) -> Option<&ParticleSolution> { self.solution.as_ref() }
+
+    /// Reconstruct a `Particle` shell from a saved [`ParticleSolution`].
     ///
-    /// Replicates `Particle._strain_path_inc` (minus stress path).
+    /// The resulting particle is marked as solved and all data arrays are
+    /// populated from the solution.  Mesh data is not available (`source` is
+    /// set to [`ParticleSource::Loaded`]).
+    pub fn from_solution(sol: ParticleSolution) -> Self {
+        let inc_no = sol.coordinates.nrows();
+        let mesh_order = if sol.warps.ncols() > 0 { (sol.warps.ncols() / 6) as u8 } else { 1 };
+        Particle {
+            source: ParticleSource::Loaded { inc_no, mesh_order },
+            track: true,
+            coordinates: sol.coordinates.clone(),
+            warps: sol.warps.clone(),
+            incs: sol.incs.clone(),
+            volumes: sol.volumes.clone(),
+            reference_index: 0,
+            reference_update_register: sol.reference_update_register.clone(),
+            _adrift: false,
+            solution: Some(sol),
+        }
+    }
+
+    /// Solve a single increment.  Reads mesh data and ref_update from `self.source`.
     ///
     /// # Arguments
-    /// * `m`          — increment index (0-based; result stored at `m+1`)
-    /// * `cm`         — current mesh data
-    /// * `ref_update` — `true` if the reference mesh changed at step `m`
-    ///                   (replaces Python's filename-based `_check_update`)
+    /// * `m` — increment index (0-based; result stored at `m+1`)
     ///
     /// Returns `true` on success.
-    pub fn solve_increment(
-        &mut self,
-        m: usize,
-        cm: &MeshData<'_>,
-        ref_update: bool,
-    ) -> bool {
+    /// Advance the particle by one increment using the supplied mesh data.
+    ///
+    /// The caller is responsible for loading (or borrowing) the correct mesh for
+    /// increment `m` — this decouples loading from solving and enables the
+    /// saved-by-reference path where only one mesh file is live at a time.
+    pub fn solve_increment(&mut self, m: usize, mesh: &MeshSolution, calibration: Option<&CalibrationParams>) -> bool {
+        let ref_update = self.source.ref_update_at(m);
         if ref_update {
             self.reference_index = m;
             self.reference_update_register.push(m);
         }
 
-        let centroids = compute_centroids(cm.nodes, cm.elements);
-        let coord = [
-            self.coordinates[[self.reference_index, 0]],
-            self.coordinates[[self.reference_index, 1]],
-        ];
-        let tri_idx = element_locator(coord, cm.nodes, cm.elements, &centroids);
+        let mut warp_inc = if let Some(params) = calibration {
+            // coord is in object space (maintained throughout calibrated solve).
+            let coord_obj = [
+                self.coordinates[[self.reference_index, 0]],
+                self.coordinates[[self.reference_index, 1]],
+            ];
 
-        let elem = cm.elements.row(tri_idx);
-        // Gather element node coordinates and displacements
-        let ncols = cm.elements.ncols(); // 3 or 6
-        let mut e_nodes = Array2::<f64>::zeros((ncols, 2));
-        let mut e_disps = Array2::<f64>::zeros((ncols, 2));
-        for (k, &ni) in elem.iter().enumerate() {
-            e_nodes[[k, 0]] = cm.nodes[[ni, 0]];
-            e_nodes[[k, 1]] = cm.nodes[[ni, 1]];
-            e_disps[[k, 0]] = cm.displacements[[ni, 0]];
-            e_disps[[k, 1]] = cm.displacements[[ni, 1]];
-        }
+            // Map back to image space for element_locator (mesh data is image-space).
+            let coord_img_arr = params.o2i(ndarray::array![[coord_obj[0], coord_obj[1]]].view());
+            let coord_img = [coord_img_arr[[0, 0]], coord_img_arr[[0, 1]]];
 
-        let mut warp_inc =
-            warp_increment(coord, e_nodes.view(), e_disps.view(), cm.mesh_order);
+            let (tri_idx, adrift) = element_locator(coord_img, &mesh.nodes, &mesh.elements, &mesh.centroids);
+            self._adrift = adrift;
+
+            let elem = mesh.elements.row(tri_idx);
+            let ncols = mesh.elements.ncols();
+            let mut e_nodes_img = Array2::<f64>::zeros((ncols, 2));
+            let mut e_displaced_img = Array2::<f64>::zeros((ncols, 2));
+            for (k, &ni) in elem.iter().enumerate() {
+                e_nodes_img[[k, 0]] = mesh.nodes[[ni, 0]];
+                e_nodes_img[[k, 1]] = mesh.nodes[[ni, 1]];
+                e_displaced_img[[k, 0]] = mesh.nodes[[ni, 0]] + mesh.displacements[[ni, 0]];
+                e_displaced_img[[k, 1]] = mesh.nodes[[ni, 1]] + mesh.displacements[[ni, 1]];
+            }
+
+            // Convert element nodes and displaced counterparts to object space (6–12 i2o calls).
+            let e_nodes_obj = params.i2o(e_nodes_img.view());
+            let e_displaced_obj = params.i2o(e_displaced_img.view());
+            let e_disps_obj = e_displaced_obj - &e_nodes_obj;
+
+            warp_increment(coord_obj, e_nodes_obj.view(), e_disps_obj.view(), mesh.mesh_order)
+        } else {
+            let coord = [
+                self.coordinates[[self.reference_index, 0]],
+                self.coordinates[[self.reference_index, 1]],
+            ];
+            let (tri_idx, adrift) = element_locator(coord, &mesh.nodes, &mesh.elements, &mesh.centroids);
+            self._adrift = adrift;
+
+            let elem = mesh.elements.row(tri_idx);
+            let ncols = mesh.elements.ncols();
+            let mut e_nodes = Array2::<f64>::zeros((ncols, 2));
+            let mut e_disps = Array2::<f64>::zeros((ncols, 2));
+            for (k, &ni) in elem.iter().enumerate() {
+                e_nodes[[k, 0]] = mesh.nodes[[ni, 0]];
+                e_nodes[[k, 1]] = mesh.nodes[[ni, 1]];
+                e_disps[[k, 0]] = mesh.displacements[[ni, 0]];
+                e_disps[[k, 1]] = mesh.displacements[[ni, 1]];
+            }
+
+            warp_increment(coord, e_nodes.view(), e_disps.view(), mesh.mesh_order)
+        };
 
         // Clip strain components to [-0.99, 0.99] (matches Python)
         for i in 2..warp_inc.len() {
@@ -643,36 +720,29 @@ impl Particle {
         true
     }
 
-    /// Solve for all increments over a sequence of meshes.
+    /// Solve for all increments using mesh data from `self.source`.
     ///
-    /// Replicates `Particle._strain_path_full` (minus stress path, minus alive_bar).
+    /// Meshes are loaded one at a time; for saved-by-reference sequences each
+    /// mesh file is read, used for its single increment, then dropped before
+    /// the next file is opened.
     ///
-    /// # Arguments
-    /// * `meshes` — one entry per increment (not per frame);
-    ///              `meshes[m]` supplies the DIC solve between frame `m` and
-    ///              frame `m+1`.  Length must equal `inc_no - 1`.
-    /// * `cfg`    — solve configuration
-    pub fn solve(
-        &mut self,
-        meshes: &[MeshData<'_>],
-        cfg: &ParticleConfig,
-    ) -> Result<ParticleSolution, Error> {
-        let expected = self.inc_no - 1;
-        if meshes.len() != expected {
-            return Err(Error::InvalidInput(format!(
-                "expected {} meshes for {} increments, got {}",
-                expected,
-                self.inc_no,
-                meshes.len()
-            )));
+    /// On completion stores the result internally.  Access via `self.solution()`.
+    pub fn solve(&mut self, cfg: &ParticleConfig, calibration: Option<&CalibrationParams>) -> Result<(), Error> {
+        if let Some(params) = calibration {
+            let img = ndarray::array![[self.coordinates[[0, 0]], self.coordinates[[0, 1]]]];
+            let obj = params.i2o(img.view());
+            self.coordinates[[0, 0]] = obj[[0, 0]];
+            self.coordinates[[0, 1]] = obj[[0, 1]];
         }
-
-        for m in 0..expected {
-            self.solve_increment(m, &meshes[m], false);
+        let n = self.source.n_meshes();
+        for m in 0..n {
+            let mesh = self.source.load_mesh_at(m)?;
+            self.solve_increment(m, &mesh, calibration);
         }
-
-        self.solved = true;
-        Ok(self.finalize(cfg))
+        let mut sol = self.finalize(cfg);
+        sol.calibrated = calibration.is_some();
+        self.solution = Some(sol);
+        Ok(())
     }
 
     /// Compute strains from accumulated warps and return a [`ParticleSolution`].
@@ -690,7 +760,8 @@ impl Particle {
             strain_incs,
             vol_strains: vs,
             reference_update_register: self.reference_update_register.clone(),
-            image_0_path: self.image_0_path.clone(),
+            image_0_path: self.image_0_path().cloned(),
+            calibrated: false,
         }
     }
 }
@@ -870,7 +941,7 @@ mod tests {
     fn make_mesh_o1() -> (Array2<f64>, Array2<usize>, Array2<f64>) {
         let nodes = array![[0.0,0.0],[1.0,0.0],[0.0,1.0],[1.0,1.0]];
         let elems = array![[0usize,1,2],[1,3,2]];
-        let centroids = compute_centroids(&nodes, &elems);
+        let centroids = crate::mesh::compute_centroids(&nodes, &elems);
         (nodes, elems, centroids)
     }
 
@@ -878,28 +949,37 @@ mod tests {
     fn test_element_locator_centroid_elem0() {
         let (nodes, elems, centroids) = make_mesh_o1();
         let coord = [centroids[[0, 0]], centroids[[0, 1]]];
-        assert_eq!(element_locator(coord, &nodes, &elems, &centroids), 0);
+        assert_eq!(element_locator(coord, &nodes, &elems, &centroids), (0, false));
     }
 
     #[test]
     fn test_element_locator_centroid_elem1() {
         let (nodes, elems, centroids) = make_mesh_o1();
         let coord = [centroids[[1, 0]], centroids[[1, 1]]];
-        assert_eq!(element_locator(coord, &nodes, &elems, &centroids), 1);
+        assert_eq!(element_locator(coord, &nodes, &elems, &centroids), (1, false));
     }
 
     #[test]
     fn test_element_locator_interior_point() {
         let (nodes, elems, centroids) = make_mesh_o1();
-        assert_eq!(element_locator([0.2, 0.2], &nodes, &elems, &centroids), 0);
-        assert_eq!(element_locator([0.8, 0.8], &nodes, &elems, &centroids), 1);
+        assert_eq!(element_locator([0.2, 0.2], &nodes, &elems, &centroids), (0, false));
+        assert_eq!(element_locator([0.8, 0.8], &nodes, &elems, &centroids), (1, false));
     }
 
     #[test]
     fn test_element_locator_exterior_fallback() {
-        // (2,2) outside mesh → nearest centroid is element 1
+        // (2,2) outside mesh → nearest centroid is element 1, adrift=true
         let (nodes, elems, centroids) = make_mesh_o1();
-        assert_eq!(element_locator([2.0, 2.0], &nodes, &elems, &centroids), 1);
+        assert_eq!(element_locator([2.0, 2.0], &nodes, &elems, &centroids), (1, true));
+    }
+
+    #[test]
+    fn test_element_locator_adrift_flag() {
+        let (nodes, elems, centroids) = make_mesh_o1();
+        let (_, adrift_inside) = element_locator([0.2, 0.2], &nodes, &elems, &centroids);
+        let (_, adrift_outside) = element_locator([5.0, 5.0], &nodes, &elems, &centroids);
+        assert!(!adrift_inside);
+        assert!(adrift_outside);
     }
 
     // -----------------------------------------------------------------------
@@ -951,13 +1031,63 @@ mod tests {
     // Particle struct — integration tests
     // -----------------------------------------------------------------------
 
+    fn make_mesh_sol_o1(disps: Array2<f64>) -> crate::mesh::MeshSolution {
+        use ndarray::{Array1, Array2};
+        use std::path::PathBuf;
+        let nodes = array![[0.0f64,0.0],[1.0,0.0],[0.0,1.0],[1.0,1.0]];
+        let elements = array![[0usize,1,2],[1,3,2]];
+        let centroids = crate::mesh::compute_centroids(&nodes, &elements);
+        let n = 4;
+        crate::mesh::MeshSolution {
+            nodes,
+            elements,
+            boundary: vec![0, 1, 3, 2],
+            exclusions: vec![],
+            centroids,
+            areas: Array1::from_vec(vec![0.5, 0.5]),
+            warps: Array2::zeros((2, 6)),
+            displacements: disps,
+            c_zncc: Array1::ones(n),
+            p: Array2::zeros((n, 6)),
+            seed_node: 0,
+            mesh_order: 1,
+            subset_order: 1,
+            iterations: Array1::zeros(n),
+            norms: Array1::zeros(n),
+            f_img_path: PathBuf::new(),
+            g_img_path: PathBuf::new(),
+        }
+    }
+
+    fn make_seq_o1(disps_list: Vec<Array2<f64>>) -> Arc<crate::sequence::SequenceSolution> {
+        let n_pairs = disps_list.len();
+        let mesh_solutions: Vec<_> = disps_list.into_iter().map(make_mesh_sol_o1).collect();
+        Arc::new(crate::sequence::SequenceSolution {
+            mesh_solutions,
+            mesh_paths: vec![],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false; n_pairs],
+            mesh_order: 1,
+            first_f_img_path: None,
+        })
+    }
+
     #[test]
     fn test_particle_new() {
-        let p = Particle::new([10.0, 20.0], &[0.0; 6], 1e9, 3, 1, true, None).unwrap();
-        assert_eq!(p.inc_no, 3);
-        assert_eq!(p.mesh_order, 1);
+        let seq = make_seq_o1(vec![ndarray::Array2::<f64>::zeros((4, 2))]);
+        let p = Particle::new(
+            ParticleSource::Sequence(seq),
+            [10.0, 20.0],
+            &[0.0; 6],
+            1e9,
+            true,
+        ).unwrap();
+        assert_eq!(p.inc_no(), 2);
+        assert_eq!(p.mesh_order(), 1);
         assert!(p.track);
-        assert_eq!(p.coordinates.nrows(), 3);
+        assert_eq!(p.coordinates.nrows(), 2);
         assert!((p.coordinates[[0, 0]] - 10.0).abs() < 1e-12);
     }
 
@@ -965,26 +1095,18 @@ mod tests {
     fn test_particle_solve_increment_pure_translation() {
         // Mesh with uniform displacement (u=0.5, v=0.1) on all 4 nodes.
         // Particle at centroid of elem 0 should acquire warp_inc = [0.5, 0.1, 0,0,0,0].
-        let nodes = array![[0.0,0.0],[1.0,0.0],[0.0,1.0],[1.0,1.0]];
-        let elements = array![[0usize,1,2],[1,3,2]];
         let disps = array![[0.5,0.1],[0.5,0.1],[0.5,0.1],[0.5,0.1]];
-        let cm = MeshData {
-            nodes: &nodes,
-            elements: &elements,
-            displacements: &disps,
-            mesh_order: 1,
-        };
+        let mesh_sol = make_mesh_sol_o1(disps);
+        let source = ParticleSource::Mesh(Arc::new(mesh_sol.clone()));
 
         let mut p = Particle::new(
+            source,
             [1.0/3.0, 1.0/3.0],
             &[0.0; 6],
             1e9,
-            2,   // 2 frames → 1 increment
-            1,
             true,
-            None,
         ).unwrap();
-        assert!(p.solve_increment(0, &cm, false));
+        assert!(p.solve_increment(0, &mesh_sol, None));
 
         // Coordinate should have moved by (0.5, 0.1) in Lagrangian mode
         assert!((p.coordinates[[1, 0]] - (1.0/3.0 + 0.5)).abs() < 1e-10,
@@ -999,18 +1121,143 @@ mod tests {
 
     #[test]
     fn test_particle_solve_sequence() {
-        // Two increments of uniform translation → warps accumulate correctly.
-        let nodes = array![[0.0,0.0],[1.0,0.0],[0.0,1.0],[1.0,1.0]];
-        let elements = array![[0usize,1,2],[1,3,2]];
-        let disps = array![[0.1,0.0],[0.1,0.0],[0.1,0.0],[0.1,0.0]];
-        let m = MeshData {
-            nodes: &nodes, elements: &elements,
-            displacements: &disps, mesh_order: 1,
-        };
+        // With a fixed reference (no reference updates), each step queries the mesh
+        // at reference position [0.3, 0.3], so coords[m+1] = ref + disp = 0.4 both times.
+        // The second step with reference_updates[1]=true advances the reference to step 1,
+        // so coords[2] = coords[1] + disp = 0.5.
+        let disps = array![[0.1f64,0.0],[0.1,0.0],[0.1,0.0],[0.1,0.0]];
+        let mesh_sol_0 = make_mesh_sol_o1(disps.clone());
+        let mesh_sol_1 = make_mesh_sol_o1(disps);
+        let seq = Arc::new(crate::sequence::SequenceSolution {
+            mesh_solutions: vec![mesh_sol_0, mesh_sol_1],
+            mesh_paths: vec![],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false, true],  // ref update at step 1
+            mesh_order: 1,
+            first_f_img_path: None,
+        });
+        let mut p = Particle::new(
+            ParticleSource::Sequence(seq),
+            [0.3, 0.3],
+            &[0.0; 6],
+            1e6,
+            true,
+        ).unwrap();
+        p.solve(&ParticleConfig::default(), None).unwrap();
+        let sol = p.solution().unwrap();
+        // Step 0: ref=0, coord=[0.4,0.3]; step 1: ref advances to 1, coord=[0.5,0.3]
+        assert!((sol.coordinates[[1, 0]] - 0.4).abs() < 1e-9,
+            "x1={}", sol.coordinates[[1,0]]);
+        assert!((sol.coordinates[[2, 0]] - 0.5).abs() < 1e-9,
+            "x2={}", sol.coordinates[[2,0]]);
+    }
 
-        let mut p = Particle::new([0.3, 0.3], &[0.0;6], 1e6, 3, 1, true, None).unwrap();
-        let sol = p.solve(&[m], &ParticleConfig::default());
-        // solve expects 2 meshes for inc_no=3; we only supplied 1 → should error
-        assert!(sol.is_err());
+    // -----------------------------------------------------------------------
+    // Saved-by-reference: solve_increment and solve load from disk
+    // -----------------------------------------------------------------------
+
+    fn make_saved_by_ref_seq(tag: &str, disps_list: Vec<Array2<f64>>) -> (Arc<crate::sequence::SequenceSolution>, Vec<std::path::PathBuf>) {
+        let paths: Vec<_> = disps_list.iter().enumerate().map(|(i, _)| {
+            std::env::temp_dir().join(format!("geopyv_test_particle_{tag}_{i}.pyv"))
+        }).collect();
+        for (i, disps) in disps_list.iter().enumerate() {
+            let ms = make_mesh_sol_o1(disps.clone());
+            crate::io::save(&paths[i], &crate::io::GeopyvObject::Mesh(ms)).unwrap();
+        }
+        let sol = Arc::new(crate::sequence::SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: paths.clone(),
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false; disps_list.len()],
+            mesh_order: 1,
+            first_f_img_path: None,
+        });
+        (sol, paths)
+    }
+
+    #[test]
+    fn test_particle_source_inc_no_saved_by_reference() {
+        let (seq, paths) = make_saved_by_ref_seq("inc_no", vec![
+            Array2::<f64>::zeros((4, 2)),
+            Array2::<f64>::zeros((4, 2)),
+        ]);
+        let src = ParticleSource::Sequence(seq);
+        assert_eq!(src.inc_no(), 3);
+        for p in paths { let _ = std::fs::remove_file(p); }
+    }
+
+    #[test]
+    fn test_particle_source_mesh_order_saved_by_reference() {
+        let (seq, paths) = make_saved_by_ref_seq("mesh_order", vec![Array2::<f64>::zeros((4, 2))]);
+        let src = ParticleSource::Sequence(seq);
+        assert_eq!(src.mesh_order(), 1);
+        for p in paths { let _ = std::fs::remove_file(p); }
+    }
+
+    #[test]
+    fn test_particle_solve_increment_saved_by_reference() {
+        let disps = array![[0.3f64, 0.0], [0.3, 0.0], [0.3, 0.0], [0.3, 0.0]];
+        let (seq, paths) = make_saved_by_ref_seq("si_sbr", vec![disps]);
+
+        let mut p = Particle::new(
+            ParticleSource::Sequence(seq),
+            [1.0/3.0, 1.0/3.0],
+            &[0.0; 6],
+            1e9,
+            true,
+        ).unwrap();
+        assert_eq!(p.inc_no(), 2);
+
+        let mesh = p.source.load_mesh_at(0).unwrap();
+        assert!(p.solve_increment(0, &mesh, None));
+        assert!((p.coordinates[[1, 0]] - (1.0/3.0 + 0.3)).abs() < 1e-9,
+            "x={}", p.coordinates[[1, 0]]);
+
+        for path in paths { let _ = std::fs::remove_file(path); }
+    }
+
+    #[test]
+    fn test_particle_solve_saved_by_reference() {
+        // Same geometry as test_particle_solve_sequence but meshes are on disk.
+        // reference_updates[1]=true advances the reference after step 0, so
+        // coords[2] = coords[1] + disp = 0.5 (not 0.4).
+        let disps_0 = array![[0.1f64, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0]];
+        let disps_1 = array![[0.1f64, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0]];
+        let (seq_base, paths) = make_saved_by_ref_seq("solve_sbr", vec![disps_0, disps_1]);
+
+        // Reconstruct with reference update at step 1.
+        let seq = Arc::new(crate::sequence::SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: seq_base.mesh_paths.clone(),
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false, true],
+            mesh_order: 1,
+            first_f_img_path: None,
+        });
+
+        let mut p = Particle::new(
+            ParticleSource::Sequence(seq),
+            [0.3, 0.3],
+            &[0.0; 6],
+            1e6,
+            true,
+        ).unwrap();
+        assert_eq!(p.inc_no(), 3);
+        p.solve(&ParticleConfig::default(), None).unwrap();
+
+        let sol = p.solution().unwrap();
+        assert_eq!(sol.coordinates.nrows(), 3);
+        assert!((sol.coordinates[[1, 0]] - 0.4).abs() < 1e-9,
+            "x1={}", sol.coordinates[[1, 0]]);
+        assert!((sol.coordinates[[2, 0]] - 0.5).abs() < 1e-9,
+            "x2={}", sol.coordinates[[2, 0]]);
+
+        for path in paths { let _ = std::fs::remove_file(path); }
     }
 }

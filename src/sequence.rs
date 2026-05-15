@@ -38,9 +38,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     image::Image,
-    io::{save as io_save, GeopyvObject},
+    io::{load as io_load, save as io_save, GeopyvObject},
     mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig},
-    particle::{MeshData, Particle},
+    particle::{Particle, ParticleSource},
     masks::LocalMask,
     Error,
 };
@@ -143,6 +143,45 @@ pub struct SequenceSolution {
     pub unsolvable: bool,
     /// g-indices (1-based) at which tolerance override was active.
     pub override_log: Vec<usize>,
+    /// One entry per mesh pair; `true` if the reference image advanced at that step.
+    pub reference_updates: Vec<bool>,
+    /// Element order of the meshes in this sequence.  Available in both storage
+    /// modes without loading any mesh file.
+    #[serde(default = "default_mesh_order")]
+    pub mesh_order: u8,
+    /// `f_img_path` of the first solved mesh pair; `None` if no pair was solved.
+    #[serde(default)]
+    pub first_f_img_path: Option<PathBuf>,
+}
+
+fn default_mesh_order() -> u8 { 1 }
+
+impl SequenceSolution {
+    /// Number of mesh pairs, regardless of storage mode.
+    pub fn n_meshes(&self) -> usize {
+        if self.mesh_solutions.is_empty() {
+            self.mesh_paths.len()
+        } else {
+            self.mesh_solutions.len()
+        }
+    }
+
+    /// Load the [`MeshSolution`] for pair `m`.
+    ///
+    /// In-memory mode: clones from the in-memory vector.
+    /// Saved-by-reference mode: deserialises from the corresponding `.pyv` file.
+    pub fn load_mesh_at(&self, m: usize) -> Result<MeshSolution, Error> {
+        if let Some(ms) = self.mesh_solutions.get(m) {
+            return Ok(ms.clone());
+        }
+        let path = &self.mesh_paths[m];
+        match io_load(path)? {
+            GeopyvObject::Mesh(ms) => Ok(ms),
+            _ => Err(Error::InvalidInput(
+                format!("expected Mesh at {}", path.display()),
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +278,9 @@ impl Sequence {
         let mut mesh_solutions: Vec<MeshSolution> = Vec::with_capacity(n_images - 1);
         let mut mesh_paths: Vec<PathBuf> = Vec::new();
         let mut override_log: Vec<usize> = Vec::new();
+        let n_pairs = n_images - 1;
+        let mut reference_updates: Vec<bool> = vec![false; n_pairs];
+        let mut first_f_img_path: Option<PathBuf> = None;
 
         if let Some(ref save_dir) = cfg.save {
             std::fs::create_dir_all(save_dir)?;
@@ -356,6 +398,9 @@ impl Sequence {
                             solved: false,
                             unsolvable: true,
                             override_log,
+                            reference_updates,
+                            mesh_order: self.mesh_cfg.mesh_order,
+                            first_f_img_path,
                         });
                     }
                 }
@@ -367,6 +412,11 @@ impl Sequence {
                     override_log.push(g_index);
                 }
                 mesh_override = false;
+            }
+
+            // Capture reference image path from the first solved pair.
+            if first_f_img_path.is_none() {
+                first_f_img_path = Some(mesh_sol.f_img_path.clone());
             }
 
             // --- Store result and update sync geometry. ---------------------
@@ -420,6 +470,10 @@ impl Sequence {
                 if cfg.options.sync {
                     sync_sol = None;
                 }
+                let next_pair = g_index - 1;
+                if next_pair < n_pairs {
+                    reference_updates[next_pair] = true;
+                }
             }
         }
 
@@ -432,6 +486,9 @@ impl Sequence {
             solved: all_solved,
             unsolvable: false,
             override_log,
+            reference_updates,
+            mesh_order: self.mesh_cfg.mesh_order,
+            first_f_img_path,
         })
     }
 
@@ -443,61 +500,35 @@ impl Sequence {
 
 /// Replicate `Sequence._deformation_preconditioning`.
 ///
-/// Creates a single-increment [`Particle`] at `seed_coord`, applies one
-/// `solve_increment` on the solved mesh, and returns the resulting warp at
-/// frame 1.
-///
 /// # Returns
-/// `(seed_displacement, seed_warp)`
-/// * `seed_displacement` — `[u, v]` displacement at the seed coordinate
-/// * `seed_warp`         — warp vector of length `6*subset_order` for the
-///                         next pair's initial warp (first
-///                         `6*min(mesh_order,subset_order)` terms from frame 1)
+/// `(seed_displacement, seed_warp)` — displacement `[u, v]` at the seed
+/// coordinate and warp vector of length `6*subset_order` for the next pair.
 pub fn deformation_preconditioning(
     sol: &MeshSolution,
     seed_coord: [f64; 2],
     mesh_order: u8,
     subset_order: u8,
 ) -> ([f64; 2], Vec<f64>) {
-    let particle_result = Particle::new(
-        seed_coord,
-        &[0.0f64; 12],
-        1.0,
-        2,        // 2 frames → 1 increment
-        mesh_order,
-        true,     // Lagrangian
-        None,
-    );
-
-    let mut particle = match particle_result {
+    let source = ParticleSource::Mesh(Arc::new(sol.clone()));
+    let mut particle = match Particle::new(source, seed_coord, &[0.0f64; 12], 1.0, true) {
         Ok(p) => p,
         Err(_) => return ([0.0; 2], vec![0.0; 6 * subset_order as usize]),
     };
-
-    let mesh_data = MeshData {
-        nodes: &sol.nodes,
-        elements: &sol.elements,
-        displacements: &sol.displacements,
-        mesh_order,
-    };
-    particle.solve_increment(0, &mesh_data, false);
+    particle.solve_increment(0, sol, None);
 
     let p_len = 6 * mesh_order as usize;
     let warp_1: Vec<f64> = (0..p_len).map(|j| particle.warps[[1, j]]).collect();
-
     let disp = [
         warp_1.first().copied().unwrap_or(0.0),
         warp_1.get(1).copied().unwrap_or(0.0),
     ];
 
-    // Seed warp: first 6*min(mesh_order,subset_order) terms.
     let n_copy = 6 * (mesh_order as usize).min(subset_order as usize);
     let out_len = 6 * subset_order as usize;
     let mut seed_warp_out = vec![0.0f64; out_len];
     for i in 0..n_copy.min(warp_1.len()).min(out_len) {
         seed_warp_out[i] = warp_1[i];
     }
-
     (disp, seed_warp_out)
 }
 
@@ -636,6 +667,7 @@ mod tests {
     fn unit_square_solution(u: f64, v: f64) -> MeshSolution {
         let nodes = array![[0.0f64, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let elements = array![[0usize, 1, 2], [1, 3, 2]];
+        let centroids = crate::mesh::compute_centroids(&nodes, &elements);
         let disps = array![[u, v], [u, v], [u, v], [u, v]];
         let n = 4;
         MeshSolution {
@@ -643,6 +675,7 @@ mod tests {
             elements,
             boundary: vec![0, 1, 2, 3],
             exclusions: vec![],
+            centroids,
             areas: Array1::from_vec(vec![0.5, 0.5]),
             warps: ndarray::Array2::zeros((2, 6)),
             displacements: disps,
@@ -754,5 +787,105 @@ mod tests {
         // the formula is verified here directly.
         let n_images = 5usize;
         assert_eq!(n_images - 1, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // SequenceSolution::n_meshes and load_mesh_at
+    // -----------------------------------------------------------------------
+
+    fn make_sequence_solution_in_memory(n: usize) -> SequenceSolution {
+        let meshes: Vec<MeshSolution> = (0..n).map(|_| unit_square_solution(0.1, 0.0)).collect();
+        SequenceSolution {
+            mesh_solutions: meshes,
+            mesh_paths: vec![],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false; n],
+            mesh_order: 1,
+            first_f_img_path: None,
+        }
+    }
+
+    #[test]
+    fn test_n_meshes_in_memory() {
+        let sol = make_sequence_solution_in_memory(3);
+        assert_eq!(sol.n_meshes(), 3);
+    }
+
+    #[test]
+    fn test_n_meshes_saved_by_reference() {
+        let sol = SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false, false],
+            mesh_order: 1,
+            first_f_img_path: None,
+        };
+        assert_eq!(sol.n_meshes(), 2);
+    }
+
+    #[test]
+    fn test_n_meshes_empty() {
+        let sol = make_sequence_solution_in_memory(0);
+        assert_eq!(sol.n_meshes(), 0);
+    }
+
+    #[test]
+    fn test_load_mesh_at_in_memory() {
+        let sol = make_sequence_solution_in_memory(2);
+        let m = sol.load_mesh_at(0).unwrap();
+        assert_eq!(m.mesh_order, 1);
+        assert_eq!(m.nodes, sol.mesh_solutions[0].nodes);
+    }
+
+    #[test]
+    fn test_load_mesh_at_saved_by_reference() {
+        // Write a mesh to a temp file, then load it back via load_mesh_at.
+        let mesh = unit_square_solution(0.2, 0.0);
+        let tmp = std::env::temp_dir().join("geopyv_test_seq_load_mesh_at.pyv");
+        crate::io::save(&tmp, &GeopyvObject::Mesh(mesh.clone())).unwrap();
+
+        let sol = SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: vec![tmp.clone()],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false],
+            mesh_order: 1,
+            first_f_img_path: None,
+        };
+
+        let loaded = sol.load_mesh_at(0).unwrap();
+        assert_eq!(loaded.nodes, mesh.nodes);
+        assert_eq!(loaded.mesh_order, mesh.mesh_order);
+
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn test_load_mesh_at_wrong_type_returns_err() {
+        // Save a SequenceSolution to disk, then try to load it as a mesh pair → Err.
+        let inner = make_sequence_solution_in_memory(1);
+        let tmp = std::env::temp_dir().join("geopyv_test_seq_wrong_type.pyv");
+        crate::io::save(&tmp, &GeopyvObject::Sequence(inner)).unwrap();
+
+        let sol = SequenceSolution {
+            mesh_solutions: vec![],
+            mesh_paths: vec![tmp.clone()],
+            solved: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false],
+            mesh_order: 1,
+            first_f_img_path: None,
+        };
+        assert!(sol.load_mesh_at(0).is_err());
+
+        let _ = std::fs::remove_file(tmp);
     }
 }

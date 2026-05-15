@@ -344,3 +344,289 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     plt.tight_layout()
     _show_save_close(fig, show, block, save)
     return fig, ax
+
+
+# ---------------------------------------------------------------------------
+# Validation plot helpers
+# ---------------------------------------------------------------------------
+
+_WARP_LABELS = [
+    r"Horizontal displacement, $u$ ($px$)",
+    r"Vertical displacement, $v$ ($px$)",
+    r"Horizontal normal strain, $\epsilon_{xx}$ ($-$)",
+    r"Shear strain component, $dv/dx$ ($-$)",
+    r"Shear strain component, $du/dy$ ($-$)",
+    r"Vertical normal strain, $\epsilon_{yy}$ ($-$)",
+    r"Strain gradient component, $d^2u/dx^2$ ($-$)",
+    r"Strain gradient component, $d^2v/dx^2$ ($-$)",
+    r"Strain gradient component, $d^2u/dxdy$ ($-$)",
+    r"Strain gradient component, $d^2v/dxdy$ ($-$)",
+    r"Strain gradient component, $d^2u/dy^2$ ($-$)",
+    r"Strain gradient component, $d^2v/dy^2$ ($-$)",
+    r"Rotation, $\theta$ ($^o$)",
+    r"Pure shear strain, $\epsilon_{xy}$ ($-$)",
+]
+
+_NOISE_AXES_TITLES = [
+    r"(a) $1^{st}$ Order Subsets, $1^{st}$ Order Mesh",
+    r"(b) $2^{nd}$ Order Subsets, $1^{st}$ Order Mesh",
+    r"(c) $1^{st}$ Order Subsets, $2^{nd}$ Order Mesh",
+    r"(d) $2^{nd}$ Order Subsets, $2^{nd}$ Order Mesh",
+]
+
+_COLOURS = ["r", "b", "g", "orange", "purple", "k", "brown"]
+_MARKERS = ["o", "^", "s", "v", "D", "P"]
+
+
+def _x_series(solution, component):
+    pm = np.asarray(solution.pm)     # (image_no, 12)
+    if component == 12:
+        # pm[i, 0] = angle (radians) at step i for WarpMode::Rotation
+        return np.degrees(pm[1:, 0])
+    elif component == 13:
+        return np.abs(pm[1:, 3])
+    else:
+        return np.abs(pm[1:, component])
+
+
+def _std_error_series(field_data, component):
+    applied  = np.asarray(field_data.applied)   # (n_frames, n_particles, 12)
+    observed = np.asarray(field_data.observed)
+    err = applied[:, :, component] - observed[:, :, component]
+    return np.std(err, axis=1)
+
+
+def _mean_error_series(field_data):
+    applied  = np.asarray(field_data.applied)
+    observed = np.asarray(field_data.observed)
+    diff = applied[:, :, :2] - observed[:, :, :2]
+    l2 = np.sqrt(np.sum(diff ** 2, axis=2))
+    return np.mean(l2, axis=1)
+
+
+def standard_error_validation(solution, component, observing=None,
+                               scale="log", plot="scatter",
+                               xlim=None, ylim=None,
+                               xlabel=None, ylabel=None,
+                               prev_series=None, prev_series_label=None,
+                               show=True, block=True, save=None, **kwargs):
+    fig, ax = plt.subplots()
+    fields = solution.fields
+    x = _x_series(solution, component)
+    for idx, fd in enumerate(fields):
+        y = _std_error_series(fd, component if observing is None else observing)
+        colour = _COLOURS[idx % len(_COLOURS)]
+        marker = _MARKERS[idx % len(_MARKERS)]
+        label  = solution.labels[idx] if idx < len(solution.labels) else str(idx)
+        if plot == "scatter":
+            ax.scatter(x, y, color=colour, marker=marker, label=label, **kwargs)
+        else:
+            ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
+    if prev_series is not None:
+        ax.plot(x, prev_series, color="gray", linestyle="--",
+                label=prev_series_label or "previous")
+    ax.set_xscale(scale)
+    ax.set_yscale(scale)
+    ax.set_xlabel(xlabel or (_WARP_LABELS[component] if component < len(_WARP_LABELS) else ""))
+    ax.set_ylabel(ylabel or "Standard error")
+    ax.legend(loc="upper left")
+    ax.grid(True, which="both", linestyle=":", alpha=0.5)
+    _show_save_close(fig, show, block, save)
+    return fig, ax
+
+
+def mean_error_validation(solution, component,
+                          scale="log", plot="scatter",
+                          xlim=None, ylim=None,
+                          prev_series=None, prev_series_label=None,
+                          show=True, block=True, save=None, **kwargs):
+    fig, ax = plt.subplots()
+    x = _x_series(solution, component)
+    for idx, fd in enumerate(solution.fields):
+        y = _mean_error_series(fd)
+        colour = _COLOURS[idx % len(_COLOURS)]
+        marker = _MARKERS[idx % len(_MARKERS)]
+        label  = solution.labels[idx] if idx < len(solution.labels) else str(idx)
+        if plot == "scatter":
+            ax.scatter(x, y, color=colour, marker=marker, label=label, **kwargs)
+        else:
+            ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
+    if prev_series is not None:
+        ax.plot(x, prev_series, color="gray", linestyle="--",
+                label=prev_series_label or "previous")
+    ax.set_xscale(scale)
+    ax.set_yscale(scale)
+    ax.set_xlabel(_WARP_LABELS[component] if component < len(_WARP_LABELS) else "")
+    ax.set_ylabel("Mean L2 displacement error ($px$)")
+    ax.legend(loc="upper left")
+    ax.grid(True, which="both", linestyle=":", alpha=0.5)
+    _show_save_close(fig, show, block, save)
+    return fig, ax
+
+
+def noise_standard_error_validation(solution, component, observing=None,
+                                     scale="log", plot="scatter",
+                                     xlim=None, ylim=None,
+                                     xlabel=None, ylabel=None,
+                                     show=True, block=True, save=None, **kwargs):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    x = _x_series(solution, component)
+    for panel_idx, ax in enumerate(axes.flat):
+        field_group_start = panel_idx * 1
+        for sub_idx in range(len(solution.fields)):
+            if sub_idx // 4 != panel_idx:
+                continue
+            fd = solution.fields[sub_idx]
+            y  = _std_error_series(fd, component if observing is None else observing)
+            colour = _COLOURS[sub_idx % len(_COLOURS)]
+            marker = _MARKERS[sub_idx % len(_MARKERS)]
+            label  = solution.labels[sub_idx] if sub_idx < len(solution.labels) else str(sub_idx)
+            if plot == "scatter":
+                ax.scatter(x, y, color=colour, marker=marker, label=label, **kwargs)
+            else:
+                ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
+        ax.set_xscale(scale)
+        ax.set_yscale(scale)
+        if panel_idx < len(_NOISE_AXES_TITLES):
+            ax.set_title(_NOISE_AXES_TITLES[panel_idx])
+        ax.set_xlabel(xlabel or (_WARP_LABELS[component] if component < len(_WARP_LABELS) else ""))
+        ax.set_ylabel(ylabel or "Standard error")
+        ax.grid(True, which="both", linestyle=":", alpha=0.5)
+    axes[1, 1].legend(loc="upper left")
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save)
+    return fig, axes
+
+
+def noise_mean_error_validation(solution, component,
+                                 scale="log", plot="scatter",
+                                 xlim=None, ylim=None,
+                                 show=True, block=True, save=None, **kwargs):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    x = _x_series(solution, component)
+    for panel_idx, ax in enumerate(axes.flat):
+        for sub_idx in range(len(solution.fields)):
+            if sub_idx // 4 != panel_idx:
+                continue
+            fd = solution.fields[sub_idx]
+            y  = _mean_error_series(fd)
+            colour = _COLOURS[sub_idx % len(_COLOURS)]
+            marker = _MARKERS[sub_idx % len(_MARKERS)]
+            label  = solution.labels[sub_idx] if sub_idx < len(solution.labels) else str(sub_idx)
+            if plot == "scatter":
+                ax.scatter(x, y, color=colour, marker=marker, label=label, **kwargs)
+            else:
+                ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
+        ax.set_xscale(scale)
+        ax.set_yscale(scale)
+        if panel_idx < len(_NOISE_AXES_TITLES):
+            ax.set_title(_NOISE_AXES_TITLES[panel_idx])
+        ax.set_xlabel(_WARP_LABELS[component] if component < len(_WARP_LABELS) else "")
+        ax.set_ylabel("Mean L2 displacement error ($px$)")
+        ax.grid(True, which="both", linestyle=":", alpha=0.5)
+    axes[1, 1].legend(loc="upper left")
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save)
+    return fig, axes
+
+
+def strain_error_validation(solution,
+                             scale="log", plot="scatter",
+                             xlim=None, ylim=None,
+                             show=True, block=True, save=None, **kwargs):
+    fig, axes = plt.subplots(3, 1, figsize=(8, 12))
+    mult = np.asarray(solution.mult)[1:]  # (n_frames,) x-axis
+
+    for idx, fd in enumerate(solution.fields):
+        applied  = np.asarray(fd.applied)
+        observed = np.asarray(fd.observed)
+        colour = _COLOURS[idx % len(_COLOURS)]
+        marker = _MARKERS[idx % len(_MARKERS)]
+        label  = solution.labels[idx] if idx < len(solution.labels) else str(idx)
+
+        # Panel 0: std of L2 displacement error
+        diff_disp = applied[:, :, :2] - observed[:, :, :2]
+        l2 = np.sqrt(np.sum(diff_disp ** 2, axis=2))
+        y0 = np.std(l2, axis=1)
+
+        # Panel 1: std of shear strain error — avg of warp components 3 and 4
+        err3 = applied[:, :, 3] - observed[:, :, 3]
+        err4 = applied[:, :, 4] - observed[:, :, 4]
+        y1 = np.std(0.5 * (err3 + err4), axis=1)
+
+        # Panel 2: std of volumetric strain error
+        # det(F) - 1 where F = I + grad(u)
+        # F = [[1+du/dx, du/dy],[dv/dx, 1+dv/dy]] = [[1+w2,w4],[w3,1+w5]]
+        def det_err(w):
+            return (1.0 + w[:, :, 2]) * (1.0 + w[:, :, 5]) - w[:, :, 3] * w[:, :, 4]
+        vol_err = det_err(applied) - det_err(observed)
+        y2 = np.std(vol_err, axis=1)
+
+        for ax, y in zip(axes, [y0, y1, y2]):
+            if plot == "scatter":
+                ax.scatter(mult, y, color=colour, marker=marker, label=label, **kwargs)
+            else:
+                ax.plot(mult, y, color=colour, marker=marker, label=label, **kwargs)
+
+    for ax in axes:
+        ax.set_xscale(scale)
+        ax.set_yscale(scale)
+        ax.grid(True, which="both", linestyle=":", alpha=0.5)
+    axes[0].set_ylabel("Std L2 displacement error ($px$)")
+    axes[1].set_ylabel(r"Std shear strain error ($-$)")
+    axes[2].set_ylabel(r"Std volumetric strain error ($-$)")
+    axes[2].set_xlabel("Warp multiplier")
+    axes[0].legend(loc="upper left")
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save)
+    return fig, axes
+
+
+def spatial_error_validation(solution, field_index, time_index, quantity="R",
+                              imshow=True, colorbar=True,
+                              ticks=None, alpha=0.5, levels=None,
+                              xlim=None, ylim=None,
+                              show=True, block=True, save=None, **kwargs):
+    fd = solution.fields[field_index]
+    applied  = np.asarray(fd.applied)   # (n_frames, n_particles, 12)
+    observed = np.asarray(fd.observed)
+    coords   = np.asarray(fd.coordinates)  # (n_frames+1, n_particles, 2)
+
+    # Particle positions at time_index (clamped to available frames)
+    t = min(time_index, coords.shape[0] - 1)
+    xy = coords[t]  # (n_particles, 2)
+    x_pos = xy[:, 0]
+    y_pos = xy[:, 1]
+
+    # Error quantity (use frame time_index-1 if time_index >= 1, else frame 0)
+    frame = min(max(time_index - 1, 0), applied.shape[0] - 1)
+    if quantity == "u":
+        err = applied[frame, :, 0] - observed[frame, :, 0]
+    elif quantity == "v":
+        err = applied[frame, :, 1] - observed[frame, :, 1]
+    else:  # "R" — L2 displacement error
+        du = applied[frame, :, 0] - observed[frame, :, 0]
+        dv = applied[frame, :, 1] - observed[frame, :, 1]
+        err = np.sqrt(du**2 + dv**2)
+
+    fig, ax = plt.subplots()
+    if imshow:
+        img_path = fd.image_0_path
+        _imshow_or_blank(ax, img_path)
+
+    triang = tri.Triangulation(x_pos, y_pos)
+    contour_kwargs = {}
+    if levels is not None:
+        contour_kwargs["levels"] = levels
+    contour_kwargs.update(kwargs)
+    cf = ax.tricontourf(triang, err, alpha=alpha, **contour_kwargs)
+    if colorbar:
+        cb = fig.colorbar(cf, ax=ax)
+        if ticks is not None:
+            cb.set_ticks(ticks)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    _show_save_close(fig, show, block, save)
+    return fig, ax

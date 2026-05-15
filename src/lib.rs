@@ -1,3 +1,4 @@
+pub mod calibration;
 pub mod error;
 pub mod geometry;
 pub mod image;
@@ -8,6 +9,7 @@ pub mod field;
 pub mod sequence;
 pub mod subset;
 pub mod masks;
+pub mod speckle;
 pub mod validation;
 
 pub use error::Error;

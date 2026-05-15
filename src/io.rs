@@ -35,6 +35,7 @@ use crate::{
     mesh::MeshSolution,
     particle::ParticleSolution,
     sequence::SequenceSolution,
+    speckle::Speckle,
     subset::SubsetSolution,
     Error,
 };
@@ -62,6 +63,7 @@ pub enum GeopyvObject {
     Field(FieldSolution),
     Sequence(SequenceSolution),
     Particle(ParticleSolution),
+    Speckle(Speckle),
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +144,15 @@ mod tests {
 
     /// Build a minimal MeshSolution with known values for round-trip tests.
     fn make_mesh_solution() -> MeshSolution {
+        let nodes = array![[0.0_f64, 0.0], [1.0, 0.0], [0.5, 1.0]];
+        let elements = array![[0usize, 1, 2]];
+        let centroids = crate::mesh::compute_centroids(&nodes, &elements);
         MeshSolution {
-            nodes: array![[0.0_f64, 0.0], [1.0, 0.0], [0.5, 1.0]],
-            elements: array![[0usize, 1, 2]],
+            nodes,
+            elements,
             boundary: vec![0, 1, 2],
             exclusions: vec![],
+            centroids,
             areas: array![0.5_f64],
             warps: array![[0.1_f64, 0.2, 0.0, 0.0, 0.0, 0.0,
                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
@@ -196,6 +202,9 @@ mod tests {
             solved: true,
             unsolvable: false,
             override_log: vec![],
+            reference_updates: vec![false, false],
+            mesh_order: 1,
+            first_f_img_path: None,
         };
         let tmp = std::env::temp_dir().join("geopyv_test_seq.pyv");
         save(&tmp, &GeopyvObject::Sequence(sol.clone())).unwrap();
