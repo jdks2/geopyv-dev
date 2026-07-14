@@ -52,4 +52,10 @@ class ParticleWrapper:
     def inspect(self, **kwargs):
         return plots.inspect_particle(self._inner, **kwargs)
 
+    def history(self, quantity="warps", **kwargs):
+        return plots.history_particle(self._inner, quantity, **kwargs)
+
+    def trace(self, quantity="warps", component=0, **kwargs):
+        return plots.trace_particle(self._inner, quantity, component, **kwargs)
+
 

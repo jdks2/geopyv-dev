@@ -1653,7 +1653,7 @@ fn run_solve(
     let n_images = params.image_paths.len();
     let n_pairs = n_images - 1;
 
-    let mut mesh_solutions: Vec<MeshSolution> = Vec::with_capacity(n_pairs);
+    let mut mesh_solutions: Vec<Arc<MeshSolution>> = Vec::with_capacity(n_pairs);
     let mut override_log: Vec<usize> = Vec::new();
     let mut sync_sol: Option<MeshSolution> = None;
     let mut mesh_override = false;
@@ -1773,6 +1773,9 @@ fn run_solve(
                     drop(io_tx);
                     let _ = io_thread.join();
                     let sol = SequenceSolution {
+                        reference_updates: vec![false; mesh_solutions.len()],
+                        mesh_order: params.mesh_order,
+                        first_f_img_path: params.image_paths.first().cloned(),
                         mesh_solutions,
                         mesh_paths: vec![],
                         solved: false,
@@ -1803,7 +1806,7 @@ fn run_solve(
         if params.sync {
             sync_sol = Some(mesh_sol.clone());
         }
-        mesh_solutions.push(mesh_sol.clone());
+        mesh_solutions.push(Arc::new(mesh_sol.clone()));
 
         g_index += 1;
         if g_index >= n_images {
@@ -1848,6 +1851,9 @@ fn run_solve(
     }
 
     let sol = SequenceSolution {
+        reference_updates: vec![false; mesh_solutions.len()],
+        mesh_order: params.mesh_order,
+        first_f_img_path: params.image_paths.first().cloned(),
         mesh_solutions,
         mesh_paths: vec![],
         solved: true,

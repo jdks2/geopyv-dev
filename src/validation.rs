@@ -356,8 +356,8 @@ mod tests {
     }
 
     fn make_field_sol(n_frames: usize, u: f64, n_particles: usize) -> FieldSolution {
-        let particles: Vec<ParticleSolution> =
-            (0..n_particles).map(|_| make_particle_sol(n_frames, u)).collect();
+        let particles: Vec<Arc<ParticleSolution>> =
+            (0..n_particles).map(|_| Arc::new(make_particle_sol(n_frames, u))).collect();
         let mut init_coords = Array2::<f64>::zeros((n_particles, 2));
         for j in 0..n_particles {
             init_coords[[j, 0]] = 100.0;
@@ -384,7 +384,7 @@ mod tests {
         let speckle = make_speckle_translation(u, image_no);
 
         // Build ParticleSolution with warps[i,0] = u * scale_mult_at(i) for i in 1..=n_frames
-        let mut particles = Vec::new();
+        let mut particles: Vec<Arc<ParticleSolution>> = Vec::new();
         for _ in 0..2 {
             let mut warps = Array2::<f64>::zeros((n_frames + 1, 12));
             let mut coords = Array2::<f64>::zeros((n_frames + 1, 2));
@@ -396,7 +396,7 @@ mod tests {
                 coords[[i, 0]] = 100.0 + u * m;
                 coords[[i, 1]] = 100.0;
             }
-            particles.push(ParticleSolution {
+            particles.push(Arc::new(ParticleSolution {
                 coordinates: coords,
                 warps,
                 incs: Array2::zeros((n_frames + 1, 12)),
@@ -407,7 +407,7 @@ mod tests {
                 reference_update_register: vec![],
                 image_0_path: None,
                 calibrated: false,
-            });
+            }));
         }
 
         let mut init_coords = Array2::<f64>::zeros((2, 2));

@@ -1,5 +1,6 @@
 mod py_calibration;
 mod py_image;
+mod utils;
 mod py_speckle;
 mod py_mask;
 mod py_geometry;

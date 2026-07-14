@@ -29,6 +29,7 @@ use crate::{
     py_geometry::extract_region,
     py_image::PyImage,
     py_mask::PyMask,
+    utils::{arc_array1, arc_array2},
     Error,
 };
 
@@ -45,7 +46,7 @@ pub struct PyMesh {
     pub(crate) inner: Mesh,
     pub(crate) f_img: Option<Py<PyImage>>,
     pub(crate) g_img: Option<Py<PyImage>>,
-    pub(crate) solution: Option<MeshSolution>,
+    pub(crate) solution: Option<Arc<MeshSolution>>,
 }
 
 #[pymethods]
@@ -182,7 +183,7 @@ impl PyMesh {
             method: solve_method,
         };
         let sol = self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
-        self.solution = Some(sol);
+        self.solution = Some(Arc::new(sol));
         Ok(())
     }
 
@@ -250,31 +251,31 @@ impl PyMesh {
     /// Signed element areas ``(M,)``.
     #[getter]
     fn areas<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.require_solved()?.areas.clone().into_pyarray_bound(py))
+        arc_array1(py, self.require_solved_arc()?, |s| &s.areas)
     }
 
     /// Element warp vectors ``(M, 12)``.
     #[getter]
     fn warps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        Ok(self.require_solved()?.warps.clone().into_pyarray_bound(py))
+        arc_array2(py, self.require_solved_arc()?, |s| &s.warps)
     }
 
     /// Per-node displacements ``(N, 2)``.
     #[getter]
     fn displacements<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        Ok(self.require_solved()?.displacements.clone().into_pyarray_bound(py))
+        arc_array2(py, self.require_solved_arc()?, |s| &s.displacements)
     }
 
     /// Per-node ZNCC scores ``(N,)``.
     #[getter]
     fn c_zncc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.require_solved()?.c_zncc.clone().into_pyarray_bound(py))
+        arc_array1(py, self.require_solved_arc()?, |s| &s.c_zncc)
     }
 
     /// Per-node warp parameters ``(N, 6)`` or ``(N, 12)``.
     #[getter]
     fn p<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        Ok(self.require_solved()?.p.clone().into_pyarray_bound(py))
+        arc_array2(py, self.require_solved_arc()?, |s| &s.p)
     }
 
     /// Index of the seed node.
@@ -292,13 +293,13 @@ impl PyMesh {
     /// Per-node iteration counts ``(N,)``.
     #[getter]
     fn iterations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        Ok(self.require_solved()?.iterations.clone().into_pyarray_bound(py))
+        arc_array1(py, self.require_solved_arc()?, |s| &s.iterations)
     }
 
     /// Per-node final ∆norm values ``(N,)``.
     #[getter]
     fn norms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.require_solved()?.norms.clone().into_pyarray_bound(py))
+        arc_array1(py, self.require_solved_arc()?, |s| &s.norms)
     }
 
     /// Reference image file path, or ``None`` if not set.
@@ -324,7 +325,7 @@ impl PyMesh {
         let sol = self.solution.as_ref().ok_or_else(|| {
             PyRuntimeError::new_err("Mesh has not been solved; cannot save.")
         })?;
-        io_save(path, &GeopyvObject::Mesh(sol.clone())).map_err(Error::from)?;
+        io_save(path, &GeopyvObject::Mesh((**sol).clone())).map_err(Error::from)?;
         Ok(())
     }
 
@@ -359,6 +360,12 @@ impl PyMesh {
 
 impl PyMesh {
     fn require_solved(&self) -> PyResult<&MeshSolution> {
+        self.solution.as_deref().ok_or_else(|| {
+            PyAttributeError::new_err("Mesh has not been solved; call solve() first")
+        })
+    }
+
+    fn require_solved_arc(&self) -> PyResult<&Arc<MeshSolution>> {
         self.solution.as_ref().ok_or_else(|| {
             PyAttributeError::new_err("Mesh has not been solved; call solve() first")
         })
@@ -366,48 +373,55 @@ impl PyMesh {
 
     /// Restore a solved `PyMesh` from a serialised `MeshSolution`.
     ///
-    /// Attempts to reload the reference and target images from their stored
-    /// paths.  Falls back to a 1×1 placeholder image if a path is missing or
-    /// the file cannot be read (the mesh geometry is always restored).
-    pub(crate) fn from_solution(py: Python<'_>, sol: MeshSolution) -> PyResult<Self> {
+    /// Images are NOT loaded — only geometry and solution arrays are restored.
+    /// `f_img` / `g_img` will be `None`; `f_img_path` / `g_img_path` remain
+    /// accessible for display purposes.  Call `reload_images()` explicitly if
+    /// the full `Image` (with B-spline coefficients) is needed for re-solving.
+    pub(crate) fn from_solution(_py: Python<'_>, sol: Arc<MeshSolution>) -> PyResult<Self> {
+        let dummy = Arc::new(Image::from_array(ndarray::Array2::<f64>::zeros((10, 10)), 3));
+        let inner = Mesh::from_solution(&sol, Arc::clone(&dummy), dummy);
+        Ok(PyMesh {
+            inner,
+            f_img: None,
+            g_img: None,
+            solution: Some(sol),
+        })
+    }
+
+    /// Load (or reload) the reference and target images from their stored paths.
+    ///
+    /// Required before re-solving a restored mesh.  Reads both images from disk
+    /// and computes B-spline coefficients.
+    pub(crate) fn reload_images(&mut self, py: Python<'_>) -> PyResult<()> {
+        let sol = self.require_solved_arc()?.clone();
         let dummy = || Arc::new(Image::from_array(ndarray::Array2::<f64>::zeros((10, 10)), 3));
 
-        let mut f_py: Option<Py<PyImage>> = None;
         let mut f_arc = dummy();
         if !sol.f_img_path.as_os_str().is_empty() {
             if let Ok(img) = Image::from_file(&sol.f_img_path, 20) {
                 let arc = Arc::new(img);
                 f_arc = Arc::clone(&arc);
-                let py_img = PyImage {
+                self.f_img = Py::new(py, PyImage {
                     inner: arc,
                     filepath: Some(sol.f_img_path.to_string_lossy().into_owned()),
-                };
-                f_py = Py::new(py, py_img).ok();
+                }).ok();
             }
         }
 
-        let mut g_py: Option<Py<PyImage>> = None;
         let mut g_arc = dummy();
         if !sol.g_img_path.as_os_str().is_empty() {
             if let Ok(img) = Image::from_file(&sol.g_img_path, 20) {
                 let arc = Arc::new(img);
                 g_arc = Arc::clone(&arc);
-                let py_img = PyImage {
+                self.g_img = Py::new(py, PyImage {
                     inner: arc,
                     filepath: Some(sol.g_img_path.to_string_lossy().into_owned()),
-                };
-                g_py = Py::new(py, py_img).ok();
+                }).ok();
             }
         }
 
-        let inner = Mesh::from_solution(&sol, f_arc, g_arc);
-
-        Ok(PyMesh {
-            inner,
-            f_img: f_py,
-            g_img: g_py,
-            solution: Some(sol),
-        })
+        self.inner = Mesh::from_solution(&sol, f_arc, g_arc);
+        Ok(())
     }
 }
 

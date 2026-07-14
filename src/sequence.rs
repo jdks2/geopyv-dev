@@ -34,14 +34,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ndarray::Axis;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    geometry::region::{Region, RegionOption},
     image::Image,
     io::{load as io_load, save as io_save, GeopyvObject},
     mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig},
     particle::{Particle, ParticleSource},
     masks::LocalMask,
+    subset::Subset,
     Error,
 };
 
@@ -64,16 +67,17 @@ fn last_number_in_name(s: &str) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Parameters forwarded to [`Mesh::new`] for each image pair.
+///
+/// `boundary`/`exclusions` are live [`Region`]s (not raw arrays) so that
+/// [`Sequence::solve`] can track their displacement across reference-image
+/// updates, mirroring `Mesh._store_region` / `Mesh._update_region` in the
+/// original Python (`geopyv/src/geopyv/mesh.py`).
 #[derive(Debug, Clone)]
 pub struct SequenceMeshConfig {
-    /// Boundary polygon vertices `(N, 2)`.
-    pub boundary_nodes: ndarray::Array2<f64>,
-    /// If `true`, only pixels inside the boundary polygon are active.
-    pub boundary_hard: bool,
-    /// Exclusion polygon arrays.
-    pub exclusion_nodes: Vec<ndarray::Array2<f64>>,
-    /// Per-exclusion hard flag (soft = meshing constraint only, does not clip mask).
-    pub exclusions_hard: Vec<bool>,
+    /// Boundary region (polygon vertices + tracking mode).
+    pub boundary: Region,
+    /// Exclusion regions.
+    pub exclusions: Vec<Region>,
     /// `(size_lower, size_upper)` element edge lengths.
     pub size: (f64, f64),
     pub target_nodes: usize,
@@ -132,7 +136,7 @@ pub struct SequenceSolveConfig {
 pub struct SequenceSolution {
     /// Per-pair DIC solutions when solve was called with `save = None`.
     /// Empty when meshes were saved by reference.
-    pub mesh_solutions: Vec<MeshSolution>,
+    pub mesh_solutions: Vec<Arc<MeshSolution>>,
     /// File paths of per-frame `.pyv` files when solve was called with
     /// `save = Some(dir)`.  Empty when meshes are held in memory.
     pub mesh_paths: Vec<PathBuf>,
@@ -152,6 +156,27 @@ pub struct SequenceSolution {
     /// `f_img_path` of the first solved mesh pair; `None` if no pair was solved.
     #[serde(default)]
     pub first_f_img_path: Option<PathBuf>,
+    /// Final tracked state of the boundary region (displaced across the whole run).
+    #[serde(default = "default_boundary_region")]
+    pub boundary_region: Region,
+    /// Final tracked state of each exclusion region.
+    #[serde(default)]
+    pub exclusion_regions: Vec<Region>,
+}
+
+/// Minimal static placeholder region — used where a full boundary/exclusion
+/// history isn't available or needed (e.g. reconstructing a `Sequence` shell
+/// from a saved [`SequenceSolution`], where only the solved data matters).
+pub fn default_boundary_region() -> Region {
+    Region::path(
+        Some([0.0, 0.0]),
+        ndarray::array![[0.0, 0.0]],
+        RegionOption::S,
+        false,
+        false,
+        0.0,
+    )
+    .expect("static placeholder region is always valid")
 }
 
 fn default_mesh_order() -> u8 { 1 }
@@ -170,13 +195,13 @@ impl SequenceSolution {
     ///
     /// In-memory mode: clones from the in-memory vector.
     /// Saved-by-reference mode: deserialises from the corresponding `.pyv` file.
-    pub fn load_mesh_at(&self, m: usize) -> Result<MeshSolution, Error> {
-        if let Some(ms) = self.mesh_solutions.get(m) {
-            return Ok(ms.clone());
+    pub fn load_mesh_at(&self, m: usize) -> Result<Arc<MeshSolution>, Error> {
+        if let Some(arc) = self.mesh_solutions.get(m) {
+            return Ok(Arc::clone(arc));
         }
         let path = &self.mesh_paths[m];
         match io_load(path)? {
-            GeopyvObject::Mesh(ms) => Ok(ms),
+            GeopyvObject::Mesh(ms) => Ok(Arc::new(ms)),
             _ => Err(Error::InvalidInput(
                 format!("expected Mesh at {}", path.display()),
             )),
@@ -275,7 +300,7 @@ impl Sequence {
     /// `{dir}/mesh_{i:04}.pyv` and not held in memory.
     pub fn solve(&self, cfg: &SequenceSolveConfig) -> Result<SequenceSolution, Error> {
         let n_images = self.image_paths.len();
-        let mut mesh_solutions: Vec<MeshSolution> = Vec::with_capacity(n_images - 1);
+        let mut mesh_solutions: Vec<Arc<MeshSolution>> = Vec::with_capacity(n_images - 1);
         let mut mesh_paths: Vec<PathBuf> = Vec::new();
         let mut override_log: Vec<usize> = Vec::new();
         let n_pairs = n_images - 1;
@@ -298,9 +323,20 @@ impl Sequence {
         };
 
         // Cached previous-pair solution for sync mode.
-        let mut sync_sol: Option<MeshSolution> = None;
+        let mut sync_sol: Option<Arc<MeshSolution>> = None;
         // Override flag: relax tolerance for the next mesh solve.
         let mut mesh_override = false;
+
+        // Live region state, tracked across pairs (mirrors Python's
+        // `boundary_obj`/`exclusion_objs` being threaded through every
+        // `Mesh()` construction in `Sequence.solve`). Boundary is always
+        // coerced from `R` to `F` (mesh.py:898-899): a boundary can deform,
+        // it doesn't just rigidly translate/rotate.
+        let mut boundary_region = self.mesh_cfg.boundary.clone();
+        if boundary_region.option == RegionOption::R {
+            boundary_region.option = RegionOption::F;
+        }
+        let mut exclusion_regions = self.mesh_cfg.exclusions.clone();
 
         // Load initial images as Arc to enable zero-cost sharing across pairs.
         let mut f_img: Arc<Image> = Arc::new(Image::from_file(&self.image_paths[f_index], cfg.border)?);
@@ -328,16 +364,30 @@ impl Sequence {
         let all_solved;
 
         'outer: loop {
+            // --- Update tracked regions for this pair's reference image. ---
+            // Mirrors `Mesh._update_region` being called unconditionally from
+            // `Mesh.__init__` (mesh.py:912-913): a no-op unless the reference
+            // image just changed, in which case it snaps `current_nodes` to
+            // the last stored (displaced) snapshot.
+            let f_path = f_img.filepath.as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            boundary_region.update(&f_path);
+            for r in exclusion_regions.iter_mut() {
+                r.update(&f_path);
+            }
+
             // --- Build mesh for this pair. ----------------------------------
             // In sync mode, reuse previous pair's geometry when available.
-            let excl_views: Vec<_> = self.mesh_cfg.exclusion_nodes.iter().map(|a| a.view()).collect();
+            let excl_views: Vec<_> = exclusion_regions.iter().map(|r| r.current_nodes.view()).collect();
+            let excl_hard: Vec<bool> = exclusion_regions.iter().map(|r| r.hard).collect();
             let mesh = match (cfg.options.sync, &sync_sol) {
                 (true, Some(prev)) => Mesh::from_solution(prev, Arc::clone(&f_img), Arc::clone(&g_img)),
                 _ => Mesh::new(
-                    self.mesh_cfg.boundary_nodes.view(),
-                    self.mesh_cfg.boundary_hard,
+                    boundary_region.current_nodes.view(),
+                    boundary_region.hard,
                     &excl_views,
-                    &self.mesh_cfg.exclusions_hard,
+                    &excl_hard,
                     self.mesh_cfg.size,
                     self.mesh_cfg.target_nodes,
                     self.mesh_cfg.mesh_order,
@@ -375,8 +425,8 @@ impl Sequence {
 
             let pair_result = mesh.solve(&cfg.local_mask, &pair_seed, &pair_cfg, Some(&pb_mesh));
 
-            let mesh_sol = match pair_result {
-                Ok(sol) => sol,
+            let mesh_sol: Arc<MeshSolution> = match pair_result {
+                Ok(sol) => Arc::new(sol),
                 Err(_) => {
                     // Attempt to fall back to an updated reference.
                     if f_index + 1 < g_index {
@@ -401,6 +451,8 @@ impl Sequence {
                             reference_updates,
                             mesh_order: self.mesh_cfg.mesh_order,
                             first_f_img_path,
+                            boundary_region,
+                            exclusion_regions,
                         });
                     }
                 }
@@ -419,17 +471,31 @@ impl Sequence {
                 first_f_img_path = Some(mesh_sol.f_img_path.clone());
             }
 
+            // --- Store displaced region state. -------------------------------
+            // Mirrors `Mesh._store_region` (mesh.py:1400-1429): records this
+            // pair's displaced boundary/exclusion positions so a later
+            // reference update can snap back to where the specimen actually
+            // moved to, instead of the original static polygon.
+            store_region_step(
+                &mut boundary_region,
+                &mut exclusion_regions,
+                &mesh_sol,
+                &f_img,
+                &g_img,
+                cfg.mesh_cfg.subset_order,
+            )?;
+
             // --- Store result and update sync geometry. ---------------------
             if cfg.options.sync {
-                sync_sol = Some(mesh_sol.clone());
+                sync_sol = Some(Arc::clone(&mesh_sol));
             }
             if let Some(ref save_dir) = cfg.save {
                 let frame_path = save_dir.join(format!("mesh_{:04}.pyv", mesh_paths.len()));
-                io_save(&frame_path, &GeopyvObject::Mesh(mesh_sol.clone()))
+                io_save(&frame_path, &GeopyvObject::Mesh((*mesh_sol).clone()))
                     .map_err(|e| Error::Io(format!("frame save failed: {e}")))?;
                 mesh_paths.push(frame_path);
             } else {
-                mesh_solutions.push(mesh_sol.clone());
+                mesh_solutions.push(Arc::clone(&mesh_sol));
             }
 
             pb_seq.inc(1);
@@ -489,9 +555,91 @@ impl Sequence {
             reference_updates,
             mesh_order: self.mesh_cfg.mesh_order,
             first_f_img_path,
+            boundary_region,
+            exclusion_regions,
         })
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// store_region_step — free function
+// ---------------------------------------------------------------------------
+
+/// Store this pair's displaced boundary/exclusion node positions into their
+/// tracked [`Region`]s.
+///
+/// Mirrors `Mesh._store_region` (`mesh.py:1400-1429`). Exclusions with
+/// `option == R` (rigid) are re-registered via a fresh [`Subset`] solve
+/// centred on the exclusion (Python's Circle-`R` special case, `mesh.py:1403-1421`)
+/// rather than using raw nodal displacements, since a small circular exclusion's
+/// own mesh nodes are a noisier basis for translation/rotation than a direct
+/// correlation. If that solve doesn't reach `tolerance = 0.9`, storing is
+/// skipped entirely for this pair (boundary included) — matching Python's
+/// early return (`mesh.py:1416-1419`), which leaves the mesh `solved` but
+/// simply drops that pair's region-history entry.
+fn store_region_step(
+    boundary: &mut Region,
+    exclusions: &mut [Region],
+    sol: &MeshSolution,
+    f_img: &Arc<Image>,
+    g_img: &Arc<Image>,
+    subset_order: usize,
+) -> Result<(), Error> {
+    enum ExclWarp {
+        Rigid(Vec<f64>),
+        Flexible(ndarray::Array2<f64>),
+        None,
+    }
+
+    let mut warps = Vec::with_capacity(exclusions.len());
+    for (i, excl) in exclusions.iter().enumerate() {
+        match excl.option {
+            RegionOption::R => {
+                let radius = excl.radius()?;
+                let local_mask = LocalMask::circle(radius.round() as usize)?;
+                let subset = Subset::new(
+                    excl.current_centre,
+                    &local_mask,
+                    None,
+                    Arc::clone(f_img),
+                    Arc::clone(g_img),
+                    subset_order,
+                )?;
+                let disp = sol.displacements.select(Axis(0), &sol.exclusions[i]);
+                let mean = disp.mean_axis(Axis(0)).unwrap_or_else(|| ndarray::Array1::zeros(2));
+                let mut warp_0 = vec![0.0f64; 6 * subset_order];
+                warp_0[0] = mean[0];
+                warp_0[1] = mean[1];
+                let result = subset.solve_icgn(Some(&warp_0), 0.9, 1e-5, 50)?;
+                if !result.solved {
+                    // Registration failed: skip storing entirely for this pair.
+                    return Ok(());
+                }
+                warps.push(ExclWarp::Rigid(result.p));
+            }
+            RegionOption::F => {
+                let disp = sol.displacements.select(Axis(0), &sol.exclusions[i]);
+                warps.push(ExclWarp::Flexible(disp));
+            }
+            RegionOption::S | RegionOption::D => {
+                warps.push(ExclWarp::None);
+            }
+        }
+    }
+
+    for (excl, warp) in exclusions.iter_mut().zip(warps) {
+        match warp {
+            ExclWarp::Rigid(p) => excl.store_rigid(&p)?,
+            ExclWarp::Flexible(disp) => excl.store_flexible(disp.view())?,
+            ExclWarp::None => {}
+        }
+    }
+
+    let boundary_disp = sol.displacements.select(Axis(0), &sol.boundary);
+    boundary.store_flexible(boundary_disp.view())?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -744,16 +892,57 @@ mod tests {
     // Sequence::new validation
     // -----------------------------------------------------------------------
 
-    fn dummy_mesh_cfg() -> SequenceMeshConfig {
+    fn dummy_region() -> Region {
         let boundary = ndarray::array![[0.0f64, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        // Static (untracked) — preserves the pre-tracking test behaviour: a
+        // frozen boundary, same as a raw-ndarray caller gets today.
+        Region::path(None, boundary, RegionOption::S, false, true, 0.0).unwrap()
+    }
+
+    fn dummy_mesh_cfg() -> SequenceMeshConfig {
         SequenceMeshConfig {
-            boundary_nodes: boundary,
-            boundary_hard: false,
-            exclusion_nodes: vec![],
-            exclusions_hard: vec![],
+            boundary: dummy_region(),
+            exclusions: vec![],
             size: (1.0, 100.0),
             target_nodes: 10,
             mesh_order: 1,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // store_region_step — boundary tracks displacement across reference updates
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_store_region_step_boundary_tracks_displacement() {
+        let sol = unit_square_solution(0.3, -0.2);
+        let boundary_nodes = array![[0.0f64, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let mut boundary =
+            Region::path(None, boundary_nodes.clone(), RegionOption::F, false, true, 0.0).unwrap();
+        let mut exclusions: Vec<Region> = vec![];
+        let f_img = Arc::new(crate::image::Image::from_array(ndarray::Array2::zeros((100, 100)), 20));
+        let g_img = Arc::new(crate::image::Image::from_array(ndarray::Array2::zeros((100, 100)), 20));
+
+        store_region_step(&mut boundary, &mut exclusions, &sol, &f_img, &g_img, 1).unwrap();
+
+        // Displacement is recorded in history immediately...
+        assert_eq!(boundary.counter, 1);
+        assert_eq!(boundary.history_nodes.len(), 2);
+        for i in 0..4 {
+            assert!((boundary.history_nodes[1][[i, 0]] - (boundary_nodes[[i, 0]] + 0.3)).abs() < 1e-12);
+            assert!((boundary.history_nodes[1][[i, 1]] - (boundary_nodes[[i, 1]] - 0.2)).abs() < 1e-12);
+        }
+        // ...but `current_nodes` (what the next Mesh::new would use) stays at
+        // the original position until a reference update actually happens.
+        assert!((boundary.current_nodes[[0, 0]] - 0.0).abs() < 1e-12);
+
+        // Simulate the reference update that would trigger a fresh Mesh::new
+        // for the next pair: the boundary should now snap to the displaced
+        // position instead of resetting to the original static polygon.
+        boundary.update("frame_002.jpg");
+        for i in 0..4 {
+            assert!((boundary.current_nodes[[i, 0]] - (boundary_nodes[[i, 0]] + 0.3)).abs() < 1e-12);
+            assert!((boundary.current_nodes[[i, 1]] - (boundary_nodes[[i, 1]] - 0.2)).abs() < 1e-12);
         }
     }
 
@@ -794,7 +983,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_sequence_solution_in_memory(n: usize) -> SequenceSolution {
-        let meshes: Vec<MeshSolution> = (0..n).map(|_| unit_square_solution(0.1, 0.0)).collect();
+        let meshes: Vec<Arc<MeshSolution>> = (0..n).map(|_| Arc::new(unit_square_solution(0.1, 0.0))).collect();
         SequenceSolution {
             mesh_solutions: meshes,
             mesh_paths: vec![],
@@ -804,6 +993,8 @@ mod tests {
             reference_updates: vec![false; n],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: dummy_region(),
+            exclusion_regions: vec![],
         }
     }
 
@@ -824,6 +1015,8 @@ mod tests {
             reference_updates: vec![false, false],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: dummy_region(),
+            exclusion_regions: vec![],
         };
         assert_eq!(sol.n_meshes(), 2);
     }
@@ -858,6 +1051,8 @@ mod tests {
             reference_updates: vec![false],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: dummy_region(),
+            exclusion_regions: vec![],
         };
 
         let loaded = sol.load_mesh_at(0).unwrap();
@@ -883,6 +1078,8 @@ mod tests {
             reference_updates: vec![false],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: dummy_region(),
+            exclusion_regions: vec![],
         };
         assert!(sol.load_mesh_at(0).is_err());
 

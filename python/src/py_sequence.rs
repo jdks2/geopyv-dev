@@ -23,7 +23,7 @@ use geopyv_dev::{
 };
 
 use crate::{
-    py_geometry::extract_region,
+    py_geometry::{extract_region_full, write_region_state},
     py_image::PyImage,
     py_mesh::PyMesh,
     py_mask::PyMask,
@@ -110,6 +110,11 @@ impl PySequenceOptions {
 pub struct PySequence {
     pub(crate) inner: Sequence,
     pub(crate) solution: Option<geopyv_dev::sequence::SequenceSolution>,
+    /// Original boundary/exclusion objects passed to `new()`, retained so
+    /// `solve()` can write the final tracked region state back into them.
+    /// `None` when reconstructed from a saved solution (`from_solution`).
+    boundary_obj: Option<Py<PyAny>>,
+    exclusion_objs: Vec<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -125,26 +130,24 @@ impl PySequence {
         exclusions: Option<Vec<Bound<'_, PyAny>>>,
         mesh_order: u8,
     ) -> PyResult<Self> {
-        let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
+        let boundary_region = extract_region_full(boundary)?;
         let excl_list = exclusions.unwrap_or_default();
-        let (excl_owned, excl_hard): (Vec<Array2<f64>>, Vec<bool>) = excl_list
+        let excl_regions: Vec<geopyv_dev::geometry::region::Region> = excl_list
             .iter()
-            .map(|obj| extract_region(obj))
-            .collect::<PyResult<Vec<_>>>()?
-            .into_iter()
-            .unzip();
+            .map(|obj| extract_region_full(obj))
+            .collect::<PyResult<Vec<_>>>()?;
         let mesh_cfg = SequenceMeshConfig {
-            boundary_nodes,
-            boundary_hard,
-            exclusion_nodes: excl_owned,
-            exclusions_hard: excl_hard,
+            boundary: boundary_region,
+            exclusions: excl_regions,
             size,
             target_nodes,
             mesh_order,
         };
         let seq = Sequence::from_dir(std::path::Path::new(image_dir), mesh_cfg)
             .map_err(Error::from)?;
-        Ok(PySequence { inner: seq, solution: None })
+        let boundary_obj = Some(boundary.clone().unbind());
+        let exclusion_objs = excl_list.iter().map(|o| o.clone().unbind()).collect();
+        Ok(PySequence { inner: seq, solution: None, boundary_obj, exclusion_objs })
     }
 
     /// Solve all image pairs. Mutates in place; returns ``None``.
@@ -180,6 +183,7 @@ impl PySequence {
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
+        py: Python<'_>,
         local_mask: &Bound<'_, PyAny>,
         seed_coord: [f64; 2],
         seed_warp: Option<Vec<f64>>,
@@ -229,6 +233,19 @@ impl PySequence {
             save: save.map(PathBuf::from),
         };
         let sol = self.inner.solve(&cfg).map_err(Error::from)?;
+
+        // Write the final tracked boundary/exclusion state back into the
+        // original Python region objects passed to `new()`, so the caller
+        // can inspect e.g. `boundary_obj.current_nodes` post-solve. No-op
+        // for raw-ndarray inputs (nothing to write back into) or when this
+        // `Sequence` was reconstructed from a saved solution.
+        if let Some(ref obj) = self.boundary_obj {
+            write_region_state(obj.bind(py), &sol.boundary_region)?;
+        }
+        for (obj, region) in self.exclusion_objs.iter().zip(&sol.exclusion_regions) {
+            write_region_state(obj.bind(py), region)?;
+        }
+
         self.solution = Some(sol);
         Ok(())
     }
@@ -246,6 +263,31 @@ impl PySequence {
             .map(|i| {
                 let ms = sol.load_mesh_at(i).map_err(Error::from)?;
                 Py::new(py, PyMesh::from_solution(py, ms)?)
+            })
+            .collect()
+    }
+
+    /// Load a single per-pair DIC solution by index without materialising the rest.
+    ///
+    /// Prefer this over ``mesh_solutions[i]`` when only one pair is needed — the
+    /// full ``mesh_solutions`` getter loads every pair (including re-reading both
+    /// images from disk for each) before slicing.
+    fn mesh_solution_at(&self, py: Python<'_>, idx: usize) -> PyResult<Py<PyMesh>> {
+        let sol = self.require_solved()?;
+        let ms = sol.load_mesh_at(idx).map_err(Error::from)?;
+        Py::new(py, PyMesh::from_solution(py, ms)?)
+    }
+
+    /// Per-pair C_ZNCC arrays without loading images.
+    ///
+    /// Returns a list of 1-D numpy arrays (one per pair).  Much cheaper than
+    /// ``mesh_solutions`` when only correlation scores are needed.
+    fn all_c_zncc(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        let sol = self.require_solved()?;
+        (0..sol.n_meshes())
+            .map(|i| {
+                let ms = sol.load_mesh_at(i).map_err(Error::from)?;
+                Ok(ms.c_zncc.clone().into_pyarray_bound(py).into_any().unbind())
             })
             .collect()
     }
@@ -598,16 +640,14 @@ impl PySequence {
             vec![]
         };
         let mesh_cfg = SequenceMeshConfig {
-            boundary_nodes: Array2::zeros((0, 2)),
-            boundary_hard: false,
-            exclusion_nodes: vec![],
-            exclusions_hard: vec![],
+            boundary: sequence::default_boundary_region(),
+            exclusions: vec![],
             size: (1.0, 1000.0),
             target_nodes: 0,
             mesh_order: sol.mesh_order,
         };
         let inner = Sequence { image_paths, mesh_cfg };
-        Ok(PySequence { inner, solution: Some(sol) })
+        Ok(PySequence { inner, solution: Some(sol), boundary_obj: None, exclusion_objs: vec![] })
     }
 }
 

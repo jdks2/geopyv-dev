@@ -6,7 +6,7 @@ use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::particle::{MeshData, Particle, ParticleConfig, ParticleSolution};
+use geopyv_dev::particle::{Particle, ParticleConfig, ParticleSolution, ParticleSource};
 
 use crate::draw::{ActiveDrawMode, DrawState};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
@@ -826,19 +826,14 @@ fn run_solve(
     }
 
     let mesh_order = seq_sol.mesh_solutions[0].mesh_order;
-    let p_len = 6 * mesh_order as usize;
-    let initial_warp = vec![0.0f64; p_len];
-    let inc_no = n_meshes + 1;
+    let initial_warp = vec![0.0f64; 6 * mesh_order as usize];
+    let cfg = ParticleConfig {
+        factor: params.factor,
+        true_incs: params.true_incs,
+    };
 
-    let mut particle = match Particle::new(
-        params.coord,
-        &initial_warp,
-        1.0,
-        inc_no,
-        mesh_order,
-        params.track,
-        None,
-    ) {
+    let source = ParticleSource::Sequence(Arc::new(seq_sol));
+    let mut particle = match Particle::new(source, params.coord, &initial_warp, 1.0, params.track) {
         Ok(p) => p,
         Err(e) => {
             set_error(&state, format!("Particle init error: {e}"));
@@ -846,37 +841,20 @@ fn run_solve(
         }
     };
 
-    set_progress(&state, 0.1, "Solving increments\u{2026}");
-    let base = 0.1f32;
-    let per_step = (1.0f32 - base) / n_meshes as f32;
-
-    for (m, mesh_sol) in seq_sol.mesh_solutions.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            if let Ok(mut s) = state.lock() {
-                s.running = false;
-            }
-            return;
+    if cancel.load(Ordering::Relaxed) {
+        if let Ok(mut s) = state.lock() {
+            s.running = false;
         }
-
-        set_progress(
-            &state,
-            base + per_step * m as f32,
-            &format!("Step {} / {}", m + 1, n_meshes),
-        );
-
-        let mesh_data = MeshData {
-            nodes: &mesh_sol.nodes,
-            elements: &mesh_sol.elements,
-            displacements: &mesh_sol.displacements,
-            mesh_order: mesh_sol.mesh_order,
-        };
-        particle.solve_increment(m, &mesh_data, false);
+        return;
     }
 
-    let cfg = ParticleConfig {
-        factor: params.factor,
-        true_incs: params.true_incs,
-    };
+    set_progress(&state, 0.1, "Solving\u{2026}");
+
+    if let Err(e) = particle.solve(&cfg, None) {
+        set_error(&state, format!("Solve error: {e}"));
+        return;
+    }
+
     let solution = particle.finalize(&cfg);
 
     set_progress(&state, 1.0, "Done");

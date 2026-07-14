@@ -34,7 +34,7 @@ pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
                 "Mesh has not been solved; cannot save.",
             ));
         }
-        GeopyvObject::Mesh(m.solution.clone().unwrap())
+        GeopyvObject::Mesh((**m.solution.as_ref().unwrap()).clone())
     } else if let Ok(s) = obj.extract::<PyRef<PySequence>>() {
         if s.solution.is_none() {
             return Err(PyRuntimeError::new_err(
@@ -53,7 +53,7 @@ pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
         let sol = p.inner.solution().ok_or_else(|| {
             PyRuntimeError::new_err("Particle has not been solved; cannot save.")
         })?;
-        GeopyvObject::Particle(sol.clone())
+        GeopyvObject::Particle((**sol).clone())
     } else if let Ok(f) = obj.extract::<PyRef<PyField>>() {
         let sol = f.inner.solution().ok_or_else(|| {
             PyRuntimeError::new_err("Field has not been solved; cannot save.")
@@ -86,7 +86,7 @@ pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
 pub fn load(py: Python<'_>, path: &str) -> PyResult<PyObject> {
     let obj = io::load(path).map_err(Error::from)?;
     match obj {
-        GeopyvObject::Mesh(m) => Ok(Py::new(py, PyMesh::from_solution(py, m)?)?.into_py(py)),
+        GeopyvObject::Mesh(m) => Ok(Py::new(py, PyMesh::from_solution(py, Arc::new(m))?)?.into_py(py)),
         GeopyvObject::Field(f) => Ok(Py::new(py, PyField::from_solution(f)?)?.into_py(py)),
         GeopyvObject::Sequence(s) => Ok(Py::new(py, PySequence::from_solution(s)?)?.into_py(py)),
         GeopyvObject::Subset(s) => {

@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+
+use crate::utils::{arc_array1, arc_array2};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -14,6 +16,7 @@ use geopyv_dev::mesh;
 
 use crate::{py_calibration::PyCalibrationParams, py_mesh::{PyMesh, PyMeshSolution}, py_sequence::PySequence, Error};
 
+
 // ---------------------------------------------------------------------------
 // ParticleSolution class
 // ---------------------------------------------------------------------------
@@ -21,44 +24,44 @@ use crate::{py_calibration::PyCalibrationParams, py_mesh::{PyMesh, PyMeshSolutio
 /// Read-only result from :meth:`Particle.solve`.
 #[pyclass(name = "ParticleSolution")]
 pub struct PyParticleSolution {
-    pub(crate) inner: ParticleSolution,
+    pub(crate) inner: Arc<ParticleSolution>,
 }
 
 #[pymethods]
 impl PyParticleSolution {
     #[getter]
-    fn coordinates<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.coordinates.clone().into_pyarray_bound(py)
+    fn coordinates<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        arc_array2(py, &self.inner, |s| &s.coordinates)
     }
 
     #[getter]
-    fn warps<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.warps.clone().into_pyarray_bound(py)
+    fn warps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        arc_array2(py, &self.inner, |s| &s.warps)
     }
 
     #[getter]
-    fn incs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.incs.clone().into_pyarray_bound(py)
+    fn incs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        arc_array2(py, &self.inner, |s| &s.incs)
     }
 
     #[getter]
-    fn volumes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.volumes.clone().into_pyarray_bound(py)
+    fn volumes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        arc_array1(py, &self.inner, |s| &s.volumes)
     }
 
     #[getter]
-    fn strains<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.strains.clone().into_pyarray_bound(py)
+    fn strains<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        arc_array2(py, &self.inner, |s| &s.strains)
     }
 
     #[getter]
-    fn strain_incs<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.strain_incs.clone().into_pyarray_bound(py)
+    fn strain_incs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        arc_array2(py, &self.inner, |s| &s.strain_incs)
     }
 
     #[getter]
-    fn vol_strains<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.vol_strains.clone().into_pyarray_bound(py)
+    fn vol_strains<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        arc_array1(py, &self.inner, |s| &s.vol_strains)
     }
 
     #[getter]
@@ -120,7 +123,7 @@ impl PyParticle {
     #[new]
     #[pyo3(signature = (source, coordinate, initial_warp=None, track=true))]
     fn new(
-        py: Python<'_>,
+        _py: Python<'_>,
         source: &Bound<'_, PyAny>,
         coordinate: [f64; 2],
         initial_warp: Option<Vec<f64>>,
@@ -139,7 +142,7 @@ impl PyParticle {
             let sol = borrowed.solution.as_ref().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Mesh has not been solved")
             })?;
-            ParticleSource::Mesh(Arc::new(sol.clone()))
+            ParticleSource::Mesh(Arc::clone(sol))
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "source must be a solved Sequence or Mesh",
@@ -233,17 +236,17 @@ impl PyParticle {
 
     #[getter]
     fn strains<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        Ok(self.require_solved()?.strains.clone().into_pyarray_bound(py))
+        arc_array2(py, self.require_solved()?, |s| &s.strains)
     }
 
     #[getter]
     fn strain_incs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        Ok(self.require_solved()?.strain_incs.clone().into_pyarray_bound(py))
+        arc_array2(py, self.require_solved()?, |s| &s.strain_incs)
     }
 
     #[getter]
     fn vol_strains<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.require_solved()?.vol_strains.clone().into_pyarray_bound(py))
+        arc_array1(py, self.require_solved()?, |s| &s.vol_strains)
     }
 
     #[getter]
@@ -268,7 +271,7 @@ impl PyParticle {
 }
 
 impl PyParticle {
-    fn require_solved(&self) -> PyResult<&geopyv_dev::particle::ParticleSolution> {
+    fn require_solved(&self) -> PyResult<&Arc<geopyv_dev::particle::ParticleSolution>> {
         self.inner.solution().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "Particle has not been solved; call solve() first",

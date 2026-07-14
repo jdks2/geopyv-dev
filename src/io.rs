@@ -137,6 +137,7 @@ mod tests {
     use std::path::PathBuf;
     use ndarray::{array, Array1, Array2};
 
+    use std::sync::Arc;
     use crate::{
         mesh::{MeshSolution, NodeResult},
         sequence::SequenceSolution,
@@ -197,7 +198,7 @@ mod tests {
     #[test]
     fn test_sequence_round_trip() {
         let sol = SequenceSolution {
-            mesh_solutions: vec![make_mesh_solution(), make_mesh_solution()],
+            mesh_solutions: vec![Arc::new(make_mesh_solution()), Arc::new(make_mesh_solution())],
             mesh_paths: vec![],
             solved: true,
             unsolvable: false,
@@ -205,6 +206,8 @@ mod tests {
             reference_updates: vec![false, false],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         };
         let tmp = std::env::temp_dir().join("geopyv_test_seq.pyv");
         save(&tmp, &GeopyvObject::Sequence(sol.clone())).unwrap();

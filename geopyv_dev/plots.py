@@ -1,32 +1,35 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
 import matplotlib.tri as tri
 from scipy.spatial import Delaunay
+from matplotlib.collections import LineCollection
 
+plt.rcParams["mathtext.fontset"] = "stix"
+matplotlib.rcParams["font.family"] = "STIXGeneral"
 
 def _imshow_or_blank(ax, img_path, **kwargs):
     """Helper: show image from path, or blank background if path is None."""
     kwargs.setdefault("cmap", "gist_gray")
     if img_path is not None:
         import cv2
-        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        img_gs = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(float)
+        img_gs = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         ax.imshow(img_gs, **kwargs)
     else:
-        blank = np.zeros((50, 50), dtype=float)
+        blank = np.zeros((50, 50), dtype=np.uint8)
         ax.imshow(blank, **kwargs)
 
 
-def _show_save_close(fig, show, block, save):
+def _show_save_close(fig, show, block, save, owned=True):
     if save:
         plt.savefig(save, dpi=600)
     if show:
         plt.show(block=block)
-    else:
+    elif owned:
         plt.close(fig)
 
 
-def inspect_subset(subset, show=True, block=True, save=False, **kwargs):
+def inspect_subset(subset, ax=None, show=True, block=True, save=False, **kwargs):
     coord = subset.coord
     f_coords = np.asarray(subset.f_coords)
     f = np.asarray(subset.f)
@@ -77,23 +80,31 @@ def inspect_subset(subset, show=True, block=True, save=False, **kwargs):
     imshow_kwargs = {"cmap": "gist_gray"}
     imshow_kwargs.update(kwargs)
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     ax.imshow(display, **imshow_kwargs)
     ax.text(0.5, -0.05,
             f"Size: {template_size} px; \u03c3_s = {sigma_intensity:.2f}; SSSIG = {sssig:.2E}",
             transform=ax.transAxes, ha="center")
     ax.set_axis_off()
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
-def inspect_mesh(mesh, subset_idx=None, show_areas=False, show=True, block=True, save=False, **kwargs):
+def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None, show=True, block=True, save=False, **kwargs):
     nodes = np.asarray(mesh.nodes)
     elements = np.asarray(mesh.elements)
     f_img_path = getattr(mesh, 'f_img_path', None)
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     imshow_kwargs = {"cmap": "gist_gray"}
     imshow_kwargs.update(kwargs)
     _imshow_or_blank(ax, f_img_path, **imshow_kwargs)
@@ -119,47 +130,59 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, show=True, block=True,
         for nd in nodes:
             ax.add_patch(MplCircle((nd[0], nd[1]), radius, alpha=0.2, color='blue'))
 
+    if subset_idx is not None and subset_idx < len(nodes):
+        node = nodes[subset_idx]
+        ax.scatter([node[0]], [node[1]], color='red', s=60, zorder=10)
+
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
-def inspect_sequence(sequence, mesh_idx=None, subset_idx=None, show=True, block=True, save=False, **kwargs):
+def inspect_sequence(sequence, mesh_idx=None, subset_idx=None, ax=None, show=True, block=True, save=False, **kwargs):
     if mesh_idx is None:
         raise ValueError("mesh_idx is required")
-    mesh = sequence.mesh_solutions[mesh_idx]
-    return inspect_mesh(mesh, subset_idx=subset_idx, show=show, block=block, save=save, **kwargs)
+    mesh = sequence.mesh_solution_at(mesh_idx)
+    return inspect_mesh(mesh, subset_idx=subset_idx, ax=ax, show=show, block=block, save=save, **kwargs)
 
 
-def inspect_particle(particle, show=True, block=True, save=False, **kwargs):
+def inspect_particle(particle, ax=None, show=True, block=True, save=False, **kwargs):
     coords = np.asarray(particle.coordinates)
     initial = coords[0]
     img_path = getattr(particle, 'image_0_path', None)
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     _imshow_or_blank(ax, img_path)
     ax.scatter([initial[0]], [initial[1]], marker='x', color='red', s=100, zorder=10, **kwargs)
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
-def inspect_field(field, particle_idx=None, show=True, block=True, save=False, **kwargs):
+def inspect_field(field, particle_idx=None, ax=None, show=True, block=True, save=False, **kwargs):
     coords = np.asarray(field.coordinates)
     img_path = getattr(field, 'image_0_path', None)
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     _imshow_or_blank(ax, img_path)
     ax.scatter(coords[:, 0], coords[:, 1], **kwargs)
     if particle_idx is not None:
         ax.scatter([coords[particle_idx, 0]], [coords[particle_idx, 1]],
                    color='red', s=100, zorder=10)
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
-def convergence_subset(subset, show=True, block=True, save=False, **kwargs):
+def convergence_subset(subset, axes=None, show=True, block=True, save=False, **kwargs):
     history = getattr(subset, 'history', None)
     if not getattr(subset, 'solved', False) or history is None:
         raise ValueError("Subset has not been solved.")
@@ -169,7 +192,12 @@ def convergence_subset(subset, show=True, block=True, save=False, **kwargs):
     norms = [h[1] for h in history]
     znccs = [h[2] for h in history]
 
-    fig, ax = plt.subplots(2, 1, sharex=True)
+    owned = axes is None
+    if axes is None:
+        fig, axes = plt.subplots(2, 1, sharex=True)
+    else:
+        fig = axes[0].get_figure()
+    ax = axes
     ax[0].semilogy(iters, norms, marker="o", **kwargs)
     ax[0].semilogy([min(iters), max(iters)], [max_norm, max_norm], "--r")
     ax[0].set_ylabel(r"$\Delta$ Norm (-)")
@@ -178,11 +206,11 @@ def convergence_subset(subset, show=True, block=True, save=False, **kwargs):
     ax[1].set_ylabel(r"$C_{ZNCC}$ (-)")
     ax[1].set_xlabel("Iteration (-)")
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
-    return fig, np.array(ax)
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, np.array(axes)
 
 
-def convergence_mesh(mesh, quantity, show=True, block=True, save=False, **kwargs):
+def convergence_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, **kwargs):
     valid = {"C_ZNCC", "iterations", "norm"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -197,32 +225,47 @@ def convergence_mesh(mesh, quantity, show=True, block=True, save=False, **kwargs
         data = np.asarray(mesh.norms)
         xlabel = r"$\Delta$ Norm (-)"
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     ax.hist(data, **kwargs)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Count (-)")
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
+def contour_sequence(sequence, mesh_idx, quantity, **kwargs):
+    if mesh_idx is None:
+        raise ValueError("mesh_idx is required")
+    mesh = sequence.mesh_solution_at(mesh_idx)
+    return contour_mesh(mesh, quantity, **kwargs)
+
+
 def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_ZNCC",
-                          show=True, block=True, save=False, **kwargs):
+                          ax=None, show=True, block=True, save=False, **kwargs):
     if mesh_idx is not None:
-        mesh = sequence.mesh_solutions[mesh_idx]
-        return convergence_mesh(mesh, quantity, show=show, block=block, save=save, **kwargs)
+        mesh = sequence.mesh_solution_at(mesh_idx)
+        return convergence_mesh(mesh, quantity, ax=ax, show=show, block=block, save=save, **kwargs)
     else:
-        all_data = np.concatenate([np.asarray(m.c_zncc) for m in sequence.mesh_solutions])
-        fig, ax = plt.subplots()
+        all_data = np.concatenate([np.asarray(arr) for arr in sequence.all_c_zncc()])
+        owned = ax is None
+        if ax is None:
+            fig, ax = plt.subplots()
+        else:
+            fig = ax.get_figure()
         ax.hist(all_data, **kwargs)
         ax.set_xlabel(r"$C_{ZNCC}$ (-)")
         ax.set_ylabel("Count (-)")
         plt.tight_layout()
-        _show_save_close(fig, show, block, save)
+        _show_save_close(fig, show, block, save, owned=owned)
         return fig, ax
 
 
-def contour_mesh(mesh, quantity, show=True, block=True, save=False, **kwargs):
+def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, **kwargs):
     valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -252,7 +295,11 @@ def contour_mesh(mesh, quantity, show=True, block=True, save=False, **kwargs):
     elif quantity == "R":
         values = np.sqrt(displacements[:, 0]**2 + displacements[:, 1]**2)
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     f_img_path = getattr(mesh, 'f_img_path', None)
     _imshow_or_blank(ax, f_img_path)
 
@@ -262,12 +309,210 @@ def contour_mesh(mesh, quantity, show=True, block=True, save=False, **kwargs):
     cbar.set_label(labels[quantity])
 
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+_WARP_LABELS_HISTORY = [
+    r"$u$ ($px$)",
+    r"$v$ ($px$)",
+    r"$du/dx$ ($-$)",
+    r"$dv/dx$ ($-$)",
+    r"$du/dy$ ($-$)",
+    r"$dv/dy$ ($-$)",
+    r"$d^2u/dx^2$ ($-$)",
+    r"$d^2v/dx^2$ ($-$)",
+    r"$d^2u/dxdy$ ($-$)",
+    r"$d^2v/dxdy$ ($-$)",
+    r"$d^2u/dy^2$ ($-$)",
+    r"$d^2v/dy^2$ ($-$)",
+]
+
+_STRAIN_LABELS_HISTORY = [
+    r"$\epsilon_{xx}$ ($-$)",
+    r"$\epsilon_{yy}$ ($-$)",
+    r"$\epsilon_{zz}$ ($-$)",
+    r"$\epsilon_{yz}$ ($-$)",
+    r"$\epsilon_{xz}$ ($-$)",
+    r"$\epsilon_{xy}$ ($-$)",
+]
+
+
+def history_particle(particle, quantity="warps", components=None,
+                     ax=None, show=True, block=True, save=None,
+                     xlim=None, ylim=None, **kwargs):
+    valid = {"warps", "strains", "vol_strains"}
+    if quantity not in valid:
+        raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+
+    if quantity == "warps":
+        data = np.asarray(particle.warps)
+        if components is None:
+            components = range(data.shape[1])
+        for c in components:
+            label = _WARP_LABELS_HISTORY[c] if c < len(_WARP_LABELS_HISTORY) else str(c)
+            ax.plot(range(data.shape[0]), data[:, c], label=label, **kwargs)
+        ax.set_ylabel("Value")
+        ax.legend()
+
+    elif quantity == "strains":
+        strains = np.asarray(particle.strains)
+        vol_strains = np.asarray(particle.vol_strains)
+        ax.plot(range(strains.shape[0]), strains[:, 0], label=_STRAIN_LABELS_HISTORY[0], **kwargs)
+        ax.plot(range(strains.shape[0]), strains[:, 1], label=_STRAIN_LABELS_HISTORY[1], **kwargs)
+        ax.plot(range(strains.shape[0]), strains[:, 5], label=_STRAIN_LABELS_HISTORY[5], **kwargs)
+        ax.plot(range(len(vol_strains)), vol_strains, label=r"$\epsilon_{vol}$ ($-$)", **kwargs)
+        ax.set_ylabel(r"Strain, $\epsilon$")
+        ax.legend()
+
+    elif quantity == "vol_strains":
+        vol_strains = np.asarray(particle.vol_strains)
+        ax.plot(range(len(vol_strains)), vol_strains, **kwargs)
+        ax.set_ylabel(r"Volumetric strain, $\epsilon_{vol}$ ($-$)")
+
+    ax.set_xlabel(r"Image Number, $i$ ($-$)")
+    ax.set_xscale("linear")
+    ax.set_yscale("linear")
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def history_field(field, particle_index, quantity="warps", components=None,
+                  ax=None, show=True, block=True, save=None,
+                  xlim=None, ylim=None, **kwargs):
+    particle = field.particles[particle_index]
+    return history_particle(particle, quantity, components=components,
+                            ax=ax, show=show, block=block, save=save,
+                            xlim=xlim, ylim=ylim, **kwargs)
+
+
+def trace_particle(particle, quantity="warps", component=0,
+                   imshow=True, ax=None, show=True, block=True, save=None,
+                   xlim=None, ylim=None, **kwargs):
+    valid = {"warps", "strains", "vol_strains"}
+    if quantity not in valid:
+        raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+
+    coords = np.asarray(particle.coordinates)
+    if quantity == "warps":
+        values = np.diff(np.asarray(particle.warps)[:, component])
+        label = _WARP_LABELS_HISTORY[component] if component < len(_WARP_LABELS_HISTORY) else str(component)
+    elif quantity == "strains":
+        values = np.diff(np.asarray(particle.strains)[:, component])
+        label = _STRAIN_LABELS_HISTORY[component] if component < len(_STRAIN_LABELS_HISTORY) else str(component)
+    else:
+        values = np.diff(np.asarray(particle.vol_strains))
+        label = _STRAIN_LABELS_HISTORY[3]
+
+    points = coords.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = plt.Normalize(values.min(), values.max())
+    lc = LineCollection(segments, cmap="viridis", norm=norm, **kwargs)
+    lc.set_array(values)
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+
+    if imshow:
+        img_path = getattr(particle, 'image_0_path', None)
+        _imshow_or_blank(ax, img_path)
+    else:
+        ax.set_aspect("equal", "box")
+        ax.autoscale()
+
+    ax.add_collection(lc)
+    if not imshow:
+        ax.autoscale_view()
+    fig.colorbar(lc, ax=ax, label=label)
+
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def trace_field(field, quantity="warps", component=0,
+                imshow=True, ax=None, show=True, block=True, save=None,
+                xlim=None, ylim=None, **kwargs):
+    valid = {"warps", "strains", "vol_strains"}
+    if quantity not in valid:
+        raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+
+    all_segments = []
+    all_values = []
+    for p in field.particles:
+        coords = np.asarray(p.coordinates)
+        if quantity == "warps":
+            v = np.diff(np.asarray(p.warps)[:, component])
+        elif quantity == "strains":
+            v = np.diff(np.asarray(p.strains)[:, component])
+        else:
+            v = np.diff(np.asarray(p.vol_strains))
+        pts = coords.reshape(-1, 1, 2)
+        all_segments.append(np.concatenate([pts[:-1], pts[1:]], axis=1))
+        all_values.append(v)
+
+    all_segments = np.concatenate(all_segments, axis=0)
+    all_values = np.concatenate(all_values)
+
+    if quantity == "warps":
+        label = _WARP_LABELS_HISTORY[component] if component < len(_WARP_LABELS_HISTORY) else str(component)
+    elif quantity == "strains":
+        label = _STRAIN_LABELS_HISTORY[component] if component < len(_STRAIN_LABELS_HISTORY) else str(component)
+    else:
+        label = _STRAIN_LABELS_HISTORY[3]
+
+    norm = plt.Normalize(all_values.min(), all_values.max())
+    lc = LineCollection(all_segments, cmap="viridis", norm=norm, **kwargs)
+    lc.set_array(all_values)
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+
+    if imshow:
+        img_path = getattr(field, 'image_0_path', None)
+        _imshow_or_blank(ax, img_path)
+    else:
+        ax.set_aspect("equal", "box")
+
+    ax.add_collection(lc)
+    if not imshow:
+        ax.autoscale_view()
+    fig.colorbar(lc, ax=ax, label=label)
+
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
 def contour_field(field, quantity, window=None, dt=None, absolute=False,
-                   show=True, block=True, save=False, **kwargs):
+                   ax=None, show=True, block=True, save=False, **kwargs):
     valid = {"u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -276,7 +521,7 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     n = len(particles)
     coords = np.array([[p.coordinates[0, 0], p.coordinates[0, 1]] for p in particles])
 
-    strain_col = {"ep_xx": 0, "ep_yy": 1, "ep_xy": 2}
+    strain_col = {"ep_xx": 0, "ep_yy": 1, "ep_xy": 5}
 
     # Build window slice
     if window is not None:
@@ -323,7 +568,11 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     else:
         triangles = None
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     img_path = getattr(field, 'image_0_path', None)
     _imshow_or_blank(ax, img_path)
 
@@ -342,7 +591,7 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     cbar.set_label(label)
 
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
@@ -392,6 +641,9 @@ def _x_series(solution, component):
 def _std_error_series(field_data, component):
     applied  = np.asarray(field_data.applied)   # (n_frames, n_particles, 12)
     observed = np.asarray(field_data.observed)
+    if component >= 12:
+        l2 = np.sqrt(np.sum((applied[:, :, :2] - observed[:, :, :2]) ** 2, axis=2))
+        return np.std(l2, axis=1)
     err = applied[:, :, component] - observed[:, :, component]
     return np.std(err, axis=1)
 
@@ -407,13 +659,15 @@ def _mean_error_series(field_data):
 def standard_error_validation(solution, component, observing=None,
                                scale="log", plot="scatter",
                                xlim=None, ylim=None,
-                               xlabel=None, ylabel=None,
                                prev_series=None, prev_series_label=None,
-                               show=True, block=True, save=None, **kwargs):
-    fig, ax = plt.subplots()
-    fields = solution.fields
+                               ax=None, show=True, block=True, save=None, **kwargs):
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     x = _x_series(solution, component)
-    for idx, fd in enumerate(fields):
+    for idx, fd in enumerate(solution.fields):
         y = _std_error_series(fd, component if observing is None else observing)
         colour = _COLOURS[idx % len(_COLOURS)]
         marker = _MARKERS[idx % len(_MARKERS)]
@@ -421,17 +675,22 @@ def standard_error_validation(solution, component, observing=None,
         if plot == "scatter":
             ax.scatter(x, y, color=colour, marker=marker, label=label, **kwargs)
         else:
-            ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
+            ax.plot(x, y, color=colour, label=label, **kwargs)
     if prev_series is not None:
-        ax.plot(x, prev_series, color="gray", linestyle="--",
+        ax.plot(prev_series[:,0], prev_series[:,1], color="gray", linestyle="--",
                 label=prev_series_label or "previous")
     ax.set_xscale(scale)
-    ax.set_yscale(scale)
-    ax.set_xlabel(xlabel or (_WARP_LABELS[component] if component < len(_WARP_LABELS) else ""))
-    ax.set_ylabel(ylabel or "Standard error")
+    ax.set_yscale("log")
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_xlabel(_WARP_LABELS[component] if component < len(_WARP_LABELS) else "")
+    if observing is not None:
+        ax.set_ylabel(r"Error, $\Delta$" + _WARP_LABELS[observing])
+    else:
+        ax.set_ylabel(r"Standard error, $\rho_{px}$ ($px$)")
     ax.legend(loc="upper left")
     ax.grid(True, which="both", linestyle=":", alpha=0.5)
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
@@ -439,8 +698,12 @@ def mean_error_validation(solution, component,
                           scale="log", plot="scatter",
                           xlim=None, ylim=None,
                           prev_series=None, prev_series_label=None,
-                          show=True, block=True, save=None, **kwargs):
-    fig, ax = plt.subplots()
+                          ax=None, show=True, block=True, save=None, **kwargs):
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     x = _x_series(solution, component)
     for idx, fd in enumerate(solution.fields):
         y = _mean_error_series(fd)
@@ -456,23 +719,27 @@ def mean_error_validation(solution, component,
                 label=prev_series_label or "previous")
     ax.set_xscale(scale)
     ax.set_yscale(scale)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
     ax.set_xlabel(_WARP_LABELS[component] if component < len(_WARP_LABELS) else "")
     ax.set_ylabel("Mean L2 displacement error ($px$)")
     ax.legend(loc="upper left")
     ax.grid(True, which="both", linestyle=":", alpha=0.5)
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
 
 
 def noise_standard_error_validation(solution, component, observing=None,
                                      scale="log", plot="scatter",
                                      xlim=None, ylim=None,
-                                     xlabel=None, ylabel=None,
-                                     show=True, block=True, save=None, **kwargs):
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+                                     axes=None, show=True, block=True, save=None, **kwargs):
+    owned = axes is None
+    if axes is None:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    else:
+        fig = axes.flat[0].get_figure()
     x = _x_series(solution, component)
     for panel_idx, ax in enumerate(axes.flat):
-        field_group_start = panel_idx * 1
         for sub_idx in range(len(solution.fields)):
             if sub_idx // 4 != panel_idx:
                 continue
@@ -487,22 +754,28 @@ def noise_standard_error_validation(solution, component, observing=None,
                 ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
         ax.set_xscale(scale)
         ax.set_yscale(scale)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         if panel_idx < len(_NOISE_AXES_TITLES):
             ax.set_title(_NOISE_AXES_TITLES[panel_idx])
-        ax.set_xlabel(xlabel or (_WARP_LABELS[component] if component < len(_WARP_LABELS) else ""))
-        ax.set_ylabel(ylabel or "Standard error")
+        ax.set_xlabel(_WARP_LABELS[component] if component < len(_WARP_LABELS) else "")
+        ax.set_ylabel("Standard error")
         ax.grid(True, which="both", linestyle=":", alpha=0.5)
     axes[1, 1].legend(loc="upper left")
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, axes
 
 
 def noise_mean_error_validation(solution, component,
                                  scale="log", plot="scatter",
                                  xlim=None, ylim=None,
-                                 show=True, block=True, save=None, **kwargs):
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+                                 axes=None, show=True, block=True, save=None, **kwargs):
+    owned = axes is None
+    if axes is None:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    else:
+        fig = axes.flat[0].get_figure()
     x = _x_series(solution, component)
     for panel_idx, ax in enumerate(axes.flat):
         for sub_idx in range(len(solution.fields)):
@@ -519,6 +792,8 @@ def noise_mean_error_validation(solution, component,
                 ax.plot(x, y, color=colour, marker=marker, label=label, **kwargs)
         ax.set_xscale(scale)
         ax.set_yscale(scale)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         if panel_idx < len(_NOISE_AXES_TITLES):
             ax.set_title(_NOISE_AXES_TITLES[panel_idx])
         ax.set_xlabel(_WARP_LABELS[component] if component < len(_WARP_LABELS) else "")
@@ -526,15 +801,19 @@ def noise_mean_error_validation(solution, component,
         ax.grid(True, which="both", linestyle=":", alpha=0.5)
     axes[1, 1].legend(loc="upper left")
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, axes
 
 
 def strain_error_validation(solution,
                              scale="log", plot="scatter",
                              xlim=None, ylim=None,
-                             show=True, block=True, save=None, **kwargs):
-    fig, axes = plt.subplots(3, 1, figsize=(8, 12))
+                             axes=None, show=True, block=True, save=None, **kwargs):
+    owned = axes is None
+    if axes is None:
+        fig, axes = plt.subplots(3, 1, figsize=(8, 12))
+    else:
+        fig = axes[0].get_figure()
     mult = np.asarray(solution.mult)[1:]  # (n_frames,) x-axis
 
     for idx, fd in enumerate(solution.fields):
@@ -544,19 +823,14 @@ def strain_error_validation(solution,
         marker = _MARKERS[idx % len(_MARKERS)]
         label  = solution.labels[idx] if idx < len(solution.labels) else str(idx)
 
-        # Panel 0: std of L2 displacement error
         diff_disp = applied[:, :, :2] - observed[:, :, :2]
         l2 = np.sqrt(np.sum(diff_disp ** 2, axis=2))
         y0 = np.std(l2, axis=1)
 
-        # Panel 1: std of shear strain error — avg of warp components 3 and 4
         err3 = applied[:, :, 3] - observed[:, :, 3]
         err4 = applied[:, :, 4] - observed[:, :, 4]
         y1 = np.std(0.5 * (err3 + err4), axis=1)
 
-        # Panel 2: std of volumetric strain error
-        # det(F) - 1 where F = I + grad(u)
-        # F = [[1+du/dx, du/dy],[dv/dx, 1+dv/dy]] = [[1+w2,w4],[w3,1+w5]]
         def det_err(w):
             return (1.0 + w[:, :, 2]) * (1.0 + w[:, :, 5]) - w[:, :, 3] * w[:, :, 4]
         vol_err = det_err(applied) - det_err(observed)
@@ -571,6 +845,8 @@ def strain_error_validation(solution,
     for ax in axes:
         ax.set_xscale(scale)
         ax.set_yscale(scale)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         ax.grid(True, which="both", linestyle=":", alpha=0.5)
     axes[0].set_ylabel("Std L2 displacement error ($px$)")
     axes[1].set_ylabel(r"Std shear strain error ($-$)")
@@ -578,7 +854,7 @@ def strain_error_validation(solution,
     axes[2].set_xlabel("Warp multiplier")
     axes[0].legend(loc="upper left")
     plt.tight_layout()
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, axes
 
 
@@ -586,7 +862,7 @@ def spatial_error_validation(solution, field_index, time_index, quantity="R",
                               imshow=True, colorbar=True,
                               ticks=None, alpha=0.5, levels=None,
                               xlim=None, ylim=None,
-                              show=True, block=True, save=None, **kwargs):
+                              ax=None, show=True, block=True, save=None, **kwargs):
     fd = solution.fields[field_index]
     applied  = np.asarray(fd.applied)   # (n_frames, n_particles, 12)
     observed = np.asarray(fd.observed)
@@ -598,8 +874,7 @@ def spatial_error_validation(solution, field_index, time_index, quantity="R",
     x_pos = xy[:, 0]
     y_pos = xy[:, 1]
 
-    # Error quantity (use frame time_index-1 if time_index >= 1, else frame 0)
-    frame = min(max(time_index - 1, 0), applied.shape[0] - 1)
+    frame = min(time_index, applied.shape[0] - 1)
     if quantity == "u":
         err = applied[frame, :, 0] - observed[frame, :, 0]
     elif quantity == "v":
@@ -609,7 +884,11 @@ def spatial_error_validation(solution, field_index, time_index, quantity="R",
         dv = applied[frame, :, 1] - observed[frame, :, 1]
         err = np.sqrt(du**2 + dv**2)
 
-    fig, ax = plt.subplots()
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
     if imshow:
         img_path = fd.image_0_path
         _imshow_or_blank(ax, img_path)
@@ -628,5 +907,5 @@ def spatial_error_validation(solution, field_index, time_index, quantity="R",
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
-    _show_save_close(fig, show, block, save)
+    _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax

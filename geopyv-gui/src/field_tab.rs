@@ -6,9 +6,9 @@ use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 use ndarray::{Array1, Array2};
 
-use geopyv_dev::field::{Field, FieldSolution};
+use geopyv_dev::field::{Field, FieldDistribution, FieldSolution};
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::particle::{MeshData, ParticleSolution};
+use geopyv_dev::particle::ParticleSolution;
 
 use crate::colormap::{self, ColormapType};
 use crate::draw::{ActiveDrawMode, DrawState, point_in_polygon};
@@ -1381,9 +1381,10 @@ fn run_solve(
     let volume = params.volume_per_particle.max(f64::MIN_POSITIVE);
     let vols = Array1::<f64>::from_elem(n_particles, volume);
 
-    let inc_no = n_meshes + 1;
     let depth = params.depth.max(f64::MIN_POSITIVE);
-    let mut field = match Field::new(coords, vols, params.track, depth, inc_no, None) {
+    let distribution = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
+    let source = Arc::new(seq_sol);
+    let mut field = match Field::new(source, distribution, params.track, depth) {
         Ok(f) => f,
         Err(e) => {
             set_error(&state, format!("Field init error: {e}"));
@@ -1400,21 +1401,15 @@ fn run_solve(
 
     set_progress(&state, 0.15, "Solving field\u{2026}");
 
-    let mesh_datas: Vec<MeshData<'_>> = seq_sol
-        .mesh_solutions
-        .iter()
-        .map(|ms| MeshData {
-            nodes: &ms.nodes,
-            elements: &ms.elements,
-            displacements: &ms.displacements,
-            mesh_order: ms.mesh_order,
-        })
-        .collect();
+    if let Err(e) = field.solve(params.factor, params.true_incs, None) {
+        set_error(&state, format!("Solve error: {e}"));
+        return;
+    }
 
-    let solution = match field.solve(&mesh_datas, &[], params.factor, params.true_incs) {
-        Ok(sol) => sol,
-        Err(e) => {
-            set_error(&state, format!("Solve error: {e}"));
+    let solution = match field.solution() {
+        Some(sol) => sol.clone(),
+        None => {
+            set_error(&state, "No solution after solve".to_string());
             return;
         }
     };

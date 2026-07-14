@@ -214,6 +214,21 @@ impl Region {
         }
     }
 
+    /// Return the region's characteristic radius.
+    ///
+    /// `RegionShape::Circle { radius, .. }` and `RegionShape::Path { radius }`
+    /// both carry one (used to size the rigid-registration subset template);
+    /// `Generic` has none and is unreachable via the current constructors.
+    pub fn radius(&self) -> Result<f64, Error> {
+        match self.shape {
+            RegionShape::Circle { radius, .. } => Ok(radius),
+            RegionShape::Path { radius } => Ok(radius),
+            RegionShape::Generic => Err(Error::InvalidInput(
+                "region has no radius (RegionShape::Generic)".to_string(),
+            )),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Store methods (called per sequence step)
     // -----------------------------------------------------------------------

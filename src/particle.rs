@@ -77,9 +77,9 @@ impl ParticleSource {
     /// For `Mesh` sources this clones the single in-memory solution.
     /// For `Sequence` sources this delegates to [`SequenceSolution::load_mesh_at`],
     /// which either clones from memory or deserialises from disk.
-    pub fn load_mesh_at(&self, m: usize) -> Result<MeshSolution, Error> {
+    pub fn load_mesh_at(&self, m: usize) -> Result<Arc<MeshSolution>, Error> {
         match self {
-            Self::Mesh(ms) => Ok((**ms).clone()),
+            Self::Mesh(ms) => Ok(Arc::clone(ms)),
             Self::Sequence(s) => s.load_mesh_at(m),
             Self::Loaded { .. } => Err(Error::InvalidInput(
                 "cannot load mesh increments from a loaded Particle".to_string(),
@@ -526,7 +526,7 @@ pub struct Particle {
     pub reference_update_register: Vec<usize>,
     pub _adrift: bool,
 
-    pub(crate) solution: Option<ParticleSolution>,
+    pub(crate) solution: Option<Arc<ParticleSolution>>,
 }
 
 impl Particle {
@@ -582,7 +582,7 @@ impl Particle {
         self.source.image_0_path()
     }
     pub fn solved(&self) -> bool { self.solution.is_some() }
-    pub fn solution(&self) -> Option<&ParticleSolution> { self.solution.as_ref() }
+    pub fn solution(&self) -> Option<&Arc<ParticleSolution>> { self.solution.as_ref() }
 
     /// Reconstruct a `Particle` shell from a saved [`ParticleSolution`].
     ///
@@ -602,7 +602,7 @@ impl Particle {
             reference_index: 0,
             reference_update_register: sol.reference_update_register.clone(),
             _adrift: false,
-            solution: Some(sol),
+            solution: Some(Arc::new(sol)),
         }
     }
 
@@ -741,7 +741,7 @@ impl Particle {
         }
         let mut sol = self.finalize(cfg);
         sol.calibrated = calibration.is_some();
-        self.solution = Some(sol);
+        self.solution = Some(Arc::new(sol));
         Ok(())
     }
 
@@ -1061,7 +1061,7 @@ mod tests {
 
     fn make_seq_o1(disps_list: Vec<Array2<f64>>) -> Arc<crate::sequence::SequenceSolution> {
         let n_pairs = disps_list.len();
-        let mesh_solutions: Vec<_> = disps_list.into_iter().map(make_mesh_sol_o1).collect();
+        let mesh_solutions: Vec<_> = disps_list.into_iter().map(|d| Arc::new(make_mesh_sol_o1(d))).collect();
         Arc::new(crate::sequence::SequenceSolution {
             mesh_solutions,
             mesh_paths: vec![],
@@ -1071,6 +1071,8 @@ mod tests {
             reference_updates: vec![false; n_pairs],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         })
     }
 
@@ -1129,7 +1131,7 @@ mod tests {
         let mesh_sol_0 = make_mesh_sol_o1(disps.clone());
         let mesh_sol_1 = make_mesh_sol_o1(disps);
         let seq = Arc::new(crate::sequence::SequenceSolution {
-            mesh_solutions: vec![mesh_sol_0, mesh_sol_1],
+            mesh_solutions: vec![Arc::new(mesh_sol_0), Arc::new(mesh_sol_1)],
             mesh_paths: vec![],
             solved: true,
             unsolvable: false,
@@ -1137,6 +1139,8 @@ mod tests {
             reference_updates: vec![false, true],  // ref update at step 1
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         });
         let mut p = Particle::new(
             ParticleSource::Sequence(seq),
@@ -1175,6 +1179,8 @@ mod tests {
             reference_updates: vec![false; disps_list.len()],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         });
         (sol, paths)
     }
@@ -1239,6 +1245,8 @@ mod tests {
             reference_updates: vec![false, true],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         });
 
         let mut p = Particle::new(

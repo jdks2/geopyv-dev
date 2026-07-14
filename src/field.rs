@@ -117,7 +117,7 @@ pub enum FieldDistribution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldSolution {
     /// Per-particle strain-path solutions.
-    pub particles: Vec<ParticleSolution>,
+    pub particles: Vec<Arc<ParticleSolution>>,
     /// Initial coordinates of all particles `(N, 2)`.
     pub initial_coordinates: Array2<f64>,
     /// Sum of volumes across all particles at each increment `(inc_no,)`.
@@ -232,6 +232,8 @@ impl Field {
             reference_updates: Vec::new(),
             mesh_order: 1,
             first_f_img_path: sol.image_0_path.clone(),
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: Vec::new(),
         });
         let n = sol.initial_coordinates.nrows();
         let mut volumes = Array1::<f64>::zeros(n);
@@ -290,11 +292,11 @@ impl Field {
 
         // Phase 3: finalize strain paths.
         let calibrated = calibration.is_some();
-        let particle_solutions: Vec<ParticleSolution> = particles.iter()
+        let particle_solutions: Vec<Arc<ParticleSolution>> = particles.iter()
             .map(|p| {
                 let mut sol = p.finalize(&cfg);
                 sol.calibrated = calibrated;
-                sol
+                Arc::new(sol)
             })
             .collect();
 
@@ -376,8 +378,10 @@ mod tests {
     fn make_seq(mesh_sols: Vec<crate::mesh::MeshSolution>, ref_updates: Vec<bool>)
         -> Arc<SequenceSolution>
     {
+        let mesh_solutions: Vec<Arc<crate::mesh::MeshSolution>> =
+            mesh_sols.into_iter().map(Arc::new).collect();
         Arc::new(SequenceSolution {
-            mesh_solutions: mesh_sols,
+            mesh_solutions,
             mesh_paths: vec![],
             solved: true,
             unsolvable: false,
@@ -385,6 +389,8 @@ mod tests {
             reference_updates: ref_updates,
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         })
     }
 
@@ -670,6 +676,8 @@ mod tests {
             reference_updates: ref_updates,
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         });
         (sol, paths)
     }
@@ -699,6 +707,8 @@ mod tests {
             reference_updates: vec![],
             mesh_order: 1,
             first_f_img_path: None,
+            boundary_region: crate::sequence::default_boundary_region(),
+            exclusion_regions: vec![],
         });
         assert!(Field::new(seq, FieldDistribution::FromSequence, true, 1.0).is_err());
     }

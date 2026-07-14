@@ -26,7 +26,7 @@ pub struct PyFieldSolution {
 impl PyFieldSolution {
     #[getter]
     fn particles(&self) -> Vec<PyParticleSolution> {
-        self.inner.particles.iter().map(|p| PyParticleSolution { inner: p.clone() }).collect()
+        self.inner.particles.iter().map(|p| PyParticleSolution { inner: Arc::clone(p) }).collect()
     }
 
     #[getter]
@@ -119,6 +119,8 @@ impl PyField {
                     reference_updates: vec![false],
                     mesh_order: mesh_sol.mesh_order,
                     first_f_img_path: Some(mesh_sol.f_img_path.clone()),
+                    boundary_region: geopyv_dev::sequence::default_boundary_region(),
+                    exclusion_regions: vec![],
                 })
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -193,7 +195,7 @@ impl PyField {
     #[getter]
     fn particles(&self) -> PyResult<Vec<PyParticleSolution>> {
         Ok(self.require_solved()?.particles.iter()
-            .map(|p| PyParticleSolution { inner: p.clone() })
+            .map(|p| PyParticleSolution { inner: Arc::clone(p) })
             .collect())
     }
 

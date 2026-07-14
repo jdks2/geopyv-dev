@@ -214,6 +214,16 @@ macro_rules! impl_region_pymethods {
                 self.inner.history_centres = centres;
             }
 
+            #[setter]
+            fn set_counter(&mut self, val: usize) {
+                self.inner.counter = val;
+            }
+
+            #[setter]
+            fn set_ref_index(&mut self, val: Option<usize>) {
+                self.inner.ref_index = val;
+            }
+
             fn store_rigid(&mut self, warp: PyReadonlyArray1<f64>) -> PyResult<()> {
                 let w: Vec<f64> = warp.as_array().to_vec();
                 self.inner.store_rigid(&w).map_err(Error::from)?;
@@ -334,6 +344,52 @@ pub(crate) fn extract_region(obj: &Bound<'_, PyAny>) -> PyResult<(Array2<f64>, b
     Err(PyTypeError::new_err(
         "must be a CircleRegion, PathRegion, or numpy array (N, 2)",
     ))
+}
+
+/// Extract a full `Region` (not just `nodes`/`hard`) for `Sequence`-level
+/// displacement tracking across reference-image updates.
+///
+/// `CircleRegion`/`PathRegion` -> clone of `.inner` (preserves the region's
+/// tracking `option`). Raw ndarray -> `Region` with `option = S`
+/// (static/untracked), which preserves today's frozen-boundary behaviour for
+/// plain-array callers (there is no object to track displacement into).
+pub(crate) fn extract_region_full(obj: &Bound<'_, PyAny>) -> PyResult<region::Region> {
+    if let Ok(r) = obj.extract::<PyRef<PyCircleRegion>>() {
+        return Ok(r.inner.clone());
+    }
+    if let Ok(r) = obj.extract::<PyRef<PyPathRegion>>() {
+        return Ok(r.inner.clone());
+    }
+    if let Ok(a) = obj.extract::<PyReadonlyArray2<f64>>() {
+        let nodes = a.as_array().to_owned();
+        let region = region::Region::path(None, nodes, region::RegionOption::S, false, false, 0.0)
+            .map_err(Error::from)?;
+        return Ok(region);
+    }
+    Err(PyTypeError::new_err(
+        "must be a CircleRegion, PathRegion, or numpy array (N, 2)",
+    ))
+}
+
+/// Write a solved `Region`'s final tracked state back into a Python
+/// `CircleRegion`/`PathRegion` object — a no-op if `obj` is a raw ndarray
+/// (there's no tracked object to write into).
+///
+/// Used by `Sequence::solve` so the caller's original region object reflects
+/// the displaced boundary/exclusion positions accumulated over the whole run,
+/// matching the fact that Python's `Mesh._store_region`/`_update_region`
+/// mutate the same `boundary_obj`/`exclusion_objs` instances the caller
+/// passed in.
+pub(crate) fn write_region_state(obj: &Bound<'_, PyAny>, region: &region::Region) -> PyResult<()> {
+    if let Ok(mut r) = obj.extract::<PyRefMut<PyCircleRegion>>() {
+        r.inner = region.clone();
+        return Ok(());
+    }
+    if let Ok(mut r) = obj.extract::<PyRefMut<PyPathRegion>>() {
+        r.inner = region.clone();
+        return Ok(());
+    }
+    Ok(())
 }
 
 // ===========================================================================

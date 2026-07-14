@@ -13,7 +13,12 @@ from .plots import (
     convergence_mesh,
     convergence_sequence,
     contour_mesh,
+    contour_sequence,
     contour_field,
+    history_particle,
+    history_field,
+    trace_particle,
+    trace_field,
     standard_error_validation,
     mean_error_validation,
     noise_standard_error_validation,
@@ -203,6 +208,10 @@ class Sequence:
         return [MeshWrapper(m) for m in self._inner.mesh_solutions]
 
     @property
+    def meshes(self):
+        return self.mesh_solutions
+
+    @property
     def solved(self):
         return self._inner.solved
 
@@ -222,11 +231,20 @@ class Sequence:
     def mesh_paths(self):
         return self._inner.mesh_paths
 
-    def inspect(self, mesh_idx, **kwargs):
-        return inspect_sequence(self, mesh_idx=mesh_idx, **kwargs)
+    def mesh_solution_at(self, idx):
+        return MeshWrapper(self._inner.mesh_solution_at(idx))
+
+    def all_c_zncc(self):
+        return self._inner.all_c_zncc()
+
+    def inspect(self, mesh_idx, subset_idx=None, **kwargs):
+        return inspect_sequence(self, mesh_idx=mesh_idx, subset_idx=subset_idx, **kwargs)
 
     def convergence(self, mesh_idx=None, quantity="C_ZNCC", **kwargs):
         return convergence_sequence(self, mesh_idx=mesh_idx, quantity=quantity, **kwargs)
+
+    def contour(self, quantity, mesh_idx, **kwargs):
+        return contour_sequence(self, mesh_idx=mesh_idx, quantity=quantity, **kwargs)
 
     def save(self, path):
         _core.save(path, self._inner)
@@ -267,6 +285,12 @@ class Field:
     def contour(self, quantity, **kwargs):
         return contour_field(self, quantity, **kwargs)
 
+    def history(self, particle_index, quantity="warps", **kwargs):
+        return history_field(self, particle_index, quantity, **kwargs)
+
+    def trace(self, quantity="warps", component=0, **kwargs):
+        return trace_field(self, quantity, component, **kwargs)
+
     def save(self, path):
         _core.save(path, self._inner)
 
@@ -299,6 +323,12 @@ class Particle:
 
     def inspect(self, **kwargs):
         return inspect_particle(self._inner, **kwargs)
+
+    def history(self, quantity="warps", **kwargs):
+        return history_particle(self._inner, quantity, **kwargs)
+
+    def trace(self, quantity="warps", component=0, **kwargs):
+        return trace_particle(self._inner, quantity, component, **kwargs)
 
     def save(self, path):
         _core.save(path, self._inner)
@@ -342,6 +372,21 @@ class Validation:
     def spatial_error(self, field_index, time_index, **kwargs):
         self._check_solved()
         return spatial_error_validation(self._solution, field_index, time_index, **kwargs)
+
+    @property
+    def solution(self):
+        self._check_solved()
+        return self._solution
+
+    def n_frames(self, field_index=0):
+        self._check_solved()
+        import numpy as np
+        return np.asarray(self._solution.fields[field_index].applied).shape[0]
+
+    def n_particles(self, field_index=0):
+        self._check_solved()
+        import numpy as np
+        return np.asarray(self._solution.fields[field_index].applied).shape[1]
 
     def _check_solved(self):
         if self._solution is None:
