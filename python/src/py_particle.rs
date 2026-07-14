@@ -131,7 +131,7 @@ impl PyParticle {
     ) -> PyResult<Self> {
         let ps: ParticleSource = if let Ok(seq) = source.downcast::<PySequence>() {
             let borrowed = seq.borrow();
-            let sol = borrowed.solution.as_ref().ok_or_else(|| {
+            let sol = borrowed.inner.solution().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Sequence has not been solved")
             })?;
             ParticleSource::Sequence(Arc::new(sol.clone()))
@@ -139,7 +139,7 @@ impl PyParticle {
             ParticleSource::Mesh(Arc::new(mesh.borrow().inner.clone()))
         } else if let Ok(mesh) = source.downcast::<PyMesh>() {
             let borrowed = mesh.borrow();
-            let sol = borrowed.solution.as_ref().ok_or_else(|| {
+            let sol = borrowed.inner.solution().ok_or_else(|| {
                 pyo3::exceptions::PyRuntimeError::new_err("Mesh has not been solved")
             })?;
             ParticleSource::Mesh(Arc::clone(sol))

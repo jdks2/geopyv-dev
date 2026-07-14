@@ -1422,7 +1422,7 @@ fn run_solve(
     let exclusion_views: Vec<_> = exclusion_arrs.iter().map(|a| a.view()).collect();
     let excl_hard = vec![false; exclusion_arrs.len()];
 
-    let mesh = match Mesh::new(
+    let mut mesh = match Mesh::new(
         boundary_arr.view(),
         true,
         &exclusion_views,
@@ -1467,7 +1467,8 @@ fn run_solve(
     };
 
     match mesh.solve(&local_mask, &seed_cfg, &cfg, None) {
-        Ok(solution) => {
+        Ok(()) => {
+            let solution = (**mesh.solution().expect("solve() succeeded, solution must be Some")).clone();
             if let Ok(mut s) = state.lock() {
                 s.result = Some(Ok(solution));
                 s.progress = 1.0;

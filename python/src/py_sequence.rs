@@ -109,7 +109,6 @@ impl PySequenceOptions {
 #[pyclass(name = "Sequence")]
 pub struct PySequence {
     pub(crate) inner: Sequence,
-    pub(crate) solution: Option<geopyv_dev::sequence::SequenceSolution>,
     /// Original boundary/exclusion objects passed to `new()`, retained so
     /// `solve()` can write the final tracked region state back into them.
     /// `None` when reconstructed from a saved solution (`from_solution`).
@@ -147,7 +146,7 @@ impl PySequence {
             .map_err(Error::from)?;
         let boundary_obj = Some(boundary.clone().unbind());
         let exclusion_objs = excl_list.iter().map(|o| o.clone().unbind()).collect();
-        Ok(PySequence { inner: seq, solution: None, boundary_obj, exclusion_objs })
+        Ok(PySequence { inner: seq, boundary_obj, exclusion_objs })
     }
 
     /// Solve all image pairs. Mutates in place; returns ``None``.
@@ -232,7 +231,8 @@ impl PySequence {
             border,
             save: save.map(PathBuf::from),
         };
-        let sol = self.inner.solve(&cfg).map_err(Error::from)?;
+        self.inner.solve(&cfg).map_err(Error::from)?;
+        let sol = self.inner.solution().expect("solve() succeeded, solution must be Some");
 
         // Write the final tracked boundary/exclusion state back into the
         // original Python region objects passed to `new()`, so the caller
@@ -246,7 +246,6 @@ impl PySequence {
             write_region_state(obj.bind(py), region)?;
         }
 
-        self.solution = Some(sol);
         Ok(())
     }
 
@@ -300,10 +299,17 @@ impl PySequence {
         Ok(sol.mesh_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect())
     }
 
-    /// ``True`` when all image pairs solved successfully.
+    /// ``True`` once ``solve()`` has been called (regardless of quality).
+    /// See ``all_converged`` for whether every pair succeeded.
     #[getter]
     fn solved(&self) -> bool {
-        self.solution.as_ref().map(|s| s.solved).unwrap_or(false)
+        self.inner.solved()
+    }
+
+    /// ``True`` when all image pairs solved successfully.
+    #[getter]
+    fn all_converged(&self) -> PyResult<bool> {
+        Ok(self.require_solved()?.all_converged)
     }
 
     /// ``True`` when a consecutive pair was unsolvable and the sequence was curtailed.
@@ -332,7 +338,7 @@ impl PySequence {
     #[getter]
     fn n_pairs(&self) -> usize {
         if self.inner.image_paths.is_empty() {
-            return self.solution.as_ref().map(|s| s.n_meshes()).unwrap_or(0);
+            return self.inner.solution().map(|s| s.n_meshes()).unwrap_or(0);
         }
         self.inner.n_pairs()
     }
@@ -587,10 +593,10 @@ impl PySequence {
     }
 
     fn __repr__(&self) -> String {
-        if let Some(sol) = &self.solution {
+        if let Some(sol) = self.inner.solution() {
             let n = sol.n_meshes();
             let n_images = if self.inner.image_paths.is_empty() { n + 1 } else { self.inner.image_paths.len() };
-            format!("Sequence(images={}, pairs={}, solved={})", n_images, n, sol.solved)
+            format!("Sequence(images={}, pairs={}, all_converged={})", n_images, n, sol.all_converged)
         } else {
             format!(
                 "Sequence(images={}, pairs={})",
@@ -615,7 +621,7 @@ fn load_image_opt(py: Python<'_>, path: &std::path::Path) -> Option<Py<PyImage>>
 
 impl PySequence {
     fn require_solved(&self) -> PyResult<&geopyv_dev::sequence::SequenceSolution> {
-        self.solution.as_ref().ok_or_else(|| {
+        self.inner.solution().ok_or_else(|| {
             PyRuntimeError::new_err("Sequence has not been solved; call solve() first")
         })
     }
@@ -646,8 +652,8 @@ impl PySequence {
             target_nodes: 0,
             mesh_order: sol.mesh_order,
         };
-        let inner = Sequence { image_paths, mesh_cfg };
-        Ok(PySequence { inner, solution: Some(sol), boundary_obj: None, exclusion_objs: vec![] })
+        let inner = Sequence::from_solution(image_paths, mesh_cfg, sol);
+        Ok(PySequence { inner, boundary_obj: None, exclusion_objs: vec![] })
     }
 }
 
@@ -684,7 +690,7 @@ fn sequence_deformation_preconditioning<'py>(
     mesh_order: u8,
     subset_order: u8,
 ) -> PyResult<Bound<'py, PyTuple>> {
-    let sol = mesh.solution.as_ref().ok_or_else(|| {
+    let sol = mesh.inner.solution().ok_or_else(|| {
         PyRuntimeError::new_err("Mesh has not been solved")
     })?;
     let (disp, warp) =

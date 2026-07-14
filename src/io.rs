@@ -200,7 +200,7 @@ mod tests {
         let sol = SequenceSolution {
             mesh_solutions: vec![Arc::new(make_mesh_solution()), Arc::new(make_mesh_solution())],
             mesh_paths: vec![],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false, false],
@@ -216,7 +216,7 @@ mod tests {
         match loaded {
             GeopyvObject::Sequence(s) => {
                 assert_eq!(s.mesh_solutions.len(), 2);
-                assert!(s.solved);
+                assert!(s.all_converged);
                 assert!(!s.unsolvable);
             }
             _ => panic!("expected Sequence variant"),

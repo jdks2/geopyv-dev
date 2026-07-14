@@ -1,0 +1,4 @@
+jupyter-book>=1.0
+myst-nb>=1.0
+Pillow>=9.0
+nbconvert>=7.0

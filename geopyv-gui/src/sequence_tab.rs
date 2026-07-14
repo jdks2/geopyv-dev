@@ -10,7 +10,7 @@ use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
 use geopyv_dev::mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
-use geopyv_dev::sequence::{deformation_preconditioning, SequenceSolution};
+use geopyv_dev::sequence::{deformation_preconditioning, default_boundary_region, SequenceSolution};
 use geopyv_dev::masks::{LocalMask, MaskShape};
 
 use crate::colormap::ColormapType;
@@ -587,7 +587,7 @@ impl SequenceTabState {
             let sol = self.view.solution.as_ref().unwrap();
             section_header(ui, "Sequence");
             meta_row(ui, "Frames", &n_frames.to_string());
-            meta_row(ui, "Solved", if sol.solved { "yes" } else { "no" });
+            meta_row(ui, "All converged", if sol.all_converged { "yes" } else { "no" });
             meta_row(ui, "Unsolvable", if sol.unsolvable { "yes" } else { "no" });
             if !sol.override_log.is_empty() {
                 meta_row(ui, "Override frames", &sol.override_log.len().to_string());
@@ -1655,18 +1655,18 @@ fn run_solve(
 
     let mut mesh_solutions: Vec<Arc<MeshSolution>> = Vec::with_capacity(n_pairs);
     let mut override_log: Vec<usize> = Vec::new();
-    let mut sync_sol: Option<MeshSolution> = None;
+    let mut sync_sol: Option<Arc<MeshSolution>> = None;
     let mut mesh_override = false;
 
     let mut f_index = 0usize;
     let mut g_index = 1usize;
 
     // Spawn background I/O thread so frame writes don't block the solve loop.
-    let (io_tx, io_rx) = std::sync::mpsc::sync_channel::<(PathBuf, MeshSolution)>(4);
+    let (io_tx, io_rx) = std::sync::mpsc::sync_channel::<(PathBuf, Arc<MeshSolution>)>(4);
     let io_state = Arc::clone(&state);
     let io_thread = std::thread::spawn(move || {
         while let Ok((path, mesh_sol)) = io_rx.recv() {
-            if let Err(e) = geopyv_dev::io::save(&path, &GeopyvObject::Mesh(mesh_sol)) {
+            if let Err(e) = geopyv_dev::io::save(&path, &GeopyvObject::Mesh((*mesh_sol).clone())) {
                 set_error(&io_state, format!("Frame save error: {e}"));
                 break;
             }
@@ -1712,8 +1712,8 @@ fn run_solve(
         };
 
         // Build / reuse mesh.
-        let mesh = match (params.sync, &sync_sol) {
-            (true, Some(prev)) => Mesh::from_solution(prev, Arc::clone(&f_img), Arc::clone(&g_img)),
+        let mut mesh = match (params.sync, &sync_sol) {
+            (true, Some(prev)) => Mesh::from_solution(Arc::clone(prev), Arc::clone(&f_img), Arc::clone(&g_img)),
             _ => match Mesh::new(
                 boundary_arr.view(),
                 true,
@@ -1750,7 +1750,7 @@ fn run_solve(
         let pair_result = mesh.solve(&local_mask, &pair_seed, &pair_cfg, None);
 
         let mesh_sol = match pair_result {
-            Ok(sol) => sol,
+            Ok(()) => mesh.solution().expect("solve() succeeded, solution must be Some").clone(),
             Err(_) => {
                 if f_index + 1 < g_index {
                     f_index = g_index - 1;
@@ -1778,9 +1778,11 @@ fn run_solve(
                         first_f_img_path: params.image_paths.first().cloned(),
                         mesh_solutions,
                         mesh_paths: vec![],
-                        solved: false,
+                        all_converged: false,
                         unsolvable: true,
                         override_log,
+                        boundary_region: default_boundary_region(),
+                        exclusion_regions: Vec::new(),
                     };
                     save_frames_and_sequence(&sol, &params, &state);
                     return;
@@ -1806,7 +1808,7 @@ fn run_solve(
         if params.sync {
             sync_sol = Some(mesh_sol.clone());
         }
-        mesh_solutions.push(Arc::new(mesh_sol.clone()));
+        mesh_solutions.push(mesh_sol.clone());
 
         g_index += 1;
         if g_index >= n_images {
@@ -1856,9 +1858,11 @@ fn run_solve(
         first_f_img_path: params.image_paths.first().cloned(),
         mesh_solutions,
         mesh_paths: vec![],
-        solved: true,
+        all_converged: true,
         unsolvable: false,
         override_log,
+        boundary_region: default_boundary_region(),
+        exclusion_regions: Vec::new(),
     };
 
     // Wait for all queued frame writes to complete before saving the sequence.

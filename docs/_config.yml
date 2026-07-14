@@ -1,0 +1,15 @@
+title: geopyv-dev Tutorials
+author: Sam Stanier & Jonathan Smith
+copyright: "2025"
+
+execute:
+  execute_notebooks: "off"
+
+repository:
+  url: https://github.com/jdks2/geopyv-dev
+  branch: main
+  path_to_book: docs
+
+html:
+  use_issues_button: true
+  use_repository_button: true

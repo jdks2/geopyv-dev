@@ -4,11 +4,20 @@ build-backend = "maturin"
 
 [project]
 name = "geopyv_dev"
-version = "0.1.10"
+version = "0.1.11"
 description = "A PIV/DIC analysis package for geotechnics."
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = ["numpy", "matplotlib", "scipy"]
+
+[project.optional-dependencies]
+docs = [
+    "jupyter-book>=1.0",
+    "myst-nb>=1.0",
+    "pydata-sphinx-theme>=0.15",
+    "nbconvert>=7.0",
+    "Pillow>=9.0",
+]
 authors = [
     { name = "Sam Stanier", email = "sas229@cam.ac.uk" },
     { name = "Jonathan Smith", email = "jdks2@cam.ac.uk" },

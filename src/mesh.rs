@@ -141,6 +141,7 @@ pub struct Mesh {
     mask: Option<Array2<u8>>,
     pub f_img: Arc<Image>,
     pub g_img: Arc<Image>,
+    solution: Option<Arc<MeshSolution>>,
 }
 
 impl Mesh {
@@ -207,6 +208,7 @@ impl Mesh {
             mask: roi.mask,
             f_img,
             g_img,
+            solution: None,
         })
     }
 
@@ -214,7 +216,8 @@ impl Mesh {
     ///
     /// Used by the sequence solver in `sync` mode. `mask` is `None` because
     /// the polygon data is not available; subsets are unmasked in this mode.
-    pub fn from_solution(sol: &MeshSolution, f_img: Arc<Image>, g_img: Arc<Image>) -> Self {
+    /// The resulting mesh is marked as solved (`sol` becomes its stored solution).
+    pub fn from_solution(sol: Arc<MeshSolution>, f_img: Arc<Image>, g_img: Arc<Image>) -> Self {
         Mesh {
             nodes: sol.nodes.clone(),
             elements: sol.elements.clone(),
@@ -224,7 +227,18 @@ impl Mesh {
             mask: None,
             f_img,
             g_img,
+            solution: Some(sol),
         }
+    }
+
+    /// `true` if this mesh has been solved (a `MeshSolution` is available).
+    pub fn solved(&self) -> bool {
+        self.solution.is_some()
+    }
+
+    /// The stored solve result, if any. Cheap to clone (`Arc`).
+    pub fn solution(&self) -> Option<&Arc<MeshSolution>> {
+        self.solution.as_ref()
     }
 
     /// Run the reliability-guided DIC solver.
@@ -237,12 +251,12 @@ impl Mesh {
     /// * `cfg`        — Solver configuration.
     /// * `progress`   — Optional external progress bar (used by Sequence).
     pub fn solve(
-        &self,
+        &mut self,
         local_mask: &LocalMask,
         seed: &SeedConfig,
         cfg: &SolveConfig,
         progress: Option<&indicatif::ProgressBar>,
-    ) -> Result<MeshSolution, Error> {
+    ) -> Result<(), Error> {
         let n_nodes = self.nodes.nrows();
         let p_len = 6 * cfg.subset_order;
 
@@ -380,7 +394,7 @@ impl Mesh {
         let f_img_path = self.f_img.filepath.clone().unwrap_or_default();
         let g_img_path = self.g_img.filepath.clone().unwrap_or_default();
 
-        Ok(MeshSolution {
+        self.solution = Some(Arc::new(MeshSolution {
             nodes: self.nodes.clone(),
             elements: self.elements.clone(),
             boundary: self.boundary.clone(),
@@ -398,7 +412,8 @@ impl Mesh {
             norms,
             f_img_path,
             g_img_path,
-        })
+        }));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -413,8 +428,8 @@ impl Mesh {
         cfg: &SolveConfig,
     ) -> Result<SolveResult, Error> {
         match cfg.method {
-            SolveMethod::Icgn => subset.solve_icgn(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
-            SolveMethod::Fagn => subset.solve_fagn(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
+            SolveMethod::Icgn => subset.solve_icgn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
+            SolveMethod::Fagn => subset.solve_fagn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
         }
     }
 
@@ -569,7 +584,7 @@ impl Mesh {
                 c_znssd: result.c_znssd,
                 iterations: result.iterations,
                 converged: result.converged,
-                solved: result.solved,
+                quality_ok: result.quality_ok,
                 history: result.history,
                 max_norm: result.max_norm,
                 tolerance: result.tolerance,

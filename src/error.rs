@@ -30,6 +30,10 @@ pub enum Error {
     /// `.pyv` file has a format version that this library cannot read.
     #[error("unsupported .pyv format version {0}; expected 1 or 2")]
     UnsupportedVersion(u8),
+
+    /// Solve-dependent data was requested before `solve()` was called.
+    #[error("{0} has not been solved; call solve() first")]
+    NotSolved(String),
 }
 
 impl From<std::io::Error> for Error {

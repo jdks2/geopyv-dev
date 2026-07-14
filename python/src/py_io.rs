@@ -29,25 +29,16 @@ use crate::{
 pub fn save(path: &str, obj: &Bound<'_, PyAny>) -> PyResult<()> {
     let py = obj.py();
     let gobj = if let Ok(m) = obj.extract::<PyRef<PyMesh>>() {
-        if m.solution.is_none() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Mesh has not been solved; cannot save.",
-            ));
-        }
-        GeopyvObject::Mesh((**m.solution.as_ref().unwrap()).clone())
+        let sol = m.inner.solution().ok_or_else(|| {
+            PyRuntimeError::new_err("Mesh has not been solved; cannot save.")
+        })?;
+        GeopyvObject::Mesh((**sol).clone())
     } else if let Ok(s) = obj.extract::<PyRef<PySequence>>() {
-        if s.solution.is_none() {
-            return Err(PyRuntimeError::new_err(
-                "Sequence has not been solved; cannot save.",
-            ));
-        }
-        GeopyvObject::Sequence(s.solution.clone().unwrap())
+        let sol = s.inner.solution().ok_or_else(|| {
+            PyRuntimeError::new_err("Sequence has not been solved; cannot save.")
+        })?;
+        GeopyvObject::Sequence(sol.clone())
     } else if let Ok(s) = obj.extract::<PyRef<PySubset>>() {
-        if s.result.is_none() {
-            return Err(PyRuntimeError::new_err(
-                "Subset has not been solved; cannot save.",
-            ));
-        }
         GeopyvObject::Subset(s.to_subset_solution(py)?)
     } else if let Ok(p) = obj.extract::<PyRef<PyParticle>>() {
         let sol = p.inner.solution().ok_or_else(|| {

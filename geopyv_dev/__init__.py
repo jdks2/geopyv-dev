@@ -390,4 +390,6 @@ class Validation:
 
     def _check_solved(self):
         if self._solution is None:
-            raise RuntimeError("call solve() first")
+            raise RuntimeError(
+                f"{type(self).__name__} has not been solved; call solve() first"
+            )

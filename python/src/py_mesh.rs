@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -46,7 +46,6 @@ pub struct PyMesh {
     pub(crate) inner: Mesh,
     pub(crate) f_img: Option<Py<PyImage>>,
     pub(crate) g_img: Option<Py<PyImage>>,
-    pub(crate) solution: Option<Arc<MeshSolution>>,
 }
 
 #[pymethods]
@@ -121,7 +120,6 @@ impl PyMesh {
             inner,
             f_img: Some(f_py),
             g_img: Some(g_py),
-            solution: None,
         })
     }
 
@@ -182,8 +180,7 @@ impl PyMesh {
             tolerance,
             method: solve_method,
         };
-        let sol = self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
-        self.solution = Some(Arc::new(sol));
+        self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
         Ok(())
     }
 
@@ -241,7 +238,7 @@ impl PyMesh {
     /// ``True`` once ``solve()`` has been called successfully.
     #[getter]
     fn solved(&self) -> bool {
-        self.solution.is_some()
+        self.inner.solved()
     }
 
     // -----------------------------------------------------------------------
@@ -322,9 +319,7 @@ impl PyMesh {
 
     /// Save the solved mesh to a ``.pyv`` file.
     fn save(&self, path: &str) -> PyResult<()> {
-        let sol = self.solution.as_ref().ok_or_else(|| {
-            PyRuntimeError::new_err("Mesh has not been solved; cannot save.")
-        })?;
+        let sol = self.require_solved_arc()?;
         io_save(path, &GeopyvObject::Mesh((**sol).clone())).map_err(Error::from)?;
         Ok(())
     }
@@ -334,8 +329,7 @@ impl PyMesh {
     // -----------------------------------------------------------------------
 
     fn __repr__(&self) -> String {
-        if self.solution.is_some() {
-            let sol = self.solution.as_ref().unwrap();
+        if let Some(sol) = self.inner.solution() {
             let zncc_min = sol.c_zncc.iter().cloned().fold(f64::INFINITY, f64::min);
             let zncc_max = sol.c_zncc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             format!(
@@ -360,14 +354,14 @@ impl PyMesh {
 
 impl PyMesh {
     fn require_solved(&self) -> PyResult<&MeshSolution> {
-        self.solution.as_deref().ok_or_else(|| {
-            PyAttributeError::new_err("Mesh has not been solved; call solve() first")
+        self.inner.solution().map(|arc| arc.as_ref()).ok_or_else(|| {
+            PyRuntimeError::new_err("Mesh has not been solved; call solve() first")
         })
     }
 
     fn require_solved_arc(&self) -> PyResult<&Arc<MeshSolution>> {
-        self.solution.as_ref().ok_or_else(|| {
-            PyAttributeError::new_err("Mesh has not been solved; call solve() first")
+        self.inner.solution().ok_or_else(|| {
+            PyRuntimeError::new_err("Mesh has not been solved; call solve() first")
         })
     }
 
@@ -379,12 +373,11 @@ impl PyMesh {
     /// the full `Image` (with B-spline coefficients) is needed for re-solving.
     pub(crate) fn from_solution(_py: Python<'_>, sol: Arc<MeshSolution>) -> PyResult<Self> {
         let dummy = Arc::new(Image::from_array(ndarray::Array2::<f64>::zeros((10, 10)), 3));
-        let inner = Mesh::from_solution(&sol, Arc::clone(&dummy), dummy);
+        let inner = Mesh::from_solution(sol, Arc::clone(&dummy), dummy);
         Ok(PyMesh {
             inner,
             f_img: None,
             g_img: None,
-            solution: Some(sol),
         })
     }
 
@@ -420,7 +413,7 @@ impl PyMesh {
             }
         }
 
-        self.inner = Mesh::from_solution(&sol, f_arc, g_arc);
+        self.inner = Mesh::from_solution(sol, f_arc, g_arc);
         Ok(())
     }
 }
