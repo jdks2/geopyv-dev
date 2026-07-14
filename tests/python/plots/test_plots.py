@@ -9,7 +9,7 @@ from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 
 from geopyv_dev import (
-    Image, Subset, Mesh, Mask,
+    Image, Subset, Mesh, Mask, Sequence, SequenceOptions,
     Field,
     Particle,
     field_distribute_particles,
@@ -21,8 +21,14 @@ from geopyv_dev.plots import (
     inspect_field,
     convergence_subset,
     convergence_mesh,
+    convergence_sequence,
     contour_mesh,
+    contour_sequence,
     contour_field,
+    history_particle,
+    trace_particle,
+    history_field,
+    trace_field,
 )
 
 # ---------------------------------------------------------------------------
@@ -31,6 +37,7 @@ from geopyv_dev.plots import (
 _HERE = os.path.dirname(__file__)
 REF_JPG = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", "geopyv", "tests", "ref.jpg"))
 TAR_JPG = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", "geopyv", "tests", "tar.jpg"))
+IMAGE_DIR = os.path.dirname(REF_JPG)
 IMAGES_AVAILABLE = os.path.isfile(REF_JPG) and os.path.isfile(TAR_JPG)
 
 pytestmark = pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
@@ -105,6 +112,49 @@ def solved_field(solved_mesh):
     # Field requires a SequenceSolution source — cannot be constructed from a
     # single MeshSolution without multiple image pairs.  Fixture is a no-op.
     pytest.skip("Field fixture requires SequenceSolution (multiple image pairs)")
+
+
+# ---------------------------------------------------------------------------
+# Unsolved-object fixtures — for guard tests below (plotting on data that has
+# never had solve() called must raise, not silently plot garbage).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def unsolved_subset(ref_img, tar_img):
+    tmpl = make_circle_template(RADIUS)
+    return Subset(COORD, tmpl, ref_img, tar_img)
+
+
+@pytest.fixture
+def unsolved_mesh(ref_img, tar_img):
+    tmpl = make_circle_template(20)
+    boundary = np.array(
+        [[150.0, 150.0], [250.0, 150.0], [250.0, 250.0], [150.0, 250.0]],
+        dtype=np.float64,
+    )
+    return Mesh(boundary, target_nodes=15, f_img=ref_img, g_img=tar_img,
+                size=(20.0, 40.0))
+
+
+@pytest.fixture
+def unsolved_sequence():
+    boundary = np.array(
+        [[150.0, 150.0], [250.0, 150.0], [250.0, 250.0], [150.0, 250.0]],
+        dtype=np.float64,
+    )
+    return Sequence(image_dir=IMAGE_DIR, boundary=boundary, target_nodes=15,
+                     size=(20.0, 40.0))
+
+
+@pytest.fixture
+def unsolved_particle(solved_mesh):
+    coords, vols = field_distribute_particles(solved_mesh.nodes, solved_mesh.elements)
+    return Particle(source=solved_mesh, coordinate=[float(coords[0, 0]), float(coords[0, 1])])
+
+
+@pytest.fixture
+def unsolved_field(solved_mesh):
+    return Field(sequence_solution=solved_mesh)
 
 
 # ===========================================================================
@@ -370,3 +420,62 @@ class TestContourField:
         contour_field(solved_field, "u", show=False, save=out)
         assert os.path.isfile(out)
         assert os.path.getsize(out) > 0
+
+
+# ===========================================================================
+# TestUnsolvedGuards
+#
+# Plotting solve-dependent data on an object that has never had solve()
+# called must raise, not silently plot near-empty/garbage data. In
+# particular, history_particle/trace_particle's default quantity="warps"
+# used to read unconditionally-available (zero-filled) fields with no
+# guard at all.
+# ===========================================================================
+
+class TestUnsolvedGuards:
+    def test_convergence_subset_raises(self, unsolved_subset):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            convergence_subset(unsolved_subset, show=False)
+
+    def test_convergence_mesh_raises(self, unsolved_mesh):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            convergence_mesh(unsolved_mesh, "C_ZNCC", show=False)
+
+    def test_contour_mesh_raises(self, unsolved_mesh):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            contour_mesh(unsolved_mesh, "C_ZNCC", show=False)
+
+    def test_convergence_sequence_raises(self, unsolved_sequence):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            convergence_sequence(unsolved_sequence, show=False)
+
+    def test_contour_sequence_raises(self, unsolved_sequence):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            contour_sequence(unsolved_sequence, mesh_idx=0, quantity="C_ZNCC")
+
+    def test_history_particle_default_quantity_raises(self, unsolved_particle):
+        # Regression test: this used to silently plot near-zero data instead
+        # of raising, because the default quantity="warps" read an
+        # unconditionally-available (zero-filled) field.
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            history_particle(unsolved_particle, show=False)
+
+    def test_history_particle_strains_quantity_raises(self, unsolved_particle):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            history_particle(unsolved_particle, quantity="strains", show=False)
+
+    def test_trace_particle_default_quantity_raises(self, unsolved_particle):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            trace_particle(unsolved_particle, show=False)
+
+    def test_history_field_raises(self, unsolved_field):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            history_field(unsolved_field, particle_index=0, show=False)
+
+    def test_trace_field_raises(self, unsolved_field):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            trace_field(unsolved_field, show=False)
+
+    def test_contour_field_raises(self, unsolved_field):
+        with pytest.raises(RuntimeError, match="has not been solved"):
+            contour_field(unsolved_field, "u", show=False)

@@ -1065,7 +1065,7 @@ mod tests {
         Arc::new(crate::sequence::SequenceSolution {
             mesh_solutions,
             mesh_paths: vec![],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false; n_pairs],
@@ -1133,7 +1133,7 @@ mod tests {
         let seq = Arc::new(crate::sequence::SequenceSolution {
             mesh_solutions: vec![Arc::new(mesh_sol_0), Arc::new(mesh_sol_1)],
             mesh_paths: vec![],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false, true],  // ref update at step 1
@@ -1173,7 +1173,7 @@ mod tests {
         let sol = Arc::new(crate::sequence::SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: paths.clone(),
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false; disps_list.len()],
@@ -1239,7 +1239,7 @@ mod tests {
         let seq = Arc::new(crate::sequence::SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: seq_base.mesh_paths.clone(),
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false, true],

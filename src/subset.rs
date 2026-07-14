@@ -98,6 +98,10 @@ pub struct Subset {
     pub grad_f: Option<Array2<f64>>,
     /// Standard deviation of reference intensities.
     pub sigma_intensity: Option<f64>,
+
+    /// Result of the most recent [`Subset::solve_icgn`]/[`Subset::solve_fagn`]
+    /// call. `None` until solved.
+    solution: Option<SubsetSolution>,
 }
 
 /// Serialisable result of a single-coordinate, single image-pair DIC solve.
@@ -136,8 +140,8 @@ pub struct SolveResult {
     /// Whether the norm criterion `||Δp|| < max_norm` was satisfied.
     pub converged: bool,
     /// Whether `c_zncc >= tolerance` (quality threshold passed).
-    #[serde(default)]
-    pub solved: bool,
+    #[serde(default, alias = "solved")]
+    pub quality_ok: bool,
     /// Per-iteration history: `(iteration, norm, C_ZNCC, C_ZNSSD)`.
     pub history: Vec<(usize, f64, f64, f64)>,
     #[serde(default)]
@@ -660,13 +664,15 @@ impl Subset {
             f_m: Some(f_m),
             grad_f: Some(grad_f),
             sigma_intensity: Some(sigma_intensity),
+            solution: None,
         })
     }
 
     /// Partial constructor — called on load when images cannot be found on disk.
     ///
     /// Populates only the always-populated tier from `sol`. All image handles
-    /// and image-dependent fields are `None`.
+    /// and image-dependent fields are `None`. The resulting `Subset` is marked
+    /// as solved (`sol` becomes its stored solution).
     pub fn from_subset_solution(sol: &SubsetSolution, _local_mask: &LocalMask) -> Self {
         let subset_order = if sol.result.p.is_empty() { 1 } else { sol.result.p.len() / 6 };
         Subset {
@@ -682,7 +688,28 @@ impl Subset {
             f_m: None,
             grad_f: None,
             sigma_intensity: None,
+            solution: Some(sol.clone()),
         }
+    }
+
+    /// `true` if this subset has been solved (a `SubsetSolution` is available).
+    pub fn solved(&self) -> bool {
+        self.solution.is_some()
+    }
+
+    /// The stored solve result, if any.
+    pub fn solution(&self) -> Option<&SubsetSolution> {
+        self.solution.as_ref()
+    }
+
+    /// Directly mark this subset as solved with a pre-computed solution.
+    ///
+    /// Used when reconstructing a `Subset` that has live image data (via
+    /// [`Subset::new`], e.g. for potential re-solving) but whose solved state
+    /// comes from a previously saved [`SubsetSolution`] rather than a fresh
+    /// call to [`Subset::solve_icgn`]/[`Subset::solve_fagn`].
+    pub fn set_solution(&mut self, solution: SubsetSolution) {
+        self.solution = Some(solution);
     }
 
     /// Number of active pixels (from template summary; always available).
@@ -693,19 +720,86 @@ impl Subset {
 
     /// Inverse Compositional Gauss-Newton solver (ICGN).
     ///
-    /// The Hessian is precomputed once from the reference image gradient.
-    /// The warp is updated via matrix composition.
+    /// Mutating entry point: runs the solve and stores the resulting
+    /// [`SubsetSolution`] on `self` (see [`Subset::solved`]/[`Subset::solution`]).
+    /// For the underlying multi-call-safe computation (used internally by
+    /// [`Mesh::solve`](crate::mesh::Mesh::solve), which solves the same
+    /// `Subset` repeatedly with different initial warps without persisting
+    /// any single attempt), see [`Subset::solve_icgn_result`].
     ///
     /// # Arguments
     /// * `p_0` — initial warp vector; `None` → zeros of length `6 * subset_order`;
     ///   provided slice is silently resized to `6 * subset_order`.
-    /// * `tolerance` — minimum ZNCC for `solved = true`.
+    /// * `tolerance` — minimum ZNCC for `quality_ok = true`.
     /// * `max_norm` — convergence criterion on `||Δp||`.
     /// * `max_iterations` — iteration limit.
     ///
     /// # Errors
     /// Returns [`Error::InvalidInput`] if any image-dependent field is `None`.
     pub fn solve_icgn(
+        &mut self,
+        p_0: Option<&[f64]>,
+        tolerance: f64,
+        max_norm: f64,
+        max_iterations: usize,
+    ) -> Result<(), Error> {
+        let result = self.solve_icgn_result(p_0, tolerance, max_norm, max_iterations)?;
+        self.solution = Some(self.build_solution(result));
+        Ok(())
+    }
+
+    /// Forward Additive Gauss-Newton solver (FAGN).
+    ///
+    /// Mutating entry point; see [`Subset::solve_icgn`] for the split between
+    /// this and [`Subset::solve_fagn_result`].
+    ///
+    /// # Arguments: same as [`Subset::solve_icgn`].
+    pub fn solve_fagn(
+        &mut self,
+        p_0: Option<&[f64]>,
+        tolerance: f64,
+        max_norm: f64,
+        max_iterations: usize,
+    ) -> Result<(), Error> {
+        let result = self.solve_fagn_result(p_0, tolerance, max_norm, max_iterations)?;
+        self.solution = Some(self.build_solution(result));
+        Ok(())
+    }
+
+    /// Build a [`SubsetSolution`] from a computed [`SolveResult`], pulling in
+    /// this subset's static metadata (coordinates, mask, image paths).
+    fn build_solution(&self, result: SolveResult) -> SubsetSolution {
+        let ref_image = self.f_img.as_ref()
+            .and_then(|img| img.filepath.clone())
+            .unwrap_or_default();
+        let target_image = self.g_img.as_ref()
+            .and_then(|img| img.filepath.clone())
+            .unwrap_or_default();
+        let n_px = self.n_px();
+        SubsetSolution {
+            coord: self.coord,
+            mask: self.mask.clone(),
+            ref_image,
+            target_image,
+            result,
+            std_dev: self.delta_f / (n_px as f64).sqrt(),
+            sssig: self.sssig,
+            delta_f: self.delta_f,
+        }
+    }
+
+    /// Inverse Compositional Gauss-Newton solve computation (no mutation).
+    ///
+    /// Safe to call repeatedly on the same `Subset` with different initial
+    /// warps without disturbing any previously stored solution — this is what
+    /// [`Mesh::solve`](crate::mesh::Mesh::solve) relies on internally when it
+    /// retries a node with several candidate warps and keeps only the best
+    /// [`SolveResult`]. External callers wanting a single-shot, solved-tracking
+    /// API should use [`Subset::solve_icgn`] instead.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if any image-dependent field is `None`.
+    pub(crate) fn solve_icgn_result(
         &self,
         p_0: Option<&[f64]>,
         tolerance: f64,
@@ -763,17 +857,18 @@ impl Subset {
             .map(|&(_, _, zncc, z)| (zncc, z))
             .unwrap_or((0.0, 4.0));
 
-        let solved = c_zncc >= tolerance;
-        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, solved, history, max_norm, tolerance })
+        let quality_ok = c_zncc >= tolerance;
+        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history, max_norm, tolerance })
     }
 
-    /// Forward Additive Gauss-Newton solver (FAGN).
+    /// Forward Additive Gauss-Newton solve computation (no mutation).
     ///
-    /// The Hessian is recomputed each iteration from the target image gradient.
-    /// The warp is updated additively.
+    /// See [`Subset::solve_icgn_result`] for why this exists alongside the
+    /// mutating [`Subset::solve_fagn`].
     ///
-    /// # Arguments: same as [`solve_icgn`].
-    pub fn solve_fagn(
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if any image-dependent field is `None`.
+    pub(crate) fn solve_fagn_result(
         &self,
         p_0: Option<&[f64]>,
         tolerance: f64,
@@ -842,8 +937,8 @@ impl Subset {
             .map(|&(_, _, zncc, z)| (zncc, z))
             .unwrap_or((0.0, 4.0));
 
-        let solved = c_zncc >= tolerance;
-        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, solved, history, max_norm, tolerance })
+        let quality_ok = c_zncc >= tolerance;
+        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history, max_norm, tolerance })
     }
 }
 
@@ -1045,11 +1140,11 @@ mod tests {
         );
 
         // Solve
-        let result = subset.solve_icgn(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
 
         // Tier C: ZNCC ≈ 0.999987, rtol = 1e-5
         assert!(result.converged, "ICGN did not converge");
-        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
+        assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
         assert!(
             (result.c_zncc - 0.999987).abs() < 1e-4,
             "ZNCC = {} (expected ~0.999987)", result.c_zncc
@@ -1091,10 +1186,10 @@ mod tests {
             Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
         ).unwrap();
 
-        let result = subset.solve_fagn(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_fagn_result(None, 0.75, 1e-3, 50).unwrap();
 
         assert!(result.converged, "FAGN did not converge");
-        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
+        assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
         assert!(
             (result.c_zncc - 0.999987).abs() < 1e-4,
             "ZNCC = {} (expected ~0.999987)", result.c_zncc
@@ -1131,10 +1226,10 @@ mod tests {
             Arc::clone(&ref_img), Arc::clone(&tar_img), 2,
         ).unwrap();
 
-        let result = subset.solve_icgn(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
 
         assert!(result.converged, "ICGN order-2 did not converge");
-        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
+        assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
         assert!(
             result.c_zncc > 0.999,
             "ZNCC = {} (expected > 0.999)", result.c_zncc
@@ -1163,10 +1258,10 @@ mod tests {
             Arc::clone(&ref_img), Arc::clone(&tar_img), 2,
         ).unwrap();
 
-        let result = subset.solve_fagn(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_fagn_result(None, 0.75, 1e-3, 50).unwrap();
 
         assert!(result.converged, "FAGN order-2 did not converge");
-        assert!(result.solved, "subset should be solved (c_zncc > 0.75)");
+        assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
         assert!(
             result.c_zncc > 0.999,
             "ZNCC = {} (expected > 0.999)", result.c_zncc
@@ -1196,8 +1291,45 @@ mod tests {
         ).unwrap();
 
         // Set tolerance above 1.0 so no solve can ever pass.
-        let result = subset.solve_icgn(None, 2.0, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 2.0, 1e-3, 50).unwrap();
 
-        assert!(!result.solved, "solved should be false when tolerance > max possible ZNCC");
+        assert!(!result.quality_ok, "quality_ok should be false when tolerance > max possible ZNCC");
+    }
+
+    /// Fresh subsets report unsolved; the mutating `solve_icgn` stores a
+    /// `SubsetSolution` and flips `solved()` to true.
+    #[test]
+    fn test_mutating_solve_icgn_sets_solved_and_solution() {
+        let ref_path = test_image_path("ref.jpg");
+        let tar_path = test_image_path("tar.jpg");
+        if !ref_path.exists() || !tar_path.exists() {
+            eprintln!("Skipping: test images not found");
+            return;
+        }
+
+        use crate::image::Image;
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
+
+        let coord = [200.43, 200.76];
+        let local_mask = LocalMask::circle(25).unwrap();
+        let mut subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
+        ).unwrap();
+
+        assert!(!subset.solved(), "freshly constructed subset must be unsolved");
+        assert!(subset.solution().is_none());
+
+        subset.solve_icgn(None, 0.75, 1e-3, 50).unwrap();
+
+        assert!(subset.solved(), "solved() must be true after solve_icgn");
+        let sol = subset.solution().expect("solution must be Some after solve_icgn");
+        assert_eq!(sol.coord, coord);
+        assert!(
+            (sol.result.c_zncc - 0.999987).abs() < 1e-4,
+            "ZNCC = {} (expected ~0.999987)", sol.result.c_zncc
+        );
     }
 }

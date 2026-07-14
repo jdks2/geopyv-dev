@@ -140,8 +140,10 @@ pub struct SequenceSolution {
     /// File paths of per-frame `.pyv` files when solve was called with
     /// `save = Some(dir)`.  Empty when meshes are held in memory.
     pub mesh_paths: Vec<PathBuf>,
-    /// `true` when all image pairs were solved successfully.
-    pub solved: bool,
+    /// `true` when all image pairs were solved successfully. Distinct from
+    /// "was solve() called" — see [`Sequence::solved`] for that.
+    #[serde(alias = "solved")]
+    pub all_converged: bool,
     /// `true` when a consecutive pair was unsolvable and the sequence was
     /// curtailed.
     pub unsolvable: bool,
@@ -222,6 +224,7 @@ pub struct Sequence {
     pub image_paths: Vec<PathBuf>,
     /// Mesh generation configuration shared across all pairs.
     pub mesh_cfg: SequenceMeshConfig,
+    solution: Option<SequenceSolution>,
 }
 
 impl Sequence {
@@ -254,12 +257,37 @@ impl Sequence {
                 "target_nodes must be >= 1".to_string(),
             ));
         }
-        Ok(Sequence { image_paths, mesh_cfg })
+        Ok(Sequence { image_paths, mesh_cfg, solution: None })
+    }
+
+    /// Reconstruct a `Sequence` shell from a saved [`SequenceSolution`].
+    ///
+    /// Used when loading a `.pyv` file: `mesh_cfg` may be a placeholder (the
+    /// boundary polygon is not stored in the solution), but the resulting
+    /// `Sequence` is marked as solved (`sol` becomes its stored solution).
+    pub fn from_solution(
+        image_paths: Vec<PathBuf>,
+        mesh_cfg: SequenceMeshConfig,
+        sol: SequenceSolution,
+    ) -> Self {
+        Sequence { image_paths, mesh_cfg, solution: Some(sol) }
     }
 
     /// Number of image pairs (= number of meshes to solve).
     pub fn n_pairs(&self) -> usize {
         self.image_paths.len() - 1
+    }
+
+    /// `true` if this sequence has been solved (a `SequenceSolution` is
+    /// available). Independent of solve *quality* — see
+    /// [`SequenceSolution::all_converged`] for whether every pair succeeded.
+    pub fn solved(&self) -> bool {
+        self.solution.is_some()
+    }
+
+    /// The stored solve result, if any.
+    pub fn solution(&self) -> Option<&SequenceSolution> {
+        self.solution.as_ref()
     }
 
     /// Construct a `Sequence` by scanning a directory for image files.
@@ -298,7 +326,7 @@ impl Sequence {
     /// Replicates `Sequence.solve` (minus alive_bar, GUI, geomat sections).
     /// When `cfg.save` is `Some(dir)`, each solved mesh is written to
     /// `{dir}/mesh_{i:04}.pyv` and not held in memory.
-    pub fn solve(&self, cfg: &SequenceSolveConfig) -> Result<SequenceSolution, Error> {
+    pub fn solve(&mut self, cfg: &SequenceSolveConfig) -> Result<(), Error> {
         let n_images = self.image_paths.len();
         let mut mesh_solutions: Vec<Arc<MeshSolution>> = Vec::with_capacity(n_images - 1);
         let mut mesh_paths: Vec<PathBuf> = Vec::new();
@@ -326,6 +354,9 @@ impl Sequence {
         let mut sync_sol: Option<Arc<MeshSolution>> = None;
         // Override flag: relax tolerance for the next mesh solve.
         let mut mesh_override = false;
+        // Set when the failure-fallback path below advances `f_index`; cleared
+        // once the resulting pair's `reference_updates` entry is recorded.
+        let mut pending_ref_update = false;
 
         // Live region state, tracked across pairs (mirrors Python's
         // `boundary_obj`/`exclusion_objs` being threaded through every
@@ -381,8 +412,8 @@ impl Sequence {
             // In sync mode, reuse previous pair's geometry when available.
             let excl_views: Vec<_> = exclusion_regions.iter().map(|r| r.current_nodes.view()).collect();
             let excl_hard: Vec<bool> = exclusion_regions.iter().map(|r| r.hard).collect();
-            let mesh = match (cfg.options.sync, &sync_sol) {
-                (true, Some(prev)) => Mesh::from_solution(prev, Arc::clone(&f_img), Arc::clone(&g_img)),
+            let mut mesh = match (cfg.options.sync, &sync_sol) {
+                (true, Some(prev)) => Mesh::from_solution(Arc::clone(prev), Arc::clone(&f_img), Arc::clone(&g_img)),
                 _ => Mesh::new(
                     boundary_region.current_nodes.view(),
                     boundary_region.hard,
@@ -426,13 +457,16 @@ impl Sequence {
             let pair_result = mesh.solve(&cfg.local_mask, &pair_seed, &pair_cfg, Some(&pb_mesh));
 
             let mesh_sol: Arc<MeshSolution> = match pair_result {
-                Ok(sol) => Arc::new(sol),
+                Ok(()) => mesh.solution()
+                    .expect("solve() succeeded, solution must be Some")
+                    .clone(),
                 Err(_) => {
                     // Attempt to fall back to an updated reference.
                     if f_index + 1 < g_index {
                         // Non-consecutive pair failed: step reference forward.
                         f_index = g_index - 1;
                         f_img = Arc::new(Image::from_file(&self.image_paths[f_index], cfg.border)?);
+                        pending_ref_update = true;
                         if cfg.options.sync {
                             sync_sol = None;
                         }
@@ -442,10 +476,10 @@ impl Sequence {
                         continue 'outer;
                     } else {
                         // Consecutive pair truly unsolvable: curtail sequence.
-                        return Ok(SequenceSolution {
+                        self.solution = Some(SequenceSolution {
                             mesh_solutions,
                             mesh_paths,
-                            solved: false,
+                            all_converged: false,
                             unsolvable: true,
                             override_log,
                             reference_updates,
@@ -454,6 +488,7 @@ impl Sequence {
                             boundary_region,
                             exclusion_regions,
                         });
+                        return Ok(());
                     }
                 }
             };
@@ -469,6 +504,14 @@ impl Sequence {
             // Capture reference image path from the first solved pair.
             if first_f_img_path.is_none() {
                 first_f_img_path = Some(mesh_sol.f_img_path.clone());
+            }
+
+            if pending_ref_update {
+                let pair_idx = mesh_solutions.len() + mesh_paths.len();
+                if pair_idx < n_pairs {
+                    reference_updates[pair_idx] = true;
+                }
+                pending_ref_update = false;
             }
 
             // --- Store displaced region state. -------------------------------
@@ -546,10 +589,10 @@ impl Sequence {
         pb_seq.finish_and_clear();
         pb_mesh.finish_and_clear();
 
-        Ok(SequenceSolution {
+        self.solution = Some(SequenceSolution {
             mesh_solutions,
             mesh_paths,
-            solved: all_solved,
+            all_converged: all_solved,
             unsolvable: false,
             override_log,
             reference_updates,
@@ -557,7 +600,8 @@ impl Sequence {
             first_f_img_path,
             boundary_region,
             exclusion_regions,
-        })
+        });
+        Ok(())
     }
 
 }
@@ -611,8 +655,8 @@ fn store_region_step(
                 let mut warp_0 = vec![0.0f64; 6 * subset_order];
                 warp_0[0] = mean[0];
                 warp_0[1] = mean[1];
-                let result = subset.solve_icgn(Some(&warp_0), 0.9, 1e-5, 50)?;
-                if !result.solved {
+                let result = subset.solve_icgn_result(Some(&warp_0), 0.9, 1e-5, 50)?;
+                if !result.quality_ok {
                     // Registration failed: skip storing entirely for this pair.
                     return Ok(());
                 }
@@ -987,7 +1031,7 @@ mod tests {
         SequenceSolution {
             mesh_solutions: meshes,
             mesh_paths: vec![],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false; n],
@@ -1009,7 +1053,7 @@ mod tests {
         let sol = SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: vec![PathBuf::from("/a"), PathBuf::from("/b")],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false, false],
@@ -1045,7 +1089,7 @@ mod tests {
         let sol = SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: vec![tmp.clone()],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false],
@@ -1072,7 +1116,7 @@ mod tests {
         let sol = SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: vec![tmp.clone()],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: vec![false],

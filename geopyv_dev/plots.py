@@ -29,6 +29,20 @@ def _show_save_close(fig, show, block, save, owned=True):
         plt.close(fig)
 
 
+def _require_solved(obj):
+    """Raise RuntimeError if `obj` has not been solved yet.
+
+    Defense-in-depth: most solve-dependent attribute access already raises
+    via the underlying Rust getters, but this catches paths (e.g. a
+    `quantity` that only reads always-available fields) that wouldn't
+    otherwise error on unsolved data.
+    """
+    if not getattr(obj, 'solved', False):
+        raise RuntimeError(
+            f"{type(obj).__name__} has not been solved; call solve() first"
+        )
+
+
 def inspect_subset(subset, ax=None, show=True, block=True, save=False, **kwargs):
     coord = subset.coord
     f_coords = np.asarray(subset.f_coords)
@@ -183,9 +197,8 @@ def inspect_field(field, particle_idx=None, ax=None, show=True, block=True, save
 
 
 def convergence_subset(subset, axes=None, show=True, block=True, save=False, **kwargs):
-    history = getattr(subset, 'history', None)
-    if not getattr(subset, 'solved', False) or history is None:
-        raise ValueError("Subset has not been solved.")
+    _require_solved(subset)
+    history = subset.history
     max_norm = 1e-3
 
     iters = [h[0] for h in history]
@@ -211,6 +224,7 @@ def convergence_subset(subset, axes=None, show=True, block=True, save=False, **k
 
 
 def convergence_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, **kwargs):
+    _require_solved(mesh)
     valid = {"C_ZNCC", "iterations", "norm"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -239,6 +253,7 @@ def convergence_mesh(mesh, quantity, ax=None, show=True, block=True, save=False,
 
 
 def contour_sequence(sequence, mesh_idx, quantity, **kwargs):
+    _require_solved(sequence)
     if mesh_idx is None:
         raise ValueError("mesh_idx is required")
     mesh = sequence.mesh_solution_at(mesh_idx)
@@ -247,6 +262,7 @@ def contour_sequence(sequence, mesh_idx, quantity, **kwargs):
 
 def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_ZNCC",
                           ax=None, show=True, block=True, save=False, **kwargs):
+    _require_solved(sequence)
     if mesh_idx is not None:
         mesh = sequence.mesh_solution_at(mesh_idx)
         return convergence_mesh(mesh, quantity, ax=ax, show=show, block=block, save=save, **kwargs)
@@ -266,6 +282,7 @@ def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_Z
 
 
 def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, **kwargs):
+    _require_solved(mesh)
     valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -341,6 +358,7 @@ _STRAIN_LABELS_HISTORY = [
 def history_particle(particle, quantity="warps", components=None,
                      ax=None, show=True, block=True, save=None,
                      xlim=None, ylim=None, **kwargs):
+    _require_solved(particle)
     valid = {"warps", "strains", "vol_strains"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -391,6 +409,7 @@ def history_particle(particle, quantity="warps", components=None,
 def history_field(field, particle_index, quantity="warps", components=None,
                   ax=None, show=True, block=True, save=None,
                   xlim=None, ylim=None, **kwargs):
+    _require_solved(field)
     particle = field.particles[particle_index]
     return history_particle(particle, quantity, components=components,
                             ax=ax, show=show, block=block, save=save,
@@ -400,6 +419,7 @@ def history_field(field, particle_index, quantity="warps", components=None,
 def trace_particle(particle, quantity="warps", component=0,
                    imshow=True, ax=None, show=True, block=True, save=None,
                    xlim=None, ylim=None, **kwargs):
+    _require_solved(particle)
     valid = {"warps", "strains", "vol_strains"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -452,6 +472,7 @@ def trace_particle(particle, quantity="warps", component=0,
 def trace_field(field, quantity="warps", component=0,
                 imshow=True, ax=None, show=True, block=True, save=None,
                 xlim=None, ylim=None, **kwargs):
+    _require_solved(field)
     valid = {"warps", "strains", "vol_strains"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
@@ -513,6 +534,7 @@ def trace_field(field, quantity="warps", component=0,
 
 def contour_field(field, quantity, window=None, dt=None, absolute=False,
                    ax=None, show=True, block=True, save=False, **kwargs):
+    _require_solved(field)
     valid = {"u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")

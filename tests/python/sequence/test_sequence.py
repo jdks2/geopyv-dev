@@ -258,7 +258,7 @@ def test_sequence_repr_after_solve():
 
     r = repr(seq)
     assert "Sequence" in r
-    assert "solved" in r
+    assert "all_converged" in r
 
 
 # ===========================================================================

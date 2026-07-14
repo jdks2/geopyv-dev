@@ -27,15 +27,14 @@ use crate::{
 #[pyclass(name = "Subset")]
 pub struct PySubset {
     // Always present; image-dependent fields within inner may be None.
+    // Solve state (SolveResult wrapped in a SubsetSolution) lives on `inner`
+    // itself — see Subset::solved()/Subset::solution().
     pub(crate) inner: Subset,
 
     // Python object handles (not in Rust core).
     local_mask: Option<Py<PyMask>>,
     pub(crate) f_img: Option<Py<PyImage>>,
     pub(crate) g_img: Option<Py<PyImage>>,
-
-    // Solve result — None until solved or loaded.
-    pub(crate) result: Option<SolveResult>,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +71,10 @@ impl PySubset {
                 })
             }).transpose()?;
 
-        // Build inner — always Subset.
-        let inner = if let (Some(ref f_py), Some(ref g_py)) = (&py_f_img, &py_g_img) {
+        // Build inner — always Subset. Reconstruct with live image data when
+        // available (for potential re-solving), but always mark it solved
+        // with the loaded solution.
+        let mut inner = if let (Some(ref f_py), Some(ref g_py)) = (&py_f_img, &py_g_img) {
             let f_ref = f_py.bind(py).borrow();
             let g_ref = g_py.bind(py).borrow();
             Subset::new(
@@ -83,41 +84,39 @@ impl PySubset {
         } else {
             Subset::from_subset_solution(&sol, &local_mask)
         };
+        inner.set_solution(sol);
 
         Ok(PySubset {
             inner,
             local_mask: Some(py_mask),
             f_img: py_f_img,
             g_img: py_g_img,
-            result: Some(sol.result),
         })
     }
 
     /// Build a `SubsetSolution` for serialisation.
     pub(crate) fn to_subset_solution(&self, py: Python<'_>) -> PyResult<SubsetSolution> {
-        let result = self.result.clone().ok_or_else(|| {
+        let mut sol = self.inner.solution().cloned().ok_or_else(|| {
             PyRuntimeError::new_err("Subset has not been solved")
         })?;
-        let f_img_path = self.f_img.as_ref()
+        // Prefer the wrapper's own image handles (may have been swapped since
+        // the solve) over whatever was baked into the stored solution.
+        if let Some(f_img_path) = self.f_img.as_ref()
             .and_then(|img| img.bind(py).borrow().filepath.clone())
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let g_img_path = self.g_img.as_ref()
+        {
+            sol.ref_image = PathBuf::from(f_img_path);
+        }
+        if let Some(g_img_path) = self.g_img.as_ref()
             .and_then(|img| img.bind(py).borrow().filepath.clone())
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        {
+            sol.target_image = PathBuf::from(g_img_path);
+        }
+        Ok(sol)
+    }
 
-        let n_px = self.inner.n_px();
-        Ok(SubsetSolution {
-            coord: self.inner.coord,
-            mask: self.inner.mask.clone(),
-            ref_image: f_img_path,
-            target_image: g_img_path,
-            result,
-            std_dev: self.inner.delta_f / (n_px as f64).sqrt(),
-            sssig: self.inner.sssig,
-            delta_f: self.inner.delta_f,
-        })
+    /// The underlying `SolveResult`, if solved.
+    fn result(&self) -> Option<&SolveResult> {
+        self.inner.solution().map(|s| &s.result)
     }
 }
 
@@ -174,7 +173,6 @@ impl PySubset {
             local_mask: Some(lm_py),
             f_img: Some(f_img_py),
             g_img: Some(g_img_py),
-            result: None,
         })
     }
 
@@ -191,10 +189,9 @@ impl PySubset {
         max_iterations: usize,
         tolerance: f64,
     ) -> PyResult<()> {
-        let result = self.inner
+        self.inner
             .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
-        self.result = Some(result);
         Ok(())
     }
 
@@ -207,10 +204,9 @@ impl PySubset {
         max_iterations: usize,
         tolerance: f64,
     ) -> PyResult<()> {
-        let result = self.inner
+        self.inner
             .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
-        self.result = Some(result);
         Ok(())
     }
 
@@ -219,7 +215,7 @@ impl PySubset {
     // -----------------------------------------------------------------------
 
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        if self.result.is_none() {
+        if !self.inner.solved() {
             return Err(PyRuntimeError::new_err(
                 "Subset has not been solved; cannot save.",
             ));
@@ -246,7 +242,7 @@ impl PySubset {
     fn sssig(&self) -> f64 { self.inner.sssig }
 
     #[getter]
-    fn solved(&self) -> bool { self.result.is_some() }
+    fn solved(&self) -> bool { self.inner.solved() }
 
     #[getter]
     fn template_shape(&self) -> String {
@@ -322,28 +318,28 @@ impl PySubset {
     // -----------------------------------------------------------------------
 
     #[getter]
-    fn p(&self) -> Option<Vec<f64>> { self.result.as_ref().map(|r| r.p.clone()) }
+    fn p(&self) -> Option<Vec<f64>> { self.result().map(|r| r.p.clone()) }
 
     #[getter]
-    fn c_zncc(&self) -> Option<f64> { self.result.as_ref().map(|r| r.c_zncc) }
+    fn c_zncc(&self) -> Option<f64> { self.result().map(|r| r.c_zncc) }
 
     #[getter]
-    fn c_znssd(&self) -> Option<f64> { self.result.as_ref().map(|r| r.c_znssd) }
+    fn c_znssd(&self) -> Option<f64> { self.result().map(|r| r.c_znssd) }
 
     #[getter]
-    fn converged(&self) -> Option<bool> { self.result.as_ref().map(|r| r.converged) }
+    fn converged(&self) -> Option<bool> { self.result().map(|r| r.converged) }
 
     #[getter]
-    fn iterations(&self) -> Option<usize> { self.result.as_ref().map(|r| r.iterations) }
+    fn iterations(&self) -> Option<usize> { self.result().map(|r| r.iterations) }
 
     #[getter]
-    fn history(&self) -> Option<Vec<(usize, f64, f64, f64)>> { self.result.as_ref().map(|r| r.history.clone()) }
+    fn history(&self) -> Option<Vec<(usize, f64, f64, f64)>> { self.result().map(|r| r.history.clone()) }
 
     #[getter]
-    fn max_norm(&self) -> Option<f64> { self.result.as_ref().map(|r| r.max_norm) }
+    fn max_norm(&self) -> Option<f64> { self.result().map(|r| r.max_norm) }
 
     #[getter]
-    fn tolerance(&self) -> Option<f64> { self.result.as_ref().map(|r| r.tolerance) }
+    fn tolerance(&self) -> Option<f64> { self.result().map(|r| r.tolerance) }
 
     // -----------------------------------------------------------------------
     // __repr__
@@ -355,7 +351,7 @@ impl PySubset {
             MaskShape::Square => "square",
         };
         let tmpl_str = format!("{}({})", shape_str, self.inner.mask.size);
-        if let Some(ref r) = self.result {
+        if let Some(r) = self.result() {
             let p_str = {
                 let parts: Vec<String> = r.p.iter().map(|v| format!("{:.6}", v)).collect();
                 format!("[{}]", parts.join(", "))

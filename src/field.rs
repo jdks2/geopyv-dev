@@ -226,7 +226,7 @@ impl Field {
         let dummy_source = Arc::new(SequenceSolution {
             mesh_solutions: Vec::new(),
             mesh_paths: Vec::new(),
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: Vec::new(),
             reference_updates: Vec::new(),
@@ -383,7 +383,7 @@ mod tests {
         Arc::new(SequenceSolution {
             mesh_solutions,
             mesh_paths: vec![],
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: ref_updates,
@@ -670,7 +670,7 @@ mod tests {
         let sol = Arc::new(SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: paths.clone(),
-            solved: true,
+            all_converged: true,
             unsolvable: false,
             override_log: vec![],
             reference_updates: ref_updates,
@@ -701,7 +701,7 @@ mod tests {
         let seq = Arc::new(SequenceSolution {
             mesh_solutions: vec![],
             mesh_paths: vec![],
-            solved: false,
+            all_converged: false,
             unsolvable: true,
             override_log: vec![],
             reference_updates: vec![],

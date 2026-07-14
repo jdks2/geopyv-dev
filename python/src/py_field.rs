@@ -102,18 +102,18 @@ impl PyField {
     ) -> PyResult<Self> {
         let source: Arc<SequenceSolution> =
             if let Ok(seq) = sequence_solution.extract::<PyRef<PySequence>>() {
-                let sol = seq.solution.as_ref().ok_or_else(|| {
+                let sol = seq.inner.solution().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("Sequence has not been solved")
                 })?;
                 Arc::new(sol.clone())
             } else if let Ok(mesh) = sequence_solution.extract::<PyRef<PyMesh>>() {
-                let mesh_sol = mesh.solution.as_ref().ok_or_else(|| {
+                let mesh_sol = mesh.inner.solution().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("Mesh has not been solved")
                 })?;
                 Arc::new(SequenceSolution {
                     mesh_solutions: vec![mesh_sol.clone()],
                     mesh_paths: vec![],
-                    solved: true,
+                    all_converged: true,
                     unsolvable: false,
                     override_log: vec![],
                     reference_updates: vec![false],

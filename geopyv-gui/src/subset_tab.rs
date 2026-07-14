@@ -7,7 +7,7 @@ use egui_plot::{HLine, Legend, Line, LineStyle, Plot, Points};
 
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::subset::{Subset, SubsetSolution, MaskSummary};
+use geopyv_dev::subset::{Subset, SubsetSolution};
 use geopyv_dev::masks::{LocalMask, MaskShape};
 
 use crate::draw::{ActiveDrawMode, ImageCoord};
@@ -1330,7 +1330,7 @@ fn run_solve(
     let subset_order = n_params / 6;
 
     set_progress(&state, 0.5, "Creating subset…");
-    let subset = match Subset::new(
+    let mut subset = match Subset::new(
         params.coord,
         &local_mask,
         None,
@@ -1344,15 +1344,6 @@ fn run_solve(
             return;
         }
     };
-
-    // Capture quality metrics before solving.
-    let n_px = subset.mask.n_px;
-    let std_dev = if n_px > 0 {
-        subset.delta_f / (n_px as f64).sqrt()
-    } else {
-        0.0
-    };
-    let sssig = subset.sssig;
 
     if cancel.load(Ordering::Relaxed) {
         if let Ok(mut s) = state.lock() { s.running = false; }
@@ -1372,21 +1363,10 @@ fn run_solve(
     };
 
     match solve_result {
-        Ok(result) => {
-            let solution = SubsetSolution {
-                coord: params.coord,
-                mask: MaskSummary {
-                    shape: params.template_shape,
-                    size: params.template_size as usize,
-                    n_px,
-                },
-                ref_image: params.ref_path,
-                target_image: params.target_path,
-                result,
-                std_dev,
-                sssig,
-                delta_f: subset.delta_f,
-            };
+        Ok(()) => {
+            let solution = subset.solution()
+                .expect("solve() succeeded, solution must be Some")
+                .clone();
             if let Ok(mut s) = state.lock() {
                 s.result = Some(Ok(solution));
                 s.progress = 1.0;
