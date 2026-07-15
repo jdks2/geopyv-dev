@@ -10,7 +10,7 @@ use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
 use geopyv_dev::mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
-use geopyv_dev::sequence::{deformation_preconditioning, default_boundary_region, SequenceSolution};
+use geopyv_dev::sequence::{deformation_preconditioning, default_boundary_region, SequenceOptions as LibSequenceOptions, SequenceSolution};
 use geopyv_dev::masks::{LocalMask, MaskShape};
 
 use crate::colormap::ColormapType;
@@ -1783,6 +1783,13 @@ fn run_solve(
                         override_log,
                         boundary_region: default_boundary_region(),
                         exclusion_regions: Vec::new(),
+                        options: Some(LibSequenceOptions {
+                            guide: params.guide,
+                            sequential: params.sequential,
+                            sync: params.sync,
+                            override_: params.override_,
+                        }),
+                        border: params.border,
                     };
                     save_frames_and_sequence(&sol, &params, &state);
                     return;
@@ -1863,6 +1870,13 @@ fn run_solve(
         override_log,
         boundary_region: default_boundary_region(),
         exclusion_regions: Vec::new(),
+        options: Some(LibSequenceOptions {
+            guide: params.guide,
+            sequential: params.sequential,
+            sync: params.sync,
+            override_: params.override_,
+        }),
+        border: params.border,
     };
 
     // Wait for all queued frame writes to complete before saving the sequence.

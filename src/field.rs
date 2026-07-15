@@ -130,6 +130,12 @@ pub struct FieldSolution {
     /// Whether calibration was applied during solve.
     #[serde(default)]
     pub calibrated: bool,
+    /// Assumed out-of-plane depth used for volumetric strain calculations.
+    #[serde(default)]
+    pub depth: f64,
+    /// Whether per-particle tracking (`Particle.track`) was enabled.
+    #[serde(default)]
+    pub track: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +240,8 @@ impl Field {
             first_f_img_path: sol.image_0_path.clone(),
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: Vec::new(),
+            options: None,
+            border: 0,
         });
         let n = sol.initial_coordinates.nrows();
         let mut volumes = Array1::<f64>::zeros(n);
@@ -322,6 +330,8 @@ impl Field {
             reference_update_register,
             image_0_path: self.image_0_path().cloned(),
             calibrated,
+            depth: self.depth,
+            track: self.track,
         });
         Ok(())
     }
@@ -372,6 +382,8 @@ mod tests {
             norms: Array1::zeros(n),
             f_img_path: PathBuf::new(),
             g_img_path: PathBuf::new(),
+            solve_config: None,
+            seed: None,
         }
     }
 
@@ -391,6 +403,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         })
     }
 
@@ -678,6 +692,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         });
         (sol, paths)
     }
@@ -709,6 +725,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         });
         assert!(Field::new(seq, FieldDistribution::FromSequence, true, 1.0).is_err());
     }

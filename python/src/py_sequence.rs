@@ -220,6 +220,7 @@ impl PySequence {
                 subset_order,
                 tolerance,
                 method: solve_method,
+                override_active: false,
             },
             local_mask,
             seed: SeedConfig {

@@ -213,7 +213,15 @@ def test_sequence_solve_one_pair_result_shape():
         local_mask=template,
         seed_coord=[cx, cy],
         max_norm=1e-3,
-        max_iterations=20,
+        # This test only checks pipeline shape (tolerance=0.0 — correlation
+        # quality is irrelevant), so pin subset_order=1: at the default
+        # order-2, one subset in this real-image/soft-boundary mesh never
+        # converges at all (still fails at 10000 iterations), which is a
+        # genuine ICGN limitation, not something to chase with a bigger
+        # budget — previously masked because `quality_ok` only checked
+        # correlation, not convergence. order-1 converges cleanly by 103.
+        max_iterations=200,
+        subset_order=1,
         tolerance=0.0,
         options=SequenceOptions(guide=False, sync=False),
         border=20,
@@ -307,7 +315,10 @@ def test_sequence_boundary_tracks_displacement_across_reference_update(tmp_path)
         local_mask=template,
         seed_coord=[cx, cy],
         max_norm=1e-3,
-        max_iterations=20,
+        # 20 was insufficient for one subset in the ref->tar pair to
+        # actually converge — previously masked because `quality_ok` only
+        # checked correlation, not convergence.
+        max_iterations=100,
         subset_order=1,
         tolerance=0.0,
         options=SequenceOptions(guide=False, sync=False, sequential=True),

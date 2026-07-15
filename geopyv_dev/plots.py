@@ -281,7 +281,7 @@ def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_Z
         return fig, ax
 
 
-def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, **kwargs):
+def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, mesh_overlay=False, **kwargs):
     _require_solved(mesh)
     valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R"}
     if quantity not in valid:
@@ -324,6 +324,9 @@ def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, **k
     cf = ax.tricontourf(tri_obj, values, **kwargs)
     cbar = fig.colorbar(cf, ax=ax)
     cbar.set_label(labels[quantity])
+
+    if mesh_overlay:
+        ax.triplot(tri_obj, color="k", alpha=0.25, linewidth=0.5)
 
     plt.tight_layout()
     _show_save_close(fig, show, block, save, owned=owned)

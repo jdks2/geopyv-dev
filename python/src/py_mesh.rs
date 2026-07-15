@@ -179,6 +179,7 @@ impl PyMesh {
             subset_order,
             tolerance,
             method: solve_method,
+            override_active: false,
         };
         self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
         Ok(())
@@ -479,6 +480,8 @@ impl PyMeshSolution {
                 norms: Array1::<f64>::zeros(n_nodes),
                 f_img_path: f_img_path.map(PathBuf::from).unwrap_or_default(),
                 g_img_path: g_img_path.map(PathBuf::from).unwrap_or_default(),
+                solve_config: None,
+                seed: None,
             },
         }
     }

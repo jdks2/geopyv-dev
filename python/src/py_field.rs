@@ -121,6 +121,8 @@ impl PyField {
                     first_f_img_path: Some(mesh_sol.f_img_path.clone()),
                     boundary_region: geopyv_dev::sequence::default_boundary_region(),
                     exclusion_regions: vec![],
+                    options: None,
+                    border: 0,
                 })
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
