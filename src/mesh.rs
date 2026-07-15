@@ -19,6 +19,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nalgebra::{DMatrix, DVector};
 use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,12 @@ pub struct MeshSolution {
     pub f_img_path: PathBuf,
     /// Target image file path.
     pub g_img_path: PathBuf,
+    /// Per-subset solver settings used to produce this solution.
+    #[serde(default)]
+    pub solve_config: Option<SolveConfig>,
+    /// Seed-node parameters used to produce this solution.
+    #[serde(default)]
+    pub seed: Option<SeedConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,13 +92,20 @@ pub struct MeshSolution {
 // ---------------------------------------------------------------------------
 
 /// Parameters forwarded to each subset solver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolveConfig {
     pub max_norm: f64,
     pub max_iterations: usize,
     pub subset_order: usize,
     pub tolerance: f64,
     pub method: SolveMethod,
+    /// When `true`, `Mesh::solve` accepts a mesh with `quality_ok == false`
+    /// subsets remaining after corrections instead of returning `Err`
+    /// (mirrors `mesh.py`'s `self._override` bypass for status-3 "subset
+    /// decorrelation"). Set by `sequence.rs` on a reference-update retry;
+    /// `false` for a normal/first-attempt solve.
+    #[serde(default)]
+    pub override_active: bool,
 }
 
 impl Default for SolveConfig {
@@ -102,12 +116,13 @@ impl Default for SolveConfig {
             subset_order: 2,
             tolerance: 0.75,
             method: SolveMethod::Icgn,
+            override_active: false,
         }
     }
 }
 
 /// Seed-node parameters for reliability-guided DIC.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeedConfig {
     /// Image coordinate `[x, y]` near a region of low deformation.
     pub coord: [f64; 2],
@@ -118,7 +133,7 @@ pub struct SeedConfig {
     pub tolerance: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SolveMethod {
     Icgn,
     Fagn,
@@ -269,6 +284,7 @@ impl Mesh {
 
         let mut stored = vec![false; n_nodes];
         let mut propagated = vec![false; n_nodes];
+        let mut quality_ok = Array1::<bool>::from_elem(n_nodes, false);
         let mut c_zncc = Array1::<f64>::zeros(n_nodes);
         let mut queue: BinaryHeap<(u64, usize)> = BinaryHeap::new();
         let mut p = Array2::<f64>::zeros((n_nodes, p_len));
@@ -308,28 +324,28 @@ impl Mesh {
         };
 
         // --- Seed node (uses seed.tolerance, stricter than cfg.tolerance).
+        // Forced preconditioning warp = the user's seed_warp; falls back to a
+        // zero-warp second attempt on failure, same as any other node (see
+        // `solve_node`) — unlike the old code, which had no seed fallback.
         let seed_node = find_seed_node(&self.nodes, seed.coord);
-        let seed_result = self.solve_one_with_tolerance(
-            &subsets[seed_node],
-            &seed_warp_norm,
-            seed.tolerance,
-            cfg,
+        let seed_cfg = SolveConfig { tolerance: seed.tolerance, ..cfg.clone() };
+        let seed_result = self.solve_node(
+            &subsets[seed_node], seed_node, &[], &c_zncc, &p, &seed_cfg, Some(&seed_warp_norm),
         )?;
-        store_result(seed_node, &seed_result, &mut c_zncc, &mut p, &mut displacements, &mut iterations, &mut norms);
+        store_result(seed_node, &seed_result, &mut quality_ok, &mut c_zncc, &mut p, &mut displacements, &mut iterations, &mut norms);
         pb.inc(1);
         stored[seed_node] = true;
         propagated[seed_node] = true;
         queue.push((c_zncc[seed_node].to_bits(), seed_node));
 
         // --- Seed neighbours.
-        let seed_p: Vec<f64> = p.row(seed_node).to_vec();
         self.solve_neighbours_from(
             seed_node,
-            &seed_p,
             &subsets,
             cfg,
             pb,
             &mut stored,
+            &mut quality_ok,
             &mut c_zncc,
             &mut queue,
             &mut p,
@@ -344,14 +360,13 @@ impl Mesh {
                 continue;
             }
             propagated[cur_idx] = true;
-            let p_0: Vec<f64> = p.row(cur_idx).to_vec();
             self.solve_neighbours_from(
                 cur_idx,
-                &p_0,
                 &subsets,
                 cfg,
                 pb,
                 &mut stored,
+                &mut quality_ok,
                 &mut c_zncc,
                 &mut queue,
                 &mut p,
@@ -367,6 +382,7 @@ impl Mesh {
             cfg,
             pb,
             &mut stored,
+            &mut quality_ok,
             &mut c_zncc,
             &mut p,
             &mut displacements,
@@ -376,6 +392,25 @@ impl Mesh {
 
         if progress.is_none() {
             pb.finish_and_clear();
+        }
+
+        // --- Post-corrections quality gate ("subset decorrelation").
+        //
+        // Mirrors `mesh.py::_reliability_guided`'s `if any(self._C_ZNCC <
+        // self._tolerance): self._unsolvable = True; self._status = 3` check
+        // — but on `quality_ok` (convergence *and* correlation) rather than
+        // correlation alone, since that's the whole point of `quality_ok`
+        // meaning something now. `cfg.override_active` mirrors Python's
+        // `self._override` bypass: a reference-update retry from
+        // `sequence.rs` sets it so a still-imperfect mesh isn't rejected a
+        // second time.
+        if !cfg.override_active {
+            let n_bad = quality_ok.iter().filter(|&&ok| !ok).count();
+            if n_bad > 0 {
+                return Err(Error::InvalidInput(format!(
+                    "mesh unsolvable: {n_bad} subset(s) failed to reach quality_ok after corrections"
+                )));
+            }
         }
 
         // --- Element areas, centroids and strains.
@@ -412,6 +447,8 @@ impl Mesh {
             norms,
             f_img_path,
             g_img_path,
+            solve_config: Some(cfg.clone()),
+            seed: Some(seed.clone()),
         }));
         Ok(())
     }
@@ -442,16 +479,75 @@ impl Mesh {
         self.solve_one_with_tolerance(subset, warp_0, cfg.tolerance, cfg)
     }
 
-    /// Solve all unsolved neighbours of `cur_idx`, applying warp extrapolation
-    /// as pre-conditioning (three-attempt strategy: NN → projected → zero).
+    /// Shared node-solve primitive used by RG propagation
+    /// ([`Self::solve_neighbours_from`]) and both corrections lanes
+    /// ([`Self::correlation_improvements`], [`Self::corrections`]).
+    ///
+    /// `trusted` — indices of `target_idx`'s neighbours already stored with
+    /// `quality_ok == true`; used to build a preconditioning warp via
+    /// [`Self::precondition_warp`]. Ignored when `forced_p0` is `Some`
+    /// (the seed-node call site: the preconditioning source there is the
+    /// user's `seed_warp`, not a neighbourhood).
+    ///
+    /// Tries the preconditioned warp, then a zero warp on failure, then
+    /// returns whichever attempt scored higher on `c_zncc`. No separate
+    /// "reliable" flag: `quality_ok` on the returned result already means
+    /// "converged and correlated" (see `subset.rs::SolveResult::quality_ok`)
+    /// — if this function reaches its last attempt, both tries already
+    /// failed that check, so whichever is kept is honestly `quality_ok ==
+    /// false` by construction.
+    fn solve_node(
+        &self,
+        subset: &Subset,
+        target_idx: usize,
+        trusted: &[usize],
+        c_zncc: &Array1<f64>,
+        p: &Array2<f64>,
+        cfg: &SolveConfig,
+        forced_p0: Option<&[f64]>,
+    ) -> Result<SolveResult, Error> {
+        let p_len = 6 * cfg.subset_order;
+        let p_a: Vec<f64> = match forced_p0 {
+            Some(p0) => {
+                let mut v = p0.to_vec();
+                v.resize(p_len, 0.0);
+                v
+            }
+            None => {
+                let target_pos = [self.nodes[[target_idx, 0]], self.nodes[[target_idx, 1]]];
+                precondition_warp(&self.nodes, target_pos, trusted, c_zncc, p, p_len)
+            }
+        };
+
+        let result_a = self.solve_one(subset, &p_a, cfg)?;
+        if result_a.quality_ok {
+            return Ok(result_a);
+        }
+        if p_a.iter().all(|&v| v == 0.0) {
+            // p_a was already the zero warp — a second zero-warp attempt
+            // would be a wasted, identical solve.
+            return Ok(result_a);
+        }
+        let zeros = vec![0.0f64; p_len];
+        let result_b = self.solve_one(subset, &zeros, cfg)?;
+        if result_b.quality_ok {
+            return Ok(result_b);
+        }
+        Ok(if result_b.c_zncc > result_a.c_zncc { result_b } else { result_a })
+    }
+
+
+    /// Solve all unsolved neighbours of `cur_idx`, preconditioning each from
+    /// its *own* trusted neighbourhood (not just `cur_idx`) via
+    /// [`Self::solve_node`].
     fn solve_neighbours_from(
         &self,
         cur_idx: usize,
-        p_0: &[f64],
         subsets: &[Subset],
         cfg: &SolveConfig,
         pb: &indicatif::ProgressBar,
         stored: &mut Vec<bool>,
+        quality_ok: &mut Array1<bool>,
         c_zncc: &mut Array1<f64>,
         queue: &mut BinaryHeap<(u64, usize)>,
         p: &mut Array2<f64>,
@@ -464,59 +560,116 @@ impl Mesh {
             if stored[nb_idx] {
                 continue;
             }
-            // Attempt 1: use current p_0 as-is (nearest-neighbour preconditioning).
-            let r1 = self.solve_one(&subsets[nb_idx], p_0, cfg)?;
-            if r1.c_zncc >= cfg.tolerance {
-                store_result(nb_idx, &r1, c_zncc, p, displacements, iterations, norms);
-                pb.inc(1);
-                stored[nb_idx] = true;
-                queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
-                continue;
-            }
-            // Attempt 2: projected preconditioning (Taylor expansion from cur_idx).
-            let p_proj = project_warp(p_0, &self.nodes, cur_idx, nb_idx);
-            let r2 = self.solve_one(&subsets[nb_idx], &p_proj, cfg)?;
-            if r2.c_zncc >= cfg.tolerance {
-                store_result(nb_idx, &r2, c_zncc, p, displacements, iterations, norms);
-                pb.inc(1);
-                stored[nb_idx] = true;
-                queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
-                continue;
-            }
-            // Attempt 3: zero initial guess.
-            let zeros = vec![0.0f64; p_0.len()];
-            let r3 = self.solve_one(&subsets[nb_idx], &zeros, cfg)?;
-            store_result(nb_idx, &r3, c_zncc, p, displacements, iterations, norms);
+            let candidates = connectivity(&self.elements, self.mesh_order, nb_idx, true);
+            let trusted: Vec<usize> = candidates
+                .into_iter()
+                .filter(|&n| stored[n] && quality_ok[n])
+                .collect();
+            let result = self.solve_node(&subsets[nb_idx], nb_idx, &trusted, c_zncc, p, cfg, None)?;
+            store_result(nb_idx, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
             pb.inc(1);
             stored[nb_idx] = true;
+            // Pushed regardless of `quality_ok` — for mesh-graph connectivity
+            // completeness (a not-`quality_ok` node can still be the only
+            // path to unsolved territory). It's never counted as *trusted*
+            // for anyone else's preconditioning, since that set is filtered
+            // on `quality_ok == true` already, so this doesn't leak an
+            // untrustworthy result into anyone else's precondition.
             queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
         }
         Ok(())
     }
 
-    /// Outlier correction: re-solve nodes flagged by `_corr`, `_flow`, `_R`.
-    fn corrections(
+    /// Improve anomalous poor-correlation nodes without discarding the RG result.
+    ///
+    /// Lane 1 of corrections (matches `mesh.py::_correlation_improvements`):
+    /// re-solves each `_corr()`-flagged (IQR-outlier C_ZNCC) node via
+    /// [`Self::solve_node`], but only overwrites the node's stored solve if
+    /// the new C_ZNCC both beats the previous value and clears
+    /// `quality_ok` — otherwise the node's existing (RG-cascade) result is
+    /// left untouched and the node is excluded from preconditioning for the
+    /// remainder of this pass. No urgency to force anything here: these
+    /// nodes aren't necessarily spatially inconsistent, just relatively low
+    /// versus their peers.
+    fn correlation_improvements(
         &self,
         subsets: &[Subset],
         cfg: &SolveConfig,
-        _pb: &indicatif::ProgressBar,
         solved: &mut Vec<bool>,
+        quality_ok: &mut Array1<bool>,
         c_zncc: &mut Array1<f64>,
         p: &mut Array2<f64>,
         displacements: &mut Array2<f64>,
         iterations: &mut Array1<u32>,
         norms: &mut Array1<f64>,
     ) -> Result<(), Error> {
-        let corr_ids = corr(c_zncc.view());
+        let mut order = corr(c_zncc.view());
+        // Ascending by C_ZNCC (worst first), matching Python's np.argsort.
+        order.sort_by(|&a, &b| c_zncc[a].partial_cmp(&c_zncc[b]).unwrap());
+
+        let mut unimproved: HashSet<usize> = HashSet::new();
+        for i in 0..order.len() {
+            let j = order[i];
+            let excluded: HashSet<usize> =
+                order[i + 1..].iter().copied().chain(unimproved.iter().copied()).collect();
+            let full_neighbours = connectivity(&self.elements, self.mesh_order, j, true);
+            let trusted: Vec<usize> = full_neighbours
+                .iter()
+                .copied()
+                .filter(|&nb| !excluded.contains(&nb) && quality_ok[nb])
+                .collect();
+
+            let result = self.solve_node(&subsets[j], j, &trusted, c_zncc, p, cfg, None)?;
+            if result.c_zncc > c_zncc[j] && result.quality_ok {
+                store_result(j, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
+                solved[j] = true;
+            } else {
+                unimproved.insert(j);
+            }
+        }
+        Ok(())
+    }
+
+    /// Outlier correction: re-solve nodes flagged by `_flow`, `_R`.
+    ///
+    /// Lane 2 of corrections. Unlike Lane 1, this **always** overwrites the
+    /// stored result with whatever [`Self::solve_node`] returns: the
+    /// existing value is a known spatial discontinuity (that's what flagged
+    /// it), so leaving it in place would defeat the point and risks failing
+    /// the downstream compatibility check outright. `quality_ok` on the
+    /// stored result is the honest signal for whether it should be trusted
+    /// downstream — often `false` here, and that's now visible instead of
+    /// silently indistinguishable from a clean solve.
+    fn corrections(
+        &self,
+        subsets: &[Subset],
+        cfg: &SolveConfig,
+        _pb: &indicatif::ProgressBar,
+        solved: &mut Vec<bool>,
+        quality_ok: &mut Array1<bool>,
+        c_zncc: &mut Array1<f64>,
+        p: &mut Array2<f64>,
+        displacements: &mut Array2<f64>,
+        iterations: &mut Array1<u32>,
+        norms: &mut Array1<f64>,
+    ) -> Result<(), Error> {
+        self.correlation_improvements(
+            subsets, cfg, solved, quality_ok, c_zncc, p, displacements, iterations, norms,
+        )?;
+
         let (_, flow_ids, flow_lq, flow_iqr) =
             flow_stats(&self.elements, self.mesh_order, displacements.view());
         let (r_vals, r_ids) =
             r_stats(&self.elements, self.mesh_order, &self.nodes, displacements.view());
 
-        // Merge and sort ascending by R (smallest R corrected first).
+        // Merge and sort ascending by R — mildest displacement-magnitude
+        // anomalies corrected first (not worst-first: `r_ids` flags only
+        // *upper*-tail IQR outliers in `r_calc`, so ascending-R means the
+        // more-plausible flagged nodes get fixed first, giving the wilder
+        // ones better-informed neighbours to precondition from later in
+        // this same loop).
         let mut full_id: Vec<usize> = {
-            let s: HashSet<usize> =
-                corr_ids.iter().chain(flow_ids.iter()).chain(r_ids.iter()).copied().collect();
+            let s: HashSet<usize> = flow_ids.iter().chain(r_ids.iter()).copied().collect();
             s.into_iter().collect()
         };
         full_id.sort_by(|&a, &b| r_vals[a].partial_cmp(&r_vals[b]).unwrap());
@@ -547,49 +700,17 @@ impl Mesh {
 
         for i in 0..active_ids.len() {
             let j = active_ids[i];
-            // Build collective preconditioning warp from good neighbours.
-            let full_neighbours =
-                connectivity(&self.elements, self.mesh_order, j, true);
+            let full_neighbours = connectivity(&self.elements, self.mesh_order, j, true);
             // Exclude current and later outliers from preconditioning.
             let later: HashSet<usize> = active_ids[i..].iter().copied().collect();
-            let good_nb: Vec<usize> = full_neighbours
+            let trusted: Vec<usize> = full_neighbours
                 .iter()
                 .copied()
-                .filter(|&nb| !later.contains(&nb) && c_zncc[nb] > cfg.tolerance)
+                .filter(|&nb| !later.contains(&nb) && quality_ok[nb])
                 .collect();
 
-            let warp: Vec<f64> = if !good_nb.is_empty() {
-                let n = good_nb.len() as f64;
-                let sum: Vec<f64> = (0..p.ncols())
-                    .map(|k| good_nb.iter().map(|&nb| p[[nb, k]]).sum::<f64>() / n)
-                    .collect();
-                sum
-            } else {
-                // Fall back to single best neighbour by C_ZNCC.
-                let nb_all = connectivity(&self.elements, self.mesh_order, j, true);
-                let best = nb_all.iter().copied().max_by(|&a, &b| {
-                    c_zncc[a].partial_cmp(&c_zncc[b]).unwrap()
-                });
-                match best {
-                    Some(b) => p.row(b).to_vec(),
-                    None => vec![0.0; p.ncols()],
-                }
-            };
-
-            let result = self.solve_one(&subsets[j], &warp, cfg)?;
-            // Force the warp regardless of convergence (matches Python behaviour).
-            let forced = SolveResult {
-                p: warp.clone(),
-                c_zncc: result.c_zncc,
-                c_znssd: result.c_znssd,
-                iterations: result.iterations,
-                converged: result.converged,
-                quality_ok: result.quality_ok,
-                history: result.history,
-                max_norm: result.max_norm,
-                tolerance: result.tolerance,
-            };
-            store_result(j, &forced, c_zncc, p, displacements, iterations, norms);
+            let result = self.solve_node(&subsets[j], j, &trusted, c_zncc, p, cfg, None)?;
+            store_result(j, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
             solved[j] = true;
         }
         Ok(())
@@ -1091,16 +1212,10 @@ fn r_stats(
 // Internal helper — warp propagation
 // ---------------------------------------------------------------------------
 
-/// Project warp from `from_idx` to `to_idx` using a Taylor expansion
-/// (mirrors `Mesh._neighbours` attempt 2).
-fn project_warp(
-    p: &[f64],
-    nodes: &Array2<f64>,
-    from_idx: usize,
-    to_idx: usize,
-) -> Vec<f64> {
-    let dx = nodes[[to_idx, 0]] - nodes[[from_idx, 0]];
-    let dy = nodes[[to_idx, 1]] - nodes[[from_idx, 1]];
+/// Project warp `p` by a Taylor expansion over displacement `(dx, dy)`
+/// from the node `p` was solved at to the target position (mirrors
+/// `Mesh._neighbours` attempt 2).
+fn project_warp(p: &[f64], dx: f64, dy: f64) -> Vec<f64> {
     let mut p_proj = p.to_vec();
     if p.len() >= 6 {
         p_proj[0] = p[0] + p[2] * dx + p[4] * dy;
@@ -1117,16 +1232,132 @@ fn project_warp(
     p_proj
 }
 
+/// Build a preconditioning warp for `target_pos` from `trusted` neighbour
+/// indices (already-solved nodes with `quality_ok == true`).
+///
+/// - `>= 3` trusted — local least-squares affine field fit
+///   ([`affine_field_fit`]): derives the target's `(u, v, ux, vx, uy, vy)`
+///   from how displacement actually varies across the trusted neighbourhood,
+///   rather than trusting any one neighbour's own individually-fit gradient
+///   terms.
+/// - `1` or `2` trusted, or the fit above is singular (e.g. collinear
+///   neighbours) — Taylor-projected extrapolation from whichever trusted
+///   neighbour has the highest `c_zncc` ([`project_warp`]).
+/// - `0` trusted — zero warp.
+fn precondition_warp(
+    nodes: &Array2<f64>,
+    target_pos: [f64; 2],
+    trusted: &[usize],
+    c_zncc: &Array1<f64>,
+    p: &Array2<f64>,
+    p_len: usize,
+) -> Vec<f64> {
+    if trusted.len() >= 3 {
+        if let Some(fit) = affine_field_fit(nodes, target_pos, trusted, p, p_len) {
+            return fit;
+        }
+    }
+    if let Some(&best) = trusted
+        .iter()
+        .max_by(|&&a, &&b| c_zncc[a].partial_cmp(&c_zncc[b]).unwrap())
+    {
+        let dx = target_pos[0] - nodes[[best, 0]];
+        let dy = target_pos[1] - nodes[[best, 1]];
+        return project_warp(&p.row(best).to_vec(), dx, dy);
+    }
+    vec![0.0; p_len]
+}
+
+/// Local least-squares affine field fit through `trusted` neighbours,
+/// evaluated at `target_pos`. Regresses each neighbour's own `(u, v)`
+/// against its position offset from the target — the fitted intercepts give
+/// the target's `(u, v)`, and the fitted slopes give `(ux, uy, vx, vy)`
+/// directly, derived from how displacement actually varies across the
+/// trusted neighbourhood rather than any one neighbour's own gradient
+/// estimate.
+///
+/// For `p_len >= 12` (`subset_order == 2`), also attempts the full
+/// quadratic fit (6 basis terms per component: `1, dx, dy, dx², dx·dy,
+/// dy²`) when `trusted.len() >= 6`; otherwise the 2nd-order terms are left
+/// at zero.
+///
+/// Returns `None` if the normal-equations matrix is singular (e.g. all
+/// trusted neighbours collinear) — the caller falls back to single-neighbour
+/// Taylor projection in that case.
+fn affine_field_fit(
+    nodes: &Array2<f64>,
+    target_pos: [f64; 2],
+    trusted: &[usize],
+    p: &Array2<f64>,
+    p_len: usize,
+) -> Option<Vec<f64>> {
+    let quadratic = p_len >= 12 && trusted.len() >= 6;
+    let rows: Vec<Vec<f64>> = trusted
+        .iter()
+        .map(|&i| {
+            let dx = nodes[[i, 0]] - target_pos[0];
+            let dy = nodes[[i, 1]] - target_pos[1];
+            if quadratic {
+                vec![1.0, dx, dy, dx * dx, dx * dy, dy * dy]
+            } else {
+                vec![1.0, dx, dy]
+            }
+        })
+        .collect();
+    let u: Vec<f64> = trusted.iter().map(|&i| p[[i, 0]]).collect();
+    let v: Vec<f64> = trusted.iter().map(|&i| p[[i, 1]]).collect();
+
+    let cu = ols_solve(&rows, &u)?;
+    let cv = ols_solve(&rows, &v)?;
+
+    let mut warp = vec![0.0; p_len];
+    warp[0] = cu[0]; // u
+    warp[1] = cv[0]; // v
+    warp[2] = cu[1]; // ux
+    warp[3] = cv[1]; // vx
+    warp[4] = cu[2]; // uy
+    warp[5] = cv[2]; // vy
+    if quadratic {
+        // u(dx,dy) = u + ux·dx + uy·dy + 0.5·uxx·dx² + uxy·dx·dy + 0.5·uyy·dy²
+        // (see `apply_warp`, subset.rs) vs. the fit's u(dx,dy) = cu[0] +
+        // cu[1]·dx + cu[2]·dy + cu[3]·dx² + cu[4]·dx·dy + cu[5]·dy² — so
+        // uxx = 2·cu[3], uxy = cu[4], uyy = 2·cu[5] (and likewise for v).
+        warp[6] = 2.0 * cu[3];  // uxx
+        warp[7] = 2.0 * cv[3];  // vxx
+        warp[8] = cu[4];        // uxy
+        warp[9] = cv[4];        // vxy
+        warp[10] = 2.0 * cu[5]; // uyy
+        warp[11] = 2.0 * cv[5]; // vyy
+    }
+    Some(warp)
+}
+
+/// Ordinary least squares via the normal equations `(AᵀA) x = Aᵀy`.
+/// `rows` are the design-matrix rows (all the same length). Returns `None`
+/// if `AᵀA` is singular.
+fn ols_solve(rows: &[Vec<f64>], y: &[f64]) -> Option<Vec<f64>> {
+    let n = rows.len();
+    let m = rows.first()?.len();
+    let a = DMatrix::from_fn(n, m, |r, c| rows[r][c]);
+    let yv = DVector::from_fn(n, |r, _| y[r]);
+    let ata = a.transpose() * &a;
+    let aty = a.transpose() * yv;
+    let inv = ata.try_inverse()?;
+    Some((inv * aty).iter().copied().collect())
+}
+
 /// Store a `SolveResult` into the per-node arrays.
 fn store_result(
     idx: usize,
     result: &SolveResult,
+    quality_ok: &mut Array1<bool>,
     c_zncc: &mut Array1<f64>,
     p: &mut Array2<f64>,
     displacements: &mut Array2<f64>,
     iterations: &mut Array1<u32>,
     norms: &mut Array1<f64>,
 ) {
+    quality_ok[idx] = result.quality_ok;
     c_zncc[idx] = result.c_zncc.max(0.0);
     for (k, &v) in result.p.iter().enumerate() {
         p[[idx, k]] = v;
@@ -1413,9 +1644,71 @@ mod tests {
         let mut p = vec![0.0f64; 12];
         p[4] = 1.0; // du/dy
         p[8] = 1.0; // d2u/dxdy
-        let nodes = array![[0.0, 0.0], [2.0, 3.0]];
-        let p_proj = project_warp(&p, &nodes, 0, 1);
+        let p_proj = project_warp(&p, 2.0, 3.0);
         assert!((p_proj[4] - 3.0).abs() < 1e-12, "du/dy projected: {}", p_proj[4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // affine_field_fit / ols_solve
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn affine_field_fit_recovers_exact_linear_field() {
+        // Synthetic linear displacement field: u = 0.1*x - 0.05*y + 2.0,
+        // v = -0.02*x + 0.08*y - 1.0. A noiseless affine fit should recover
+        // it exactly at any target position, including one not among the
+        // sampled nodes.
+        let u = |x: f64, y: f64| 0.1 * x - 0.05 * y + 2.0;
+        let v = |x: f64, y: f64| -0.02 * x + 0.08 * y - 1.0;
+        let nodes = array![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [5.0, 2.0],
+        ];
+        let mut p = Array2::<f64>::zeros((5, 6));
+        for i in 0..5 {
+            let (x, y) = (nodes[[i, 0]], nodes[[i, 1]]);
+            p[[i, 0]] = u(x, y);
+            p[[i, 1]] = v(x, y);
+        }
+        let target = [3.0, 7.0];
+        let trusted = [0usize, 1, 2, 3, 4];
+        let fit = affine_field_fit(&nodes, target, &trusted, &p, 6).expect("fit should succeed");
+        assert!((fit[0] - u(target[0], target[1])).abs() < 1e-9, "u: {}", fit[0]);
+        assert!((fit[1] - v(target[0], target[1])).abs() < 1e-9, "v: {}", fit[1]);
+        assert!((fit[2] - 0.1).abs() < 1e-9, "ux: {}", fit[2]);
+        assert!((fit[3] - (-0.02)).abs() < 1e-9, "vx: {}", fit[3]);
+        assert!((fit[4] - (-0.05)).abs() < 1e-9, "uy: {}", fit[4]);
+        assert!((fit[5] - 0.08).abs() < 1e-9, "vy: {}", fit[5]);
+    }
+
+    #[test]
+    fn affine_field_fit_none_when_collinear() {
+        // All trusted neighbours on a single line: the `dy` column (and
+        // hence the normal-equations matrix) is degenerate.
+        let nodes = array![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]];
+        let p = Array2::<f64>::zeros((3, 6));
+        let trusted = [0usize, 1, 2];
+        assert!(affine_field_fit(&nodes, [1.0, 5.0], &trusted, &p, 6).is_none());
+    }
+
+    #[test]
+    fn precondition_warp_thresholds() {
+        // 0 trusted -> zero warp.
+        let nodes = array![[0.0, 0.0], [1.0, 0.0]];
+        let c_zncc = Array1::from_vec(vec![0.9, 0.95]);
+        let p = array![[1.0, 2.0, 0.0, 0.0, 0.0, 0.0], [3.0, 4.0, 0.0, 0.0, 0.0, 0.0]];
+
+        let zero = precondition_warp(&nodes, [5.0, 5.0], &[], &c_zncc, &p, 6);
+        assert!(zero.iter().all(|&v| v == 0.0));
+
+        // 1 trusted -> Taylor projection from that neighbour (no gradient
+        // terms in `p` here, so projection is a flat copy of u,v).
+        let one = precondition_warp(&nodes, [5.0, 5.0], &[1], &c_zncc, &p, 6);
+        assert!((one[0] - 3.0).abs() < 1e-12);
+        assert!((one[1] - 4.0).abs() < 1e-12);
     }
 
 }

@@ -37,7 +37,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{image::Image, masks::{LocalMask, MaskShape}, Error};
+use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, Error};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -139,7 +139,11 @@ pub struct SolveResult {
     pub iterations: usize,
     /// Whether the norm criterion `||Δp|| < max_norm` was satisfied.
     pub converged: bool,
-    /// Whether `c_zncc >= tolerance` (quality threshold passed).
+    /// Whether `converged && c_zncc >= tolerance` — both the norm criterion
+    /// and the quality threshold passed. The single trust signal read by the
+    /// RG mesh solver: a subset that exhausted `max_iterations` without
+    /// converging is never treated as trustworthy here, even if its
+    /// (possibly garbage) final `p` happens to still correlate well.
     #[serde(default, alias = "solved")]
     pub quality_ok: bool,
     /// Per-iteration history: `(iteration, norm, C_ZNCC, C_ZNSSD)`.
@@ -148,6 +152,19 @@ pub struct SolveResult {
     pub max_norm: f64,
     #[serde(default)]
     pub tolerance: f64,
+    /// Warp order: 1 (affine, 6 params) or 2 (quadratic, 12 params).
+    #[serde(default)]
+    pub subset_order: usize,
+    /// Iteration limit passed to the solver.
+    #[serde(default)]
+    pub max_iterations: usize,
+    /// Which solver produced this result.
+    #[serde(default = "default_solve_method")]
+    pub method: SolveMethod,
+}
+
+fn default_solve_method() -> SolveMethod {
+    SolveMethod::Icgn
 }
 
 // ---------------------------------------------------------------------------
@@ -857,8 +874,12 @@ impl Subset {
             .map(|&(_, _, zncc, z)| (zncc, z))
             .unwrap_or((0.0, 4.0));
 
-        let quality_ok = c_zncc >= tolerance;
-        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history, max_norm, tolerance })
+        let quality_ok = converged && c_zncc >= tolerance;
+        Ok(SolveResult {
+            p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history,
+            max_norm, tolerance,
+            subset_order: self.subset_order, max_iterations, method: SolveMethod::Icgn,
+        })
     }
 
     /// Forward Additive Gauss-Newton solve computation (no mutation).
@@ -937,8 +958,12 @@ impl Subset {
             .map(|&(_, _, zncc, z)| (zncc, z))
             .unwrap_or((0.0, 4.0));
 
-        let quality_ok = c_zncc >= tolerance;
-        Ok(SolveResult { p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history, max_norm, tolerance })
+        let quality_ok = converged && c_zncc >= tolerance;
+        Ok(SolveResult {
+            p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history,
+            max_norm, tolerance,
+            subset_order: self.subset_order, max_iterations, method: SolveMethod::Fagn,
+        })
     }
 }
 
@@ -1294,6 +1319,44 @@ mod tests {
         let result = subset.solve_icgn_result(None, 2.0, 1e-3, 50).unwrap();
 
         assert!(!result.quality_ok, "quality_ok should be false when tolerance > max possible ZNCC");
+    }
+
+    /// `quality_ok` requires convergence, not just correlation: a subset
+    /// that exhausts its iteration budget without converging must not
+    /// report `quality_ok == true` even when its c_zncc clears a lenient
+    /// tolerance. Regression test for the bug documented in
+    /// `mds/rg_quality_gate_missing_convergence_check.md`.
+    #[test]
+    fn test_quality_ok_requires_convergence() {
+        let ref_path = test_image_path("ref.jpg");
+        let tar_path = test_image_path("tar.jpg");
+        if !ref_path.exists() || !tar_path.exists() {
+            eprintln!("Skipping: test images not found");
+            return;
+        }
+
+        use crate::image::Image;
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
+
+        let coord = [200.43, 200.76];
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
+        ).unwrap();
+
+        // Lenient tolerance (any positive correlation passes) but a single
+        // iteration — nowhere near enough for `||Δp|| < max_norm` to hold.
+        let result = subset.solve_icgn_result(None, 0.0, 1e-8, 1).unwrap();
+
+        assert!(!result.converged, "single-iteration solve should not have converged");
+        assert!(
+            !result.quality_ok,
+            "quality_ok must be false when not converged, regardless of c_zncc ({})",
+            result.c_zncc
+        );
     }
 
     /// Fresh subsets report unsolved; the mutating `solve_icgn` stores a

@@ -466,7 +466,7 @@ pub fn vol_strains(volumes: &Array1<f64>) -> Array1<f64> {
 // ---------------------------------------------------------------------------
 
 /// Configuration for [`Particle::solve`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParticleConfig {
     /// Volumetric correction factor applied in `strain_def`:
     /// `1.0` → full isotropic removal, `0.0` → no correction.
@@ -506,6 +506,9 @@ pub struct ParticleSolution {
     /// Whether calibration was applied during solve.
     #[serde(default)]
     pub calibrated: bool,
+    /// Strain-computation settings used to produce this solution.
+    #[serde(default)]
+    pub config: Option<ParticleConfig>,
 }
 
 /// Lagrangian / Eulerian particle tracking and strain-path computation.
@@ -762,6 +765,7 @@ impl Particle {
             reference_update_register: self.reference_update_register.clone(),
             image_0_path: self.image_0_path().cloned(),
             calibrated: false,
+            config: Some(cfg.clone()),
         }
     }
 }
@@ -1056,6 +1060,8 @@ mod tests {
             norms: Array1::zeros(n),
             f_img_path: PathBuf::new(),
             g_img_path: PathBuf::new(),
+            solve_config: None,
+            seed: None,
         }
     }
 
@@ -1073,6 +1079,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         })
     }
 
@@ -1141,6 +1149,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         });
         let mut p = Particle::new(
             ParticleSource::Sequence(seq),
@@ -1181,6 +1191,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         });
         (sol, paths)
     }
@@ -1247,6 +1259,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: crate::sequence::default_boundary_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         });
 
         let mut p = Particle::new(

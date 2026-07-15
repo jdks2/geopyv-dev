@@ -89,7 +89,7 @@ pub struct SequenceMeshConfig {
 // ---------------------------------------------------------------------------
 
 /// Temporal coupling strategy for [`Sequence::solve`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceOptions {
     /// Apply particle-based warp preconditioning between pairs.
     pub guide: bool,
@@ -164,6 +164,12 @@ pub struct SequenceSolution {
     /// Final tracked state of each exclusion region.
     #[serde(default)]
     pub exclusion_regions: Vec<Region>,
+    /// Temporal coupling strategy used to produce this solution.
+    #[serde(default)]
+    pub options: Option<SequenceOptions>,
+    /// Image border (pixels) for B-spline precomputation, used to produce this solution.
+    #[serde(default)]
+    pub border: usize,
 }
 
 /// Minimal static placeholder region — used where a full boundary/exclusion
@@ -427,10 +433,16 @@ impl Sequence {
                 )?,
             };
 
-            // Override: use tolerance = 0 (accept any subset).
+            // Override: relax tolerance to 0 and bypass the post-corrections
+            // quality gate (mirrors `mesh.py`'s `self._override` bypass for
+            // status-3 "subset decorrelation"). Convergence still isn't
+            // relaxable this way — `tolerance: 0.0` only helps the
+            // correlation half of `quality_ok`; `override_active` is what
+            // actually lets a still-non-converged mesh through.
             let pair_cfg = if mesh_override {
                 SolveConfig {
                     tolerance: 0.0,
+                    override_active: true,
                     ..cfg.mesh_cfg.clone()
                 }
             } else {
@@ -487,6 +499,8 @@ impl Sequence {
                             first_f_img_path,
                             boundary_region,
                             exclusion_regions,
+                            options: Some(cfg.options.clone()),
+                            border: cfg.border,
                         });
                         return Ok(());
                     }
@@ -544,6 +558,10 @@ impl Sequence {
             pb_seq.inc(1);
 
             // --- Advance target image. ------------------------------------
+            // Captured before `g_img` is reassigned below: sequential mode
+            // needs the *previous* target as its new reference, not the
+            // image that's about to become the new target.
+            let prev_g_img = Arc::clone(&g_img);
             g_index += 1;
             if g_index >= n_images {
                 all_solved = true;
@@ -575,7 +593,7 @@ impl Sequence {
             // --- Sequential reference update. ----------------------------
             if cfg.options.sequential {
                 f_index = g_index - 1;
-                f_img = Arc::clone(&g_img);
+                f_img = prev_g_img;
                 if cfg.options.sync {
                     sync_sol = None;
                 }
@@ -600,6 +618,8 @@ impl Sequence {
             first_f_img_path,
             boundary_region,
             exclusion_regions,
+            options: Some(cfg.options.clone()),
+            border: cfg.border,
         });
         Ok(())
     }
@@ -880,6 +900,8 @@ mod tests {
             norms: Array1::zeros(n),
             f_img_path: PathBuf::new(),
             g_img_path: PathBuf::new(),
+            solve_config: None,
+            seed: None,
         }
     }
 
@@ -1039,6 +1061,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: dummy_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         }
     }
 
@@ -1061,6 +1085,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: dummy_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         };
         assert_eq!(sol.n_meshes(), 2);
     }
@@ -1097,6 +1123,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: dummy_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         };
 
         let loaded = sol.load_mesh_at(0).unwrap();
@@ -1124,6 +1152,8 @@ mod tests {
             first_f_img_path: None,
             boundary_region: dummy_region(),
             exclusion_regions: vec![],
+            options: None,
+            border: 0,
         };
         assert!(sol.load_mesh_at(0).is_err());
 

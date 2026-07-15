@@ -113,14 +113,19 @@ impl Validation {
             }
 
             // Observed: copy particle warp paths; zero-pad if order-1 (6-wide)
+            // cumulative=true  → observed[m] = warps[m+1]             (cumulative from image 0)
+            // cumulative=false → observed[m] = warps[m+1] - warps[m]  (frame-to-frame increment)
             let copy_cols = n_warp.min(12);
             for j in 0..n_particles {
-                let p_warps = field_sol.particles[j].warps.slice(s![1.., ..]);
-                // p_warps shape: (n_frames, n_warp) — but may be fewer rows if particle went adrift
-                let rows = p_warps.nrows().min(n_frames);
-                for row in 0..rows {
+                let all_warps = field_sol.particles[j].warps.view();
+                let max_rows = all_warps.nrows().saturating_sub(1).min(n_frames);
+                for row in 0..max_rows {
                     for col in 0..copy_cols {
-                        observed[[row, j, col]] = p_warps[[row, col]];
+                        observed[[row, j, col]] = if cumulative {
+                            all_warps[[row + 1, col]]
+                        } else {
+                            all_warps[[row + 1, col]] - all_warps[[row, col]]
+                        };
                     }
                 }
             }
@@ -352,6 +357,7 @@ mod tests {
             reference_update_register: vec![],
             image_0_path: None,
             calibrated: false,
+            config: None,
         }
     }
 
@@ -370,6 +376,8 @@ mod tests {
             reference_update_register: vec![],
             image_0_path: None,
             calibrated: false,
+            depth: 1.0,
+            track: false,
         }
     }
 
@@ -407,6 +415,7 @@ mod tests {
                 reference_update_register: vec![],
                 image_0_path: None,
                 calibrated: false,
+                config: None,
             }));
         }
 
@@ -420,6 +429,8 @@ mod tests {
             reference_update_register: vec![],
             image_0_path: None,
             calibrated: false,
+            depth: 1.0,
+            track: false,
         };
 
         let validation = Validation::new(
@@ -466,6 +477,45 @@ mod tests {
             for j in 0..2 {
                 let a = fd.result.applied[[i, j, 0]];
                 assert!((a - 1.0).abs() < 1e-8, "frame {i} applied={a}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_validation_solve_noncumulative_observed_is_incremental() {
+        // cumulative=false: observed[m] = warps[m+1] - warps[m] (incremental),
+        // not warps[m+1] (cumulative). For a perfect-DIC simulation, applied ≈ observed.
+        // With linear speckle u=3, 4 images: applied[m,j,0] = u/3 = 1.0 per frame.
+        // make_particle_sol sets warps[i,0] = u*i so observed[m,j,0] = u*1 = u (WRONG old code)
+        // or u*(m+1) - u*m = u/n … wait — make_particle_sol uses u=1.0 → step=1.0 per frame.
+        // Use u=1.0 to match speckle increment exactly: speckle step = 1/3, particle step = 1.
+        // Instead, set up where particle step matches speckle step.
+        let image_no = 4usize;
+        let n_frames = image_no - 1; // 3
+        let u = 3.0_f64; // speckle: total displacement = u, step = u/(image_no-1) = 1.0
+        let speckle = make_speckle_translation(u, image_no);
+        // particle warps[i,0] = 1.0 * i (cumulative 1.0 per frame, matching speckle)
+        let field_sol = make_field_sol(n_frames, 1.0, 2);
+
+        let validation = Validation::new(
+            Arc::new(speckle),
+            vec![field_sol],
+            vec!["nc_obs".to_string()],
+        ).unwrap();
+
+        let sol = validation.solve(false, None).unwrap();
+        let fd = &sol.fields[0];
+
+        // observed[m,j,0] must be incremental: warps[m+1,0] - warps[m,0] = 1.0
+        for i in 0..n_frames {
+            for j in 0..2 {
+                let obs = fd.result.observed[[i, j, 0]];
+                assert!((obs - 1.0).abs() < 1e-8,
+                    "frame {i} particle {j} observed={obs}, expected 1.0 (incremental)");
+                // applied and observed should match (near-zero error)
+                let app = fd.result.applied[[i, j, 0]];
+                assert!((app - obs).abs() < 1e-8,
+                    "frame {i} particle {j} applied={app} != observed={obs}");
             }
         }
     }
