@@ -803,4 +803,71 @@ mod tests {
 
         for path in paths { let _ = std::fs::remove_file(path); }
     }
+
+    // -----------------------------------------------------------------------
+    // Calibration integration
+    // -----------------------------------------------------------------------
+
+    /// A camera model whose net image<->object mapping is exactly the identity.
+    /// See the identical helper in `particle.rs`'s tests for the derivation —
+    /// `extmat` cannot literally be the identity matrix (divides by zero at
+    /// z=0), so the depth (extmat[2,3]) and focal length must match instead.
+    fn identity_calibration() -> CalibrationParams {
+        let intmat = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut extmat = Array2::<f64>::eye(4);
+        extmat[[2, 3]] = 1.0;
+        CalibrationParams::new(intmat, extmat, [0.0; 5]).unwrap()
+    }
+
+    /// Same as `identity_calibration` but with the focal length doubled, so
+    /// i2o(imgpt) == 0.5 * imgpt for every point.
+    fn half_scale_calibration() -> CalibrationParams {
+        let intmat = array![[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut extmat = Array2::<f64>::eye(4);
+        extmat[[2, 3]] = 1.0;
+        CalibrationParams::new(intmat, extmat, [0.0; 5]).unwrap()
+    }
+
+    #[test]
+    fn test_field_calibrated_flag_true() {
+        let disps = pure_translation_disps(0.5, 0.1);
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        let cal = identity_calibration();
+        field.solve(0.0, true, Some(&cal)).unwrap();
+        assert!(field.solution().unwrap().calibrated);
+    }
+
+    #[test]
+    fn test_field_calibrated_flag_false() {
+        let disps = pure_translation_disps(0.5, 0.1);
+        let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
+        field.solve(0.0, true, None).unwrap();
+        assert!(!field.solution().unwrap().calibrated);
+    }
+
+    #[test]
+    fn test_field_calibrate_pure_scale() {
+        // Same reasoning as Particle's pure_scale test: each particle's
+        // displacement increment from its (also-scaled) reference should be
+        // exactly 0.5x the uncalibrated pixel-space increment.
+        let disps = pure_translation_disps(0.5, 0.1);
+
+        let mut field_uncal = make_field_from_seq(single_mesh_seq(&disps), true);
+        field_uncal.solve(0.0, true, None).unwrap();
+        let sol_uncal = field_uncal.solution().unwrap();
+
+        let cal = half_scale_calibration();
+        let mut field_cal = make_field_from_seq(single_mesh_seq(&disps), true);
+        field_cal.solve(0.0, true, Some(&cal)).unwrap();
+        let sol_cal = field_cal.solution().unwrap();
+
+        for (p_uncal, p_cal) in sol_uncal.particles.iter().zip(sol_cal.particles.iter()) {
+            let uncal_disp_x = p_uncal.coordinates[[1, 0]] - p_uncal.coordinates[[0, 0]];
+            let cal_disp_x = p_cal.coordinates[[1, 0]] - p_cal.coordinates[[0, 0]];
+            assert!(
+                (cal_disp_x - 0.5 * uncal_disp_x).abs() < 1e-9,
+                "{} vs {}", cal_disp_x, 0.5 * uncal_disp_x
+            );
+        }
+    }
 }

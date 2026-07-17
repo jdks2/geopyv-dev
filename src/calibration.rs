@@ -3,8 +3,11 @@
 //! Translates the `o2i` / `i2o` math from `geopyv/src/geopyv/calibration.py`
 //! (CalibrationBase class).  The cv2 ArUco solve loop stays in Python.
 
-use ndarray::{Array2, ArrayView2};
-use nalgebra::{Matrix3, Matrix4};
+use std::path::PathBuf;
+
+use ndarray::{array, Array1, Array2, ArrayView2};
+use nalgebra::{Matrix3, Matrix4, Rotation3, Vector3};
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
@@ -123,6 +126,82 @@ impl CalibrationParams {
                 + self.inv_extmat[[1, 3]];
         }
         out
+    }
+
+    /// Perturb the extrinsic matrix by an additional rotation and/or translation.
+    ///
+    /// Port of the Python `CalibrationBase.modify()`. Returns a **new**
+    /// `CalibrationParams` rather than mutating in place — `intmat`/`extmat`
+    /// inverses are precomputed and cached at construction, so mutating `extmat`
+    /// afterward would leave a stale cached inverse.
+    ///
+    /// `dangles` — axis-angle rotation vector (Rodrigues form, as produced by
+    /// `cv2.Rodrigues`) added to the current pose's own axis-angle vector.
+    /// `centre` — an image-space point; after the rotation is applied, the
+    /// translation is shifted by that point's object-space projection under the
+    /// *new* rotation (and old translation) — matching the original Python's
+    /// rotate-then-recentre order exactly.
+    pub fn modify(&self, dangles: [f64; 3], centre: [f64; 2]) -> Result<CalibrationParams, Error> {
+        let rot_mat = Matrix3::from_fn(|i, j| self.extmat[[i, j]]);
+        let rotation = Rotation3::from_matrix(&rot_mat);
+        let new_axis_angle = rotation.scaled_axis() + Vector3::new(dangles[0], dangles[1], dangles[2]);
+        let new_rotation = Rotation3::from_scaled_axis(new_axis_angle);
+
+        // New rotation, old translation — used to find where `centre` now maps
+        // to in object space under the rotated (but not yet translated) pose.
+        let mut intermediate_extmat = self.extmat.clone();
+        for i in 0..3 {
+            for j in 0..3 {
+                intermediate_extmat[[i, j]] = new_rotation.matrix()[(i, j)];
+            }
+        }
+        let intermediate = CalibrationParams::new(self.intmat.clone(), intermediate_extmat.clone(), self.dist)?;
+        let objpnt = intermediate.i2o(array![[centre[0], centre[1]]].view());
+
+        let mut final_extmat = intermediate_extmat;
+        final_extmat[[0, 3]] += objpnt[[0, 0]];
+        final_extmat[[1, 3]] += objpnt[[0, 1]];
+
+        CalibrationParams::new(self.intmat.clone(), final_extmat, self.dist)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CalibrationSolution — serialisation boundary
+// ---------------------------------------------------------------------------
+
+/// Everything needed to reconstruct a solved `Calibration` from a `.pyv` file:
+/// the numeric camera model plus the diagnostic data (`inspect`/`visualise`/
+/// `contour`/`error` plots) that a fresh ChArUco solve produces. The ChArUco
+/// board detection itself is not re-runnable from this — `board`/`dictionary`
+/// setup is not persisted, only its outputs.
+///
+/// Stores the three source-of-truth camera-model fields (`intmat`/`extmat`/
+/// `dist`) rather than a `CalibrationParams` directly, so the derived/cached
+/// matrix inverses are never serialised — [`params`](Self::params) rebuilds a
+/// `CalibrationParams` on demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationSolution {
+    pub intmat: Array2<f64>,
+    pub extmat: Array2<f64>,
+    pub dist: [f64; 5],
+    /// Per accepted image: detected ChArUco corner pixel coordinates, `(N, 2)`.
+    pub corners: Vec<Array2<f64>>,
+    /// Per accepted image: ChArUco ids matching `corners` row-for-row.
+    pub ids: Vec<Array1<i32>>,
+    /// Paths of the accepted calibration images, same order as `corners`/`ids`.
+    pub accepted_images: Vec<PathBuf>,
+    /// `(height, width)` of the calibration images.
+    pub image_size: (usize, usize),
+    /// Per accepted image: each detected corner's model reprojection, `(N, 2)`
+    /// — same order/shape as the matching entry in `corners`.
+    pub reimgpnts: Vec<Array2<f64>>,
+}
+
+impl CalibrationSolution {
+    /// Reconstruct a `CalibrationParams` from the stored source-of-truth fields.
+    pub fn params(&self) -> Result<CalibrationParams, Error> {
+        CalibrationParams::new(self.intmat.clone(), self.extmat.clone(), self.dist)
     }
 }
 
@@ -299,5 +378,68 @@ mod tests {
         assert!(CalibrationParams::new(bad.clone(), good4.clone(), dist).is_err());
         let good3 = ndarray::Array2::<f64>::eye(3);
         assert!(CalibrationParams::new(good3, bad, dist).is_err());
+    }
+
+    #[test]
+    fn test_modify_zero_dangles_shifts_translation_by_centre_objpnt() {
+        let p = test_params();
+        let centre = [300.0, 200.0];
+        let expected_objpnt = p.i2o(array![[centre[0], centre[1]]].view());
+
+        let modified = p.modify([0.0, 0.0, 0.0], centre).unwrap();
+
+        // Rotation submatrix unchanged (dangles = 0).
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((modified.extmat[[i, j]] - p.extmat[[i, j]]).abs() < 1e-12);
+            }
+        }
+        // Translation shifted by centre's object-space projection under the
+        // (unchanged) rotation.
+        assert!((modified.extmat[[0, 3]] - (p.extmat[[0, 3]] + expected_objpnt[[0, 0]])).abs() < 1e-9);
+        assert!((modified.extmat[[1, 3]] - (p.extmat[[1, 3]] + expected_objpnt[[0, 1]])).abs() < 1e-9);
+        // z-translation untouched (only [:2, 3] is shifted).
+        assert!((modified.extmat[[2, 3]] - p.extmat[[2, 3]]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_modify_updates_rotation_axis_angle() {
+        let p = test_params();
+        let dangles = [0.0, 0.0, 0.05_f64];
+        let modified = p.modify(dangles, [640.0, 480.0]).unwrap();
+
+        let orig_rot = Matrix3::from_fn(|i, j| p.extmat[[i, j]]);
+        let orig_axis_angle = Rotation3::from_matrix(&orig_rot).scaled_axis();
+        let new_rot = Matrix3::from_fn(|i, j| modified.extmat[[i, j]]);
+        let new_axis_angle = Rotation3::from_matrix(&new_rot).scaled_axis();
+
+        let expected = orig_axis_angle + Vector3::new(dangles[0], dangles[1], dangles[2]);
+        for k in 0..3 {
+            assert!(
+                (new_axis_angle[k] - expected[k]).abs() < 1e-9,
+                "component {k}: {} vs {}", new_axis_angle[k], expected[k]
+            );
+        }
+    }
+
+    #[test]
+    fn test_modify_does_not_mutate_original() {
+        let p = test_params();
+        let orig_extmat = p.extmat.clone();
+        let _ = p.modify([0.1, -0.05, 0.02], [400.0, 300.0]).unwrap();
+        assert_eq!(p.extmat, orig_extmat);
+    }
+
+    #[test]
+    fn test_modify_result_still_roundtrips() {
+        let p = test_params();
+        let modified = p.modify([0.02, -0.01, 0.03], [500.0, 400.0]).unwrap();
+        let imgpnts = array![[300.0, 200.0], [700.0, 600.0]];
+        let objpnts = modified.i2o(imgpnts.view());
+        let recovered = modified.o2i(objpnts.view());
+        for i in 0..imgpnts.nrows() {
+            assert!((recovered[[i, 0]] - imgpnts[[i, 0]]).abs() < 1e-4);
+            assert!((recovered[[i, 1]] - imgpnts[[i, 1]]).abs() < 1e-4);
+        }
     }
 }

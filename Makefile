@@ -1,13 +1,7 @@
-.PHONY: tutorials docs-assets docs docs-serve
+.PHONY: docs docs-serve
 
-tutorials:
-	python3 geopyv_dev/tutorials/make_tutorials.py
-
-docs-assets:
-	python3 docs/build_assets.py
-
-docs: docs-assets
-	jupyter-book build docs/
+docs:
+	sphinx-build docs docs/_build/html
 
 docs-serve:
 	python3 -m http.server --directory docs/_build/html

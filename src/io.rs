@@ -60,6 +60,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    calibration::CalibrationSolution,
     field::FieldSolution,
     geometry::region::Region,
     mesh::{MeshSolution, SolveMethod},
@@ -97,6 +98,10 @@ pub enum GeopyvObject {
     Sequence(SequenceSolution),
     Particle(ParticleSolution),
     Speckle(Speckle),
+    // Appended after the original five variants + Speckle — a new variant at
+    // the end doesn't disturb the existing variants' bincode tag indices, so
+    // no schema-version bump is needed for this addition (see module docs).
+    Calibration(CalibrationSolution),
 }
 
 // ---------------------------------------------------------------------------

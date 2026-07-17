@@ -19,3 +19,7 @@ wheelhouse/
 # maturin build output
 geopyv_dev/_geopyv_dev*.so
 geopyv_dev/_geopyv_dev*.pyd
+
+# Sphinx build output
+docs/_build/
+docs/api/generated/
