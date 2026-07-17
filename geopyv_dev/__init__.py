@@ -1,3 +1,5 @@
+from functools import cached_property
+
 from ._geopyv_dev import *
 import geopyv_dev._geopyv_dev as _core
 
@@ -9,6 +11,10 @@ from .plots import (
     inspect_sequence,
     inspect_particle,
     inspect_field,
+    inspect_calibration,
+    visualise_calibration,
+    contour_calibration,
+    error_calibration,
     convergence_subset,
     convergence_mesh,
     convergence_sequence,
@@ -51,6 +57,8 @@ def _wrap(raw):
         return Field._new_from_inner(raw)
     if isinstance(raw, _core.ParticleSolution):
         return ParticleWrapper(raw)
+    if isinstance(raw, _core.CalibrationSolution):
+        return Calibration._from_solution(raw)
     return raw
 
 
@@ -275,9 +283,15 @@ class Field:
         cal = getattr(calibration, '_inner', calibration)
         self._inner.solve(factor=factor, true_incs=true_incs, calibration=cal)
 
-    @property
+    @cached_property
     def particles(self):
+        """Every particle's strain-path solution. Reconstructed once and cached
+        — use ``particle_at(idx)`` instead if only one particle is needed."""
         return [ParticleWrapper(p) for p in self._inner.particles]
+
+    def particle_at(self, idx):
+        """A single particle's strain-path solution, without materialising the rest."""
+        return ParticleWrapper(self._inner.particle_at(idx))
 
     def inspect(self, **kwargs):
         return inspect_field(self, **kwargs)

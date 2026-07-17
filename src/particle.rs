@@ -1282,4 +1282,111 @@ mod tests {
 
         for path in paths { let _ = std::fs::remove_file(path); }
     }
+
+    // -----------------------------------------------------------------------
+    // Calibration integration
+    // -----------------------------------------------------------------------
+
+    /// A camera model whose net image<->object mapping is exactly the identity
+    /// (intmat's focal length equals extmat's depth, zero principal point,
+    /// zero rotation/lateral-translation/distortion). `extmat` cannot literally
+    /// be the identity matrix — that puts the camera exactly on the z=0 object
+    /// plane (division by zero) — so the depth (extmat[2,3]) and focal length
+    /// must match instead.
+    fn identity_calibration() -> CalibrationParams {
+        let intmat = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut extmat = ndarray::Array2::<f64>::eye(4);
+        extmat[[2, 3]] = 1.0;
+        CalibrationParams::new(intmat, extmat, [0.0; 5]).unwrap()
+    }
+
+    /// Same as `identity_calibration` but with the focal length doubled, so
+    /// i2o(imgpt) == 0.5 * imgpt for every point (a pure uniform scale, not an
+    /// identity map).
+    fn half_scale_calibration() -> CalibrationParams {
+        let intmat = array![[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut extmat = ndarray::Array2::<f64>::eye(4);
+        extmat[[2, 3]] = 1.0;
+        CalibrationParams::new(intmat, extmat, [0.0; 5]).unwrap()
+    }
+
+    #[test]
+    fn test_particle_calibrated_flag_true() {
+        let disps = array![[0.5f64, 0.1], [0.5, 0.1], [0.5, 0.1], [0.5, 0.1]];
+        let seq = make_seq_o1(vec![disps]);
+        let cal = identity_calibration();
+        let mut p = Particle::new(ParticleSource::Sequence(seq), [1.0/3.0, 1.0/3.0], &[0.0; 6], 1e9, true).unwrap();
+        p.solve(&ParticleConfig::default(), Some(&cal)).unwrap();
+        assert!(p.solution().unwrap().calibrated);
+    }
+
+    #[test]
+    fn test_particle_calibrated_flag_false() {
+        let disps = array![[0.5f64, 0.1], [0.5, 0.1], [0.5, 0.1], [0.5, 0.1]];
+        let seq = make_seq_o1(vec![disps]);
+        let mut p = Particle::new(ParticleSource::Sequence(seq), [1.0/3.0, 1.0/3.0], &[0.0; 6], 1e9, true).unwrap();
+        p.solve(&ParticleConfig::default(), None).unwrap();
+        assert!(!p.solution().unwrap().calibrated);
+    }
+
+    #[test]
+    fn test_particle_calibrate_identity() {
+        // An identity-mapping camera should reproduce the uncalibrated solve
+        // exactly — coordinates and warps in "object space" are numerically
+        // identical to pixel space.
+        let disps = array![[0.5f64, 0.1], [0.5, 0.1], [0.5, 0.1], [0.5, 0.1]];
+
+        let seq_a = make_seq_o1(vec![disps.clone()]);
+        let mut p_uncal = Particle::new(ParticleSource::Sequence(seq_a), [1.0/3.0, 1.0/3.0], &[0.0; 6], 1e9, true).unwrap();
+        p_uncal.solve(&ParticleConfig::default(), None).unwrap();
+        let sol_uncal = p_uncal.solution().unwrap();
+
+        let seq_b = make_seq_o1(vec![disps]);
+        let cal = identity_calibration();
+        let mut p_cal = Particle::new(ParticleSource::Sequence(seq_b), [1.0/3.0, 1.0/3.0], &[0.0; 6], 1e9, true).unwrap();
+        p_cal.solve(&ParticleConfig::default(), Some(&cal)).unwrap();
+        let sol_cal = p_cal.solution().unwrap();
+
+        for i in 0..sol_uncal.coordinates.nrows() {
+            for j in 0..2 {
+                assert!(
+                    (sol_cal.coordinates[[i, j]] - sol_uncal.coordinates[[i, j]]).abs() < 1e-9,
+                    "coord[{i},{j}]: {} vs {}", sol_cal.coordinates[[i, j]], sol_uncal.coordinates[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_particle_calibrate_pure_scale() {
+        // A pure-uniform-scale camera should scale the particle's *displacement
+        // increment* from the reference coordinate by the same factor — the
+        // reference coordinate itself is also converted to object space at
+        // solve start, so absolute coordinates scale too, but by the same 0.5
+        // factor relative to the (also-scaled) reference.
+        let disps = array![[0.5f64, 0.1], [0.5, 0.1], [0.5, 0.1], [0.5, 0.1]];
+        let coord = [1.0 / 3.0, 1.0 / 3.0];
+
+        let seq_a = make_seq_o1(vec![disps.clone()]);
+        let mut p_uncal = Particle::new(ParticleSource::Sequence(seq_a), coord, &[0.0; 6], 1e9, true).unwrap();
+        p_uncal.solve(&ParticleConfig::default(), None).unwrap();
+        let sol_uncal = p_uncal.solution().unwrap();
+        let uncal_disp = [
+            sol_uncal.coordinates[[1, 0]] - sol_uncal.coordinates[[0, 0]],
+            sol_uncal.coordinates[[1, 1]] - sol_uncal.coordinates[[0, 1]],
+        ];
+
+        let seq_b = make_seq_o1(vec![disps]);
+        let cal = half_scale_calibration();
+        let mut p_cal = Particle::new(ParticleSource::Sequence(seq_b), coord, &[0.0; 6], 1e9, true).unwrap();
+        p_cal.solve(&ParticleConfig::default(), Some(&cal)).unwrap();
+        let sol_cal = p_cal.solution().unwrap();
+        let cal_disp = [
+            sol_cal.coordinates[[1, 0]] - sol_cal.coordinates[[0, 0]],
+            sol_cal.coordinates[[1, 1]] - sol_cal.coordinates[[0, 1]],
+        ];
+
+        assert!((cal_disp[0] - 0.5 * uncal_disp[0]).abs() < 1e-9, "{} vs {}", cal_disp[0], 0.5 * uncal_disp[0]);
+        assert!((cal_disp[1] - 0.5 * uncal_disp[1]).abs() < 1e-9, "{} vs {}", cal_disp[1], 0.5 * uncal_disp[1]);
+    }
 }

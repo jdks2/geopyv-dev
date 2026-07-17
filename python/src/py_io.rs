@@ -6,6 +6,7 @@ use geopyv_dev::io::{self, GeopyvObject};
 use std::sync::Arc;
 
 use crate::{
+    py_calibration::PyCalibrationSolution,
     py_field::PyField,
     py_mesh::PyMesh,
     py_particle::PyParticle,
@@ -85,6 +86,9 @@ pub fn load(py: Python<'_>, path: &str) -> PyResult<PyObject> {
         }
         GeopyvObject::Particle(p) => Ok(Py::new(py, PyParticle::from_solution(p)?)?.into_py(py)),
         GeopyvObject::Speckle(s) => Ok(Py::new(py, PySpeckle { inner: Arc::new(s) })?.into_py(py)),
+        GeopyvObject::Calibration(c) => {
+            Ok(Py::new(py, PyCalibrationSolution { inner: c })?.into_py(py))
+        }
     }
 }
 

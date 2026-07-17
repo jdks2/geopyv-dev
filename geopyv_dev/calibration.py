@@ -35,6 +35,16 @@ class CalibrationParams:
     def i2o(self, imgpnts):
         return self._inner.i2o(np.asarray(imgpnts, dtype=np.float64))
 
+    def modify(self, dangles=(0.0, 0.0, 0.0), centre=(0.0, 0.0)):
+        """Return a new CalibrationParams with the extrinsic matrix perturbed
+        by an additional rotation (axis-angle, Rodrigues form) and/or
+        translation. Does not mutate this object."""
+        new = CalibrationParams.__new__(CalibrationParams)
+        new._inner = self._inner.modify(
+            [float(a) for a in dangles], [float(c) for c in centre]
+        )
+        return new
+
     @property
     def intmat(self):
         return self._inner.intmat
@@ -153,18 +163,26 @@ class Calibration:
         allCorners, allIds, imsize = self._read_chessboards(acceptance_threshold)
         if not allCorners:
             raise RuntimeError("Calibration failed: no usable frames detected.")
+        self._all_corners = allCorners
+        self._all_ids = allIds
+        self._imsize = imsize
 
         self._calibrate_camera(allCorners, allIds, imsize)
         self._extrinsic_matrix_generator()
+        self._dist = self._dist.flatten()
+        self._reprojection()
         self.solved = True
 
-        self._dist = self._dist.flatten()
         self.params = CalibrationParams(self._intmat, self._extmat, self._dist)
 
     def _read_chessboards(self, acceptance_threshold):
         import cv2
 
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
+        # cv2.aruco.detectMarkers/interpolateCornersCharuco (free functions) were
+        # removed in modern OpenCV (still present as of the original geopyv's
+        # OpenCV version, gone by 4.7+); CharucoDetector.detectBoard is the
+        # current replacement and does its own corner refinement internally.
+        detector = cv2.aruco.CharucoDetector(self._board)
         allCorners, allIds, accepted = [], [], []
 
         for path in self._calibration_images:
@@ -177,16 +195,7 @@ class Calibration:
             else:
                 src = gray
 
-            arcnrs, arids, _ = cv2.aruco.detectMarkers(
-                src, self._dictionary, parameters=cv2.aruco.DetectorParameters()
-            )
-            if not arcnrs:
-                continue
-            for c in arcnrs:
-                cv2.cornerSubPix(gray, c, (3, 3), (-1, -1), criteria)
-            ret, chcnrs, chids = cv2.aruco.interpolateCornersCharuco(
-                arcnrs, arids, gray, self._board
-            )
+            chcnrs, chids, _, _ = detector.detectBoard(src)
             if chcnrs is not None and chids is not None and len(chcnrs) > acceptance_threshold:
                 allCorners.append(chcnrs)
                 allIds.append(chids)
@@ -210,18 +219,21 @@ class Calibration:
     def _calibrate_camera(self, allCorners, allIds, imsize):
         import cv2
 
+        # cv2.aruco.calibrateCameraCharuco (free function) was removed in
+        # modern OpenCV alongside detectMarkers/interpolateCornersCharuco;
+        # board.matchImagePoints + cv2.calibrateCamera is the replacement.
         h, w = imsize
         cam_init = np.array([[1000., 0., w / 2.], [0., 1000., h / 2.], [0., 0., 1.]])
         dist_init = np.zeros((5, 1))
-        _, self._intmat, self._dist, self._rot, self._trans = (
-            cv2.aruco.calibrateCameraCharuco(
-                charucoCorners=allCorners,
-                charucoIds=allIds,
-                board=self._board,
-                imageSize=(w, h),
-                cameraMatrix=cam_init,
-                distCoeffs=dist_init,
-            )
+
+        obj_points, img_points = [], []
+        for corners, ids in zip(allCorners, allIds):
+            objp, imgp = self._board.matchImagePoints(corners, ids)
+            obj_points.append(objp)
+            img_points.append(imgp)
+
+        _, self._intmat, self._dist, self._rot, self._trans = cv2.calibrateCamera(
+            obj_points, img_points, (w, h), cam_init, dist_init
         )
         self._rot = np.asarray(self._rot)
         self._trans = np.asarray(self._trans)
@@ -237,6 +249,54 @@ class Calibration:
             extmats[i, :3, :3], _ = cv2.Rodrigues(self._rot[i])
         self._extmats = extmats
         self._extmat = extmats[self._index]
+
+    def _find_objpnts(self, index):
+        """Board object-space corners for the ChArUco ids detected in image `index`."""
+        ids = self._all_ids[index].flatten()
+        objpnts = np.ones((len(ids), 4))
+        objpnts[:, :3] = self._objpnts[ids].reshape(-1, 3)
+        return objpnts
+
+    def _project(self, extmat, objpnts):
+        """Project (N, 4) homogeneous object points through `extmat` plus this
+        calibration's intrinsic/distortion model — same formula as
+        CalibrationParams.o2i, just batched per-image with that image's own
+        extrinsic matrix rather than the single selected `ext_id` pose."""
+        k1, k2, p1, p2, k3 = self._dist
+        X_c = extmat @ objpnts.T
+        X_c = X_c / X_c[2]
+        r2 = X_c[0] ** 2 + X_c[1] ** 2
+        f = 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
+        X_pp = np.ones((objpnts.shape[0], 3))
+        X_pp[:, 0] = X_c[0] * f + 2 * p1 * X_c[0] * X_c[1] + p2 * (r2 + 2 * X_c[0] ** 2)
+        X_pp[:, 1] = X_c[1] * f + p1 * (r2 + 2 * X_c[1] ** 2) + 2 * p2 * X_c[0] * X_c[1]
+        return (self._intmat @ X_pp.T).T[:, :2]
+
+    def _reprojection(self):
+        """Reproject each accepted image's own board corners through the
+        solved camera model, for use by error()."""
+        self._reimgpnts = [
+            self._project(self._extmats[index], self._find_objpnts(index))
+            for index in range(len(self._all_corners))
+        ]
+
+    def modify(self, dangles=(0.0, 0.0, 0.0), centre=(0.0, 0.0)):
+        """Perturb the solved extrinsic matrix by an additional rotation
+        (axis-angle, Rodrigues form) and/or translation, replacing
+        ``self.params`` with the result.
+
+        Parameters
+        ----------
+        dangles : array-like (3,), optional
+            Axis-angle rotation vector added to the current pose's own.
+        centre : array-like (2,), optional
+            Image-space point; after rotating, the translation is shifted so
+            this point's object-space projection (under the new rotation)
+            is added to it.
+        """
+        if not self.solved or self.params is None:
+            raise RuntimeError("Call solve() before modify().")
+        self.params = self.params.modify(dangles=dangles, centre=centre)
 
     def calibrate(self, obj, override=False):
         """Calibrate a Region in-place by mapping its nodes to object space.
@@ -271,3 +331,55 @@ class Calibration:
             for ctr in obj.history_centres
         ]
         obj.calibrated = True
+
+    def inspect(self, image_index=0, **kwargs):
+        from . import plots
+        return plots.inspect_calibration(self, image_index=image_index, **kwargs)
+
+    def visualise(self, **kwargs):
+        from . import plots
+        return plots.visualise_calibration(self, **kwargs)
+
+    def contour(self, quantity="R", **kwargs):
+        from . import plots
+        return plots.contour_calibration(self, quantity=quantity, **kwargs)
+
+    def error(self, quantity="R", **kwargs):
+        from . import plots
+        return plots.error_calibration(self, quantity=quantity, **kwargs)
+
+    def save(self, path):
+        """Save the solved calibration (camera model + diagnostic data behind
+        inspect/visualise/contour/error) to a .pyv file."""
+        if not self.solved:
+            raise RuntimeError("Calibration has not been solved; cannot save.")
+        sol = _core.CalibrationSolution(
+            np.asarray(self._intmat, dtype=np.float64),
+            np.asarray(self._extmat, dtype=np.float64),
+            np.asarray(self._dist, dtype=np.float64),
+            [np.asarray(c).reshape(-1, 2).astype(np.float64) for c in self._all_corners],
+            [np.asarray(i).flatten().astype(np.int32) for i in self._all_ids],
+            list(self._accepted_images),
+            tuple(self._imsize),
+            [np.asarray(r).astype(np.float64) for r in self._reimgpnts],
+        )
+        sol.save(path)
+
+    @classmethod
+    def _from_solution(cls, raw):
+        """Reconstruct a Calibration from a loaded CalibrationSolution — used
+        by gp.load(). The ChArUco board/dictionary setup is not persisted
+        (only its outputs), so this object is ready for inspect/visualise/
+        contour/error/calibrate/modify, but not for a fresh solve()."""
+        obj = cls.__new__(cls)
+        obj.solved = True
+        obj._intmat = np.asarray(raw.intmat)
+        obj._extmat = np.asarray(raw.extmat)
+        obj._dist = np.asarray(raw.dist)
+        obj._all_corners = [np.asarray(c).reshape(-1, 1, 2) for c in raw.corners]
+        obj._all_ids = [np.asarray(i).reshape(-1, 1) for i in raw.ids]
+        obj._accepted_images = list(raw.accepted_images)
+        obj._imsize = tuple(raw.image_size)
+        obj._reimgpnts = [np.asarray(r) for r in raw.reimgpnts]
+        obj.params = CalibrationParams(obj._intmat, obj._extmat, obj._dist)
+        return obj

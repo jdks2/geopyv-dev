@@ -281,23 +281,35 @@ def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_Z
         return fig, ax
 
 
-def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, mesh_overlay=False, **kwargs):
+def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, mesh_overlay=False,
+                  calibration=None, **kwargs):
     _require_solved(mesh)
     valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+    if calibration is not None and quantity not in {"u", "v", "R"}:
+        raise ValueError(
+            f"calibration only applies to quantity in ['R', 'u', 'v'], not {quantity!r}"
+        )
 
     nodes = np.asarray(mesh.nodes)
     elements = np.asarray(mesh.elements)
     displacements = np.asarray(mesh.displacements)
+    if calibration is not None:
+        # Node positions stay in pixel space (the background image and mesh layout are
+        # never re-projected — lens distortion means "calibrated positions" would be a
+        # nonlinear warp, not just a scale, and would no longer align with the image).
+        # Only the displacement values plotted for u/v/R are converted, per node.
+        displacements = calibration.i2o(nodes + displacements) - calibration.i2o(nodes)
 
+    unit = "calibrated" if calibration is not None else "px"
     labels = {
         "C_ZNCC": r"$C_{ZNCC}$ (-)",
         "iterations": "Iterations (-)",
         "norm": r"$\Delta$ Norm (-)",
-        "u": "u (px)",
-        "v": "v (px)",
-        "R": "R (px)",
+        "u": f"u ({unit})",
+        "v": f"v ({unit})",
+        "R": f"R ({unit})",
     }
     if quantity == "C_ZNCC":
         values = np.asarray(mesh.c_zncc)
@@ -932,5 +944,155 @@ def spatial_error_validation(solution, field_index, time_index, quantity="R",
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+# ---------------------------------------------------------------------------
+# Calibration plots
+# ---------------------------------------------------------------------------
+
+def inspect_calibration(calibration, image_index=0, ax=None, show=True, block=True, save=None):
+    """One calibration image with its detected ChArUco corners overlaid."""
+    _require_solved(calibration)
+    import cv2
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+
+    path = calibration._accepted_images[image_index]
+    frame = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+    ax.imshow(frame)
+    corners = calibration._all_corners[image_index]
+    ax.scatter(corners[:, :, 0], corners[:, :, 1], color="r", s=12)
+    ax.set_title(path)
+    ax.set_axis_off()
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def visualise_calibration(calibration, ax=None, show=True, block=True, save=None):
+    """Detected ChArUco corners across every accepted image — a coverage map."""
+    _require_solved(calibration)
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+
+    for corners in calibration._all_corners:
+        ax.scatter(corners[:, :, 0], corners[:, :, 1], color="r", s=6, alpha=0.6)
+    h, w = calibration._imsize
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)  # row-down image convention
+    ax.set_aspect("equal")
+    ax.set_title("Detected ChArUco corners — all accepted images")
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def _calibration_quantity_label(quantity):
+    return {
+        "R": r"Resultant, $R$ ($px$)",
+        "u": r"Horizontal displacement, $u$ ($px$)",
+        "v": r"Vertical displacement, $v$ ($px$)",
+    }[quantity]
+
+
+def contour_calibration(calibration, quantity="R", points=True, colorbar=True, ticks=None,
+                         alpha=0.75, levels=None, axis=True, xlim=None, ylim=None,
+                         ax=None, show=True, block=True, save=None):
+    """Per-corner undistortion-magnitude map — how much the lens model warps
+    each detected board corner, independent of the extrinsic pose/reprojection."""
+    _require_solved(calibration)
+    valid = {"u", "v", "R"}
+    if quantity not in valid:
+        raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+    import cv2
+
+    image_points = np.concatenate(calibration._all_corners, axis=0).reshape(-1, 2)
+    undistorted = cv2.undistortImagePoints(
+        image_points, calibration._intmat, calibration._dist
+    ).reshape(-1, 2)
+    delta = image_points - undistorted
+    if quantity == "R":
+        values = np.sqrt(np.sum(delta**2, axis=1))
+    elif quantity == "u":
+        values = delta[:, 0]
+    else:
+        values = delta[:, 1]
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots(num="Distortion magnitude")
+    else:
+        fig = ax.get_figure()
+    cf = ax.tricontourf(image_points[:, 0], image_points[:, 1], values,
+                         alpha=alpha, levels=levels, extend="both")
+    if points:
+        ax.scatter(image_points[:, 0], image_points[:, 1], color="k", s=4)
+    if not axis:
+        ax.set_axis_off()
+    ax.set_aspect("equal")
+    h, w = calibration._imsize
+    ax.set_xlim(xlim if xlim is not None else (0, w))
+    ax.set_ylim(ylim if ylim is not None else (h, 0))
+    if colorbar:
+        fig.colorbar(cf, ax=ax, label=_calibration_quantity_label(quantity), ticks=ticks)
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def error_calibration(calibration, quantity="R", points=True, colorbar=True, ticks=None,
+                       alpha=0.75, levels=None, axis=True, xlim=None, ylim=None,
+                       ax=None, show=True, block=True, save=None):
+    """Reprojection error map — detected corners vs. the solved camera model's
+    own reprojection of the corresponding board points, per accepted image."""
+    _require_solved(calibration)
+    valid = {"u", "v", "R"}
+    if quantity not in valid:
+        raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+
+    reimgpnts = np.concatenate(calibration._reimgpnts, axis=0)
+    imgpnts = np.concatenate(
+        [c.reshape(-1, 2) for c in calibration._all_corners], axis=0
+    )
+    delta = reimgpnts - imgpnts
+    if quantity == "R":
+        error = np.sqrt(np.sum(delta**2, axis=1))
+    elif quantity == "u":
+        error = delta[:, 0]
+    else:
+        error = delta[:, 1]
+
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots(num="Reprojection error")
+    else:
+        fig = ax.get_figure()
+    cf = ax.tricontourf(imgpnts[:, 0], imgpnts[:, 1], error, alpha=alpha, levels=levels, extend="both")
+    if points:
+        start = 0
+        for path, corners in zip(calibration._accepted_images, calibration._all_corners):
+            n = corners.reshape(-1, 2).shape[0]
+            ax.scatter(imgpnts[start:start + n, 0], imgpnts[start:start + n, 1], label=path, s=8)
+            start += n
+        ax.legend(fontsize=6)
+    if not axis:
+        ax.set_axis_off()
+    ax.set_aspect("equal")
+    h, w = calibration._imsize
+    ax.set_xlim(xlim if xlim is not None else (0, w))
+    ax.set_ylim(ylim if ylim is not None else (h, 0))
+    if colorbar:
+        fig.colorbar(cf, ax=ax, label=_calibration_quantity_label(quantity), ticks=ticks)
+    plt.tight_layout()
     _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax

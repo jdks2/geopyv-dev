@@ -10,7 +10,7 @@ use ndarray::Array2;
 
 use geopyv_dev::sequence::SequenceSolution;
 
-use crate::{py_calibration::PyCalibrationParams, py_mesh::PyMesh, py_particle::PyParticleSolution, py_sequence::PySequence, Error};
+use crate::{py_calibration::PyCalibrationParams, py_mesh::PyMesh, py_particle::PyParticle, py_sequence::PySequence, Error};
 
 // ---------------------------------------------------------------------------
 // FieldSolution class
@@ -24,9 +24,23 @@ pub struct PyFieldSolution {
 
 #[pymethods]
 impl PyFieldSolution {
+    /// Every particle's strain-path solution, each reconstructed as a live
+    /// ``Particle`` (see [`PyField::particles`] for why — this mirrors the
+    /// same reconstruction Subset/Mesh/Sequence already use).
     #[getter]
-    fn particles(&self) -> Vec<PyParticleSolution> {
-        self.inner.particles.iter().map(|p| PyParticleSolution { inner: Arc::clone(p) }).collect()
+    fn particles(&self) -> PyResult<Vec<PyParticle>> {
+        self.inner.particles.iter()
+            .map(|p| PyParticle::from_solution((**p).clone()))
+            .collect()
+    }
+
+    /// Load a single particle's strain-path solution by index without
+    /// materialising the rest — cheaper than ``particles[idx]`` for a large field.
+    fn particle_at(&self, idx: usize) -> PyResult<PyParticle> {
+        let p = self.inner.particles.get(idx).ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!("particle index {idx} out of range"))
+        })?;
+        PyParticle::from_solution((**p).clone())
     }
 
     #[getter]
@@ -194,11 +208,26 @@ impl PyField {
         if s.is_empty() { None } else { Some(s) }
     }
 
+    /// Every particle's strain-path solution, each reconstructed as a live
+    /// ``Particle`` — matches the Subset/Mesh/Sequence precedent of always
+    /// handing back the same live class (with a genuine ``solved`` getter)
+    /// rather than a separate read-only result type. Prefer ``particle_at(idx)``
+    /// when only one particle is needed on a large field.
     #[getter]
-    fn particles(&self) -> PyResult<Vec<PyParticleSolution>> {
-        Ok(self.require_solved()?.particles.iter()
-            .map(|p| PyParticleSolution { inner: Arc::clone(p) })
-            .collect())
+    fn particles(&self) -> PyResult<Vec<PyParticle>> {
+        self.require_solved()?.particles.iter()
+            .map(|p| PyParticle::from_solution((**p).clone()))
+            .collect()
+    }
+
+    /// Load a single particle's strain-path solution by index without
+    /// materialising the rest — cheaper than ``particles[idx]`` for a large field.
+    fn particle_at(&self, idx: usize) -> PyResult<PyParticle> {
+        let sol = self.require_solved()?;
+        let p = sol.particles.get(idx).ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!("particle index {idx} out of range"))
+        })?;
+        PyParticle::from_solution((**p).clone())
     }
 
     #[getter]

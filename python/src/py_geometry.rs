@@ -329,13 +329,32 @@ impl_region_pymethods!(PyPathRegion, "PathRegion");
 // Extraction helpers (pub(crate) — used by py_mesh and py_sequence)
 // ===========================================================================
 
+/// A `Region` that has already been through `Calibration.calibrate()` holds
+/// physical-unit coordinates, not pixels — silently accepting it here would
+/// build a triangulation/pixel-mask at the wrong scale with no error. Regions
+/// are meant to be calibrated *after* they've been used to build a Mesh/Sequence
+/// (a reporting step), never before.
+fn check_not_calibrated(calibrated: bool) -> PyResult<()> {
+    if calibrated {
+        return Err(PyTypeError::new_err(
+            "this Region has already been calibrated (region.calibrated is True) — \
+             Mesh/Sequence geometry must be built from pixel-space coordinates. \
+             Calibrate a Region only after it has been used to build a Mesh/Sequence, \
+             as a reporting step.",
+        ));
+    }
+    Ok(())
+}
+
 /// Extract `(nodes, hard)` from a region argument.
 /// Accepts PyCircleRegion, PyPathRegion, or a raw numpy array (hard=false).
 pub(crate) fn extract_region(obj: &Bound<'_, PyAny>) -> PyResult<(Array2<f64>, bool)> {
     if let Ok(r) = obj.extract::<PyRef<PyCircleRegion>>() {
+        check_not_calibrated(r.inner.calibrated)?;
         return Ok((r.inner.current_nodes.clone(), r.inner.hard));
     }
     if let Ok(r) = obj.extract::<PyRef<PyPathRegion>>() {
+        check_not_calibrated(r.inner.calibrated)?;
         return Ok((r.inner.current_nodes.clone(), r.inner.hard));
     }
     if let Ok(a) = obj.extract::<PyReadonlyArray2<f64>>() {
@@ -355,9 +374,11 @@ pub(crate) fn extract_region(obj: &Bound<'_, PyAny>) -> PyResult<(Array2<f64>, b
 /// plain-array callers (there is no object to track displacement into).
 pub(crate) fn extract_region_full(obj: &Bound<'_, PyAny>) -> PyResult<region::Region> {
     if let Ok(r) = obj.extract::<PyRef<PyCircleRegion>>() {
+        check_not_calibrated(r.inner.calibrated)?;
         return Ok(r.inner.clone());
     }
     if let Ok(r) = obj.extract::<PyRef<PyPathRegion>>() {
+        check_not_calibrated(r.inner.calibrated)?;
         return Ok(r.inner.clone());
     }
     if let Ok(a) = obj.extract::<PyReadonlyArray2<f64>>() {

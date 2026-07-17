@@ -24,11 +24,8 @@ classifiers = [
 
 [project.optional-dependencies]
 docs = [
-    "jupyter-book>=1.0",
-    "myst-nb>=1.0",
+    "sphinx>=7.0",
     "pydata-sphinx-theme>=0.15",
-    "nbconvert>=7.0",
-    "Pillow>=9.0",
 ]
 
 [project.urls]
