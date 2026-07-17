@@ -14,6 +14,7 @@ __pycache__/
 dist/
 *.egg-info/
 wheelhouse/
+.ipynb_checkpoints/
 
 # maturin build output
 geopyv_dev/_geopyv_dev*.so

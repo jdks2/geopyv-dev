@@ -2,13 +2,13 @@
 """
 Generate geopyv-dev tutorial Jupyter notebooks.
 Run from the geopyv-dev repo root:
-    python tutorials/make_tutorials.py
+    python geopyv_dev/tutorials/make_tutorials.py
 """
 
 import json
 import os
 
-os.makedirs("tutorials", exist_ok=True)
+os.makedirs("geopyv_dev/tutorials", exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Notebook format helpers
@@ -1641,15 +1641,15 @@ From here you can explore:
 # ===========================================================================
 
 notebooks = [
-    ("tutorials/00_introduction.ipynb",      NB0),
-    ("tutorials/01_images_and_masks.ipynb",  NB1),
-    ("tutorials/02_subset.ipynb",            NB2),
-    ("tutorials/03_mesh.ipynb",              NB3),
-    ("tutorials/04_sequence.ipynb",          NB4),
-    ("tutorials/05_particle_and_field.ipynb",NB5),
+    ("geopyv_dev/tutorials/00_introduction.ipynb",      NB0),
+    ("geopyv_dev/tutorials/01_images_and_masks.ipynb",  NB1),
+    ("geopyv_dev/tutorials/02_subset.ipynb",            NB2),
+    ("geopyv_dev/tutorials/03_mesh.ipynb",              NB3),
+    ("geopyv_dev/tutorials/04_sequence.ipynb",          NB4),
+    ("geopyv_dev/tutorials/05_particle_and_field.ipynb",NB5),
 ]
 
 print("Writing tutorial notebooks …")
 for path, notebook in notebooks:
     save_nb(path, notebook)
-print(f"\nDone — {len(notebooks)} notebooks written to tutorials/")
+print(f"\nDone — {len(notebooks)} notebooks written to geopyv_dev/tutorials/")
