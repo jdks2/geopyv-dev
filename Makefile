@@ -1,7 +1,7 @@
 .PHONY: tutorials docs-assets docs docs-serve
 
 tutorials:
-	python3 tutorials/make_tutorials.py
+	python3 geopyv_dev/tutorials/make_tutorials.py
 
 docs-assets:
 	python3 docs/build_assets.py

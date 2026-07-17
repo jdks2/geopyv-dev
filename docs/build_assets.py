@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
-TUTORIALS = REPO_ROOT / "tutorials"
+TUTORIALS = REPO_ROOT / "geopyv_dev" / "tutorials"
 DOCS_TUTORIALS = REPO_ROOT / "docs" / "tutorials"
 DOCS_ASSETS = REPO_ROOT / "docs" / "assets"
 
