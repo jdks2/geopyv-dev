@@ -1207,7 +1207,7 @@ fn show_scatter_plot(
                 let color = colormap::map_value(val, vmin, vmax, colormap);
 
                 let is_selected = selected_particle == Some(i);
-                let radius = if is_selected { 7.0 } else { 4.5 };
+                let radius: f32 = if is_selected { 7.0 } else { 4.5 };
                 let outline_color = if is_selected {
                     egui::Color32::WHITE
                 } else {

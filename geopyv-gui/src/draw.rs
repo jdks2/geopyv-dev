@@ -517,7 +517,7 @@ impl DrawState {
                         points: corners,
                         closed: true,
                         fill: fill_color,
-                        stroke: egui::Stroke::new(2.0, stroke_color).into(),
+                        stroke: egui::Stroke::new(2.0_f32, stroke_color).into(),
                     }));
                 }
             }
@@ -532,7 +532,7 @@ impl DrawState {
                         anchor_s,
                         radius,
                         fill_color,
-                        egui::Stroke::new(2.0, stroke_color),
+                        egui::Stroke::new(2.0_f32, stroke_color),
                     );
                 }
             }
@@ -553,7 +553,7 @@ impl DrawState {
                 if screen_pts.len() >= 2 {
                     painter.add(egui::Shape::Path(egui::epaint::PathShape::line(
                         screen_pts.clone(),
-                        egui::Stroke::new(2.0, stroke_color),
+                        egui::Stroke::new(2.0_f32, stroke_color),
                     )));
                 }
 
@@ -562,7 +562,7 @@ impl DrawState {
                         points: screen_pts.clone(),
                         closed: true,
                         fill: fill_color,
-                        stroke: egui::Stroke::new(0.0, egui::Color32::TRANSPARENT).into(),
+                        stroke: egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT).into(),
                     }));
                 }
 
@@ -576,7 +576,7 @@ impl DrawState {
                             painter.circle_stroke(
                                 screen_pts[0],
                                 SNAP_PX,
-                                egui::Stroke::new(1.5, stroke_color),
+                                egui::Stroke::new(1.5_f32, stroke_color),
                             );
                         }
                     }
@@ -590,7 +590,7 @@ impl DrawState {
                     };
                     painter.add(egui::Shape::dashed_line(
                         &[*last, cursor],
-                        egui::Stroke::new(1.0, stroke_color.linear_multiply(0.6)),
+                        egui::Stroke::new(1.0_f32, stroke_color.linear_multiply(0.6)),
                         6.0,
                         3.0,
                     ));
@@ -683,7 +683,7 @@ fn paint_polygon(
 }
 
 fn paint_crosshair_plus(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
-    let s = egui::Stroke::new(2.0, color);
+    let s = egui::Stroke::new(2.0_f32, color);
     painter.line_segment(
         [center - egui::vec2(CROSSHAIR_ARM, 0.0), center + egui::vec2(CROSSHAIR_ARM, 0.0)],
         s,
@@ -696,7 +696,7 @@ fn paint_crosshair_plus(painter: &egui::Painter, center: egui::Pos2, color: egui
 
 fn paint_crosshair_x(painter: &egui::Painter, center: egui::Pos2, color: egui::Color32) {
     let d = CROSSHAIR_ARM / std::f32::consts::SQRT_2;
-    let s = egui::Stroke::new(2.0, color);
+    let s = egui::Stroke::new(2.0_f32, color);
     painter.line_segment(
         [center - egui::vec2(d, d), center + egui::vec2(d, d)],
         s,
