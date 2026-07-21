@@ -511,11 +511,11 @@ impl SubsetTabState {
                         Line::new(norm_log.clone())
                             .name("norm")
                             .color(egui::Color32::from_rgb(100, 170, 255))
-                            .width(2.0),
+                            .width(2.0_f32),
                     );
                     plot_ui.points(
                         Points::new(norm_log)
-                            .radius(4.0)
+                            .radius(4.0_f32)
                             .color(egui::Color32::from_rgb(100, 170, 255)),
                     );
                     plot_ui.hline(
@@ -523,7 +523,7 @@ impl SubsetTabState {
                             .name("max_norm")
                             .color(egui::Color32::RED)
                             .style(LineStyle::Dashed { length: 8.0 })
-                            .width(1.5),
+                            .width(1.5_f32),
                     );
                 });
         });
@@ -540,11 +540,11 @@ impl SubsetTabState {
                         Line::new(zncc_data.clone())
                             .name("C_ZNCC")
                             .color(egui::Color32::from_rgb(100, 220, 130))
-                            .width(2.0),
+                            .width(2.0_f32),
                     );
                     plot_ui.points(
                         Points::new(zncc_data)
-                            .radius(4.0)
+                            .radius(4.0_f32)
                             .color(egui::Color32::from_rgb(100, 220, 130)),
                     );
                     plot_ui.hline(
@@ -552,7 +552,7 @@ impl SubsetTabState {
                             .name("threshold")
                             .color(egui::Color32::RED)
                             .style(LineStyle::Dashed { length: 8.0 })
-                            .width(1.5),
+                            .width(1.5_f32),
                     );
                 });
         });
@@ -1397,7 +1397,7 @@ fn paint_deformed_template(
     let cx = sol.coord[0];
     let cy = sol.coord[1];
     let r = sol.mask.size as f64;
-    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 60, 60));
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(220, 60, 60));
 
     let screen_pts: Vec<egui::Pos2> = match sol.mask.shape {
         MaskShape::Circle => {
@@ -1519,7 +1519,7 @@ const POINT_COLOR: egui::Color32 = egui::Color32::WHITE;
 
 fn paint_crosshair_x(painter: &egui::Painter, center: egui::Pos2) {
     let d = CROSSHAIR_ARM / std::f32::consts::SQRT_2;
-    let s = egui::Stroke::new(2.0, POINT_COLOR);
+    let s = egui::Stroke::new(2.0_f32, POINT_COLOR);
     painter.line_segment([center - egui::vec2(d, d), center + egui::vec2(d, d)], s);
     painter.line_segment([center - egui::vec2(d, -d), center + egui::vec2(d, -d)], s);
 }
@@ -1531,7 +1531,7 @@ fn paint_template_outline_color(
     shape: &MaskShape,
     color: egui::Color32,
 ) {
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     match shape {
         MaskShape::Circle => {
             painter.circle_stroke(center, screen_radius, stroke);

@@ -1645,6 +1645,7 @@ fn run_solve(
             SolveMethod::Icgn => LibSolveMethod::Icgn,
             SolveMethod::Fagn => LibSolveMethod::Fagn,
         },
+        override_active: false,
     };
     let seed_coord_init = params.seed;
     let mut seed_coord = seed_coord_init;
@@ -1735,7 +1736,7 @@ fn run_solve(
 
         // Solve config (possibly override).
         let pair_cfg = if mesh_override {
-            SolveConfig { tolerance: 0.0, ..mesh_cfg.clone() }
+            SolveConfig { tolerance: 0.0, override_active: true, ..mesh_cfg.clone() }
         } else {
             mesh_cfg.clone()
         };

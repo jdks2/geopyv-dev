@@ -1458,6 +1458,7 @@ fn run_solve(
             SolveMethod::Icgn => LibSolveMethod::Icgn,
             SolveMethod::Fagn => LibSolveMethod::Fagn,
         },
+        override_active: false,
     };
     let seed_warp = vec![0.0f64; 6 * p_len];
     let seed_cfg = SeedConfig {
@@ -1646,7 +1647,7 @@ pub fn render_mesh_overlay(
     // Wireframe edges.
     if show_wireframe {
         let stroke = egui::Stroke::new(
-            0.5,
+            0.5_f32,
             egui::Color32::from_rgba_unmultiplied(200, 200, 200, 80),
         );
         for e in 0..n_elems {
