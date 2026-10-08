@@ -20,14 +20,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nalgebra::{DMatrix, DVector};
-use ndarray::{s, Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    field::{Field, FieldDistribution},
     geometry::{meshing, triangulation},
     image::Image,
+    particle::{MeshlessParams, StrainMethod},
+    sequence::SequenceSolution,
     subset::{Subset, SolveResult},
-    masks::LocalMask,
+    masks::{zone_at, LocalMask, MaskShape},
     Error,
 };
 
@@ -85,6 +89,82 @@ pub struct MeshSolution {
     /// Seed-node parameters used to produce this solution.
     #[serde(default)]
     pub seed: Option<SeedConfig>,
+    /// Subset template shape (uniform across nodes). Backs
+    /// `Mesh.inspect(subset_idx=...)`'s template crop.
+    #[serde(default)]
+    pub template_shape: Option<MaskShape>,
+    /// Per-node subset template size (radius / half-side), `(N,)`. Every
+    /// entry is currently equal (one shared template per solve).
+    #[serde(default)]
+    pub template_sizes: Option<Array1<u32>>,
+    /// Zonal-masking diagnostics — `Some` only for a
+    /// `masking = Masking::Zonal` solve whose pass 2 succeeded; `None` for
+    /// uniform solves and for a zonal solve that fell back to pass 1 (its
+    /// stored result then carries no zone cut). See [`ZonalMaskingRecord`].
+    #[serde(default)]
+    pub zonal_masking: Option<ZonalMaskingRecord>,
+}
+
+/// Per-node record of what [`Mesh::solve_zonal_masking_impl`] did, retained
+/// on [`MeshSolution`] for post-solve inspection
+/// (`Mesh.inspect(zones=True)` / `Mesh.inspect(subset_idx=...)`). All
+/// per-node arrays are indexed identically to `MeshSolution::nodes`.
+///
+/// Zones are defined from the **spatial gradient** of the shear strain:
+/// nodes whose `|∇γ|` sits on a ridge (`> grad_cutoff`) mark the interfaces,
+/// the low-gradient regions between them are the coherent deformation
+/// regimes, and each subset keeps only pixels sharing its own centre's
+/// regime label. See `geopyv_dev_fresh/zonal_masking_gradient_correction.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZonalMaskingRecord {
+    /// Stage-2 meshless shear strain (`gamma_max`) at each node, `(N,)` —
+    /// context only; the classifier keys off its gradient, below.
+    pub node_gamma_max: Array1<f64>,
+    /// Stage-2 meshless shear-strain gradient magnitude
+    /// `|∇γ| = hypot(dγ/dx, dγ/dy)` at each node, `(N,)` — the classifying
+    /// signal.
+    pub node_gamma_max_grad: Array1<f64>,
+    /// `true` where the node's `|∇γ|` exceeded `grad_cutoff`, i.e. the node
+    /// sits on an interface ridge rather than inside a regime, `(N,)`.
+    pub node_boundary: Vec<bool>,
+    /// Zone id under each node's own centre in `zone_image`, `(N,)`.
+    pub node_zone: Array1<u32>,
+    /// Retained pixel count BEFORE the zone cut (shape ∩ boundary), `(N,)`.
+    pub node_pre_px: Array1<u32>,
+    /// Retained pixel count AFTER the zone cut (shape ∩ boundary ∩ zone),
+    /// `(N,)`.
+    pub node_post_px: Array1<u32>,
+    /// `true` where the minimum-pixel guard rejected the zone cut and the
+    /// node was solved with its ordinary (un-zoned) subset, `(N,)`.
+    pub node_guard_fallback: Vec<bool>,
+    /// Robust-threshold multiplier actually used (`ZonalConfig::k`).
+    pub k: f64,
+    /// Median of the per-node `|∇γ|`.
+    pub grad_median: f64,
+    /// Median absolute deviation of the per-node `|∇γ|`.
+    pub grad_mad: f64,
+    /// `grad_median + k * 1.4826 * grad_mad` — the ridge cut-off on `|∇γ|`.
+    pub grad_cutoff: f64,
+    /// The whole-image zone-label grid pass 2 actually applied, `(H, W)`.
+    pub zone_image: Array2<u8>,
+}
+
+/// What every node's subset is cut from during one `solve_impl` pass: the
+/// shared local template, plus -- only for pass 2 of a `Masking::Zonal`
+/// solve -- the whole-image zone-label grid that further restricts each
+/// node's subset to its own centre's zone (see [`zone_cut_for_node`]). The
+/// zone grid is deliberately *not* a `SolveConfig` field: it is internal
+/// plumbing of [`Mesh::solve_zonal_masking_impl`], reachable only via
+/// `masking = Masking::Zonal`.
+struct SubsetTemplate<'a> {
+    local_mask: &'a LocalMask,
+    zone_mask: Option<ArrayView2<'a, u8>>,
+}
+
+impl<'a> SubsetTemplate<'a> {
+    fn plain(local_mask: &'a LocalMask) -> Self {
+        Self { local_mask, zone_mask: None }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +186,289 @@ pub struct SolveConfig {
     /// `false` for a normal/first-attempt solve.
     #[serde(default)]
     pub override_active: bool,
+    /// Intra-mesh RG frontier traversal strategy — see [`Preconditioning`].
+    /// Persisted (unlike `masking`): this is a real solve-configuration
+    /// choice, not a one-shot pipeline input.
+    #[serde(default)]
+    pub preconditioning: Preconditioning,
+    /// Tunables for `preconditioning == LayerRg` — see [`LayerRgConfig`].
+    /// Ignored otherwise.
+    #[serde(default)]
+    pub layer_rg: LayerRgConfig,
+    /// The `masking` axis of `solver_options` — see [`Masking`]. Not
+    /// serialised: a one-shot pipeline input, not persisted mesh state.
+    #[serde(skip)]
+    pub masking: Masking,
+}
+
+/// Minimum fraction of a node's "shape ∩ boundary" pixel count that must
+/// survive a zonal cut for that cut to be applied; below it the node falls
+/// back to its ordinary (un-zoned) subset rather than solving with a
+/// badly-cut one (`geopyv_dev_fresh/zonal_masking_plan.md`, "Minimum-pixel
+/// guard"). A fixed safety invariant of zonal masking, not a tuning knob.
+const ZONE_MASK_MIN_PIXEL_FRACTION: f64 = 1.0 / 3.0;
+
+/// `(median, MAD)` of a value stream, via O(n) selection (no full sort).
+/// `MAD` is the median absolute deviation from the median — `1.4826 * MAD`
+/// is a robust σ estimate. Used for the ridge cutoff on the smoothed `|∇γ|`
+/// image in `Mesh::solve_zonal_masking_impl`. Returns `(0.0, 0.0)` for an
+/// empty stream.
+fn robust_median_mad(values: impl Iterator<Item = f64>) -> (f64, f64) {
+    let mut v: Vec<f64> = values.filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mid = v.len() / 2;
+    v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    let median = v[mid];
+    let mut dev: Vec<f64> = v.iter().map(|&x| (x - median).abs()).collect();
+    dev.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    (median, dev[mid])
+}
+
+/// Mean node spacing over the node bounding box:
+/// `sqrt(bbox_area / n_nodes)`. Used to scale the default `|∇γ|`-image
+/// smoothing σ in `Mesh::solve_zonal_masking_impl` — same convention the
+/// rasteriser's own bucket-grid cell size uses, and the standard
+/// mesh-density scale this codebase ties meshless radii to.
+fn node_spacing(nodes: &Array2<f64>) -> f64 {
+    let n = nodes.nrows();
+    if n == 0 {
+        return 1.0;
+    }
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for i in 0..n {
+        x_min = x_min.min(nodes[[i, 0]]);
+        x_max = x_max.max(nodes[[i, 0]]);
+        y_min = y_min.min(nodes[[i, 1]]);
+        y_max = y_max.max(nodes[[i, 1]]);
+    }
+    let area = ((x_max - x_min).max(1.0)) * ((y_max - y_min).max(1.0));
+    (area / n as f64).sqrt().max(1.0)
+}
+
+/// Convergence tolerance for the zonal classifier refit loop: stop once
+/// fewer than this fraction of *image pixels* change zone between
+/// consecutive passes. ~5e-4 of a 2000² image ≈ a ~1 px shift of a
+/// full-width seam.
+const ZONAL_ITER_TOL: f64 = 5e-4;
+
+/// Output of one classifier pass (`classify_from_field`) — everything
+/// [`Mesh::solve_zonal_masking_impl`] needs for its inspection record and
+/// for seeding the next refit iteration.
+struct ClassifyResult {
+    zone_image: Array2<u8>,
+    /// Zone id under each node centre (`zone_at`), for the convergence
+    /// check and the zone-aware refit seed.
+    node_zone: Array1<u32>,
+    gamma_max: Vec<f64>,
+    grad_mag: Vec<f64>,
+    node_boundary: Vec<bool>,
+    grad_median: f64,
+    grad_mad: f64,
+    grad_cutoff: f64,
+    /// Weak-ridge guard fired ⇒ `zone_image` is all-ones (a single zone).
+    collapsed: bool,
+}
+
+/// Stages 3, 5a, 5b, 6 of the zonal classifier, factored out of
+/// [`Mesh::solve_zonal_masking_impl`] so they can run once per refit
+/// iteration. No behaviour change vs the previous inline form.
+fn classify_from_field(
+    field_sol: &crate::field::FieldSolution,
+    nodes: &Array2<f64>,
+    img_shape: (usize, usize),
+    sigma: f64,
+    zc: &ZonalConfig,
+    min_core_px: usize,
+) -> ClassifyResult {
+    use crate::geometry::rasterize;
+    let n_nodes = nodes.nrows();
+
+    // --- Stage 3: per-node `gamma_max` (drives the classifier) + its own
+    // meshless gradient magnitude `|∇γ|` (recorded for inspection only).
+    let gamma_max: Vec<f64> = field_sol
+        .particles
+        .iter()
+        .map(|p| {
+            p.principal_strains
+                .as_ref()
+                .and_then(|ps| ps.row(ps.nrows() - 1).get(2).copied())
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let grad_mag: Vec<f64> = field_sol
+        .particles
+        .iter()
+        .map(|p| {
+            p.gamma_max_grad
+                .as_ref()
+                .map(|g| {
+                    let last = g.row(g.nrows() - 1);
+                    last[0].hypot(last[1])
+                })
+                .filter(|v| v.is_finite())
+                .unwrap_or(0.0)
+        })
+        .collect();
+
+    // --- Stage 5a: dense, smoothed |∇γ| image (Sobel of a blurred
+    // nearest-node `gamma_max` raster).
+    let gamma_dense = rasterize::nearest_node_values(nodes.view(), &gamma_max, img_shape);
+    let gamma_smooth = rasterize::gaussian_blur(gamma_dense.view(), sigma);
+    let grad_dense = rasterize::sobel_magnitude(gamma_smooth.view());
+
+    // --- Stage 5b: robust ridge threshold.
+    let (grad_median, grad_mad) = robust_median_mad(grad_dense.iter().copied());
+    let grad_cutoff = grad_median + zc.k * 1.4826 * grad_mad;
+    let core_mask = grad_dense.mapv(|g| g <= grad_cutoff);
+    let node_boundary: Vec<bool> = (0..n_nodes)
+        .map(|i| {
+            let cx = (nodes[[i, 0]] as isize).clamp(0, img_shape.1 as isize - 1) as usize;
+            let cy = (nodes[[i, 1]] as isize).clamp(0, img_shape.0 as isize - 1) as usize;
+            grad_dense[[cy, cx]] > grad_cutoff
+        })
+        .collect();
+
+    // --- Stage 6: cores → drop < 1 subset → weak-ridge guard → watershed.
+    let (mut markers, n_cores) = rasterize::label_components(core_mask.view());
+    let mut counts = vec![0usize; n_cores as usize + 1];
+    for &v in markers.iter() {
+        counts[v as usize] += 1;
+    }
+    let n_kept = (1..=n_cores as usize).filter(|&l| counts[l] >= min_core_px).count();
+    for v in markers.iter_mut() {
+        if *v != 0 && counts[*v as usize] < min_core_px {
+            *v = 0;
+        }
+    }
+    let core_frac =
+        core_mask.iter().filter(|&&c| c).count() as f64 / (img_shape.0 * img_shape.1) as f64;
+    let collapsed = n_kept <= 1 || core_frac < 0.25;
+    let zone_image = if collapsed {
+        Array2::<u8>::ones(img_shape)
+    } else {
+        let flooded = rasterize::watershed_from_markers(grad_dense.view(), markers.view());
+        let flooded = rasterize::fill_from_nearest_label(flooded.view());
+        flooded.mapv(|v| v.max(1).min(255) as u8)
+    };
+
+    let node_zone: Array1<u32> = (0..n_nodes)
+        .map(|i| zone_at(zone_image.view(), [nodes[[i, 0]], nodes[[i, 1]]]) as u32)
+        .collect();
+
+    ClassifyResult {
+        zone_image,
+        node_zone,
+        gamma_max,
+        grad_mag,
+        node_boundary,
+        grad_median,
+        grad_mad,
+        grad_cutoff,
+        collapsed,
+    }
+}
+
+/// Fraction of image pixels whose zone label moved between two classifier
+/// passes — the convergence signal for the refit loop. Zone ids are greedily
+/// matched by maximum overlap first (watershed / CC ids are scan-order, not
+/// stable across passes). Pixel-level, not per-node: the seam keeps shifting
+/// for a few refits after every *node* has already settled into its final
+/// zone, so a node-level metric would stop the loop too early.
+fn changed_zone_pixel_frac(prev: &Array2<u8>, cur: &Array2<u8>) -> f64 {
+    let (p, c) = match (prev.as_slice(), cur.as_slice()) {
+        (Some(p), Some(c)) if p.len() == c.len() && !p.is_empty() => (p, c),
+        _ => return 0.0,
+    };
+    let cur_max = c.iter().copied().max().unwrap_or(0) as usize;
+    let prev_max = p.iter().copied().max().unwrap_or(0) as usize;
+    let mut overlap = vec![vec![0usize; prev_max + 1]; cur_max + 1];
+    for i in 0..p.len() {
+        overlap[c[i] as usize][p[i] as usize] += 1;
+    }
+    let map: Vec<u8> = (0..=cur_max)
+        .map(|ci| (0..=prev_max).max_by_key(|&pi| overlap[ci][pi]).unwrap_or(0) as u8)
+        .collect();
+    let changed = (0..p.len()).filter(|&i| map[c[i] as usize] != p[i]).count();
+    changed as f64 / p.len() as f64
+}
+
+/// A throwaway [`ZonalMaskingRecord`] carrying only `node_zone` + `zone_image`
+/// — the two fields [`crate::particle::meshless_warp_increment`] reads for
+/// `zone_aware` neighbour filtering. Attached to the source mesh of a refit
+/// iteration's Stage-2 field; never serialised.
+fn minimal_zonal_record(
+    node_zone: Array1<u32>,
+    zone_image: Array2<u8>,
+    n: usize,
+) -> ZonalMaskingRecord {
+    ZonalMaskingRecord {
+        node_gamma_max: Array1::zeros(n),
+        node_gamma_max_grad: Array1::zeros(n),
+        node_boundary: vec![false; n],
+        node_zone,
+        node_pre_px: Array1::zeros(n),
+        node_post_px: Array1::zeros(n),
+        node_guard_fallback: vec![false; n],
+        k: 0.0,
+        grad_median: 0.0,
+        grad_mad: 0.0,
+        grad_cutoff: 0.0,
+        zone_image,
+    }
+}
+
+/// The per-node zone-mask cut plus its minimum-pixel guard — factored out
+/// of [`Mesh::subset_at`] so [`Mesh::solve_zonal_masking_impl`] can record
+/// the exact same `pre`/`post`/fell-back numbers it produced, without
+/// re-solving. Purely geometric (no image correlation): clones `base`,
+/// applies [`LocalMask::zone_mask_update`], and measures the retained pixel
+/// counts with and without the cut (both intersected with `global_mask`,
+/// the boundary/exclusion mask, when present — mirroring `Subset::new`'s
+/// own downstream `mask_update`).
+///
+/// Returns `(picked, pre_px, post_px, fell_back)`:
+/// * `picked`    — the mask to build the subset from: the zone-cut mask,
+///   or `base` unchanged when the guard rejects the cut.
+/// * `pre_px`    — retained px, shape ∩ boundary, no zone cut.
+/// * `post_px`   — retained px, shape ∩ boundary ∩ zone.
+/// * `fell_back` — `true` when `pre_px > 0` and `post_px` dropped below
+///   `min_pixel_fraction * pre_px`.
+fn zone_cut_for_node(
+    base: &LocalMask,
+    coord: [f64; 2],
+    global_mask: Option<ArrayView2<u8>>,
+    zone_mask: ArrayView2<u8>,
+    min_pixel_fraction: f64,
+) -> (LocalMask, u32, u32, bool) {
+    let pre = match global_mask {
+        Some(gm) => {
+            let mut probe = base.clone();
+            probe.mask_update(coord, gm);
+            probe.m_n_px.unwrap_or(0)
+        }
+        None => base.n_px,
+    };
+
+    let mut lm = base.clone();
+    lm.zone_mask_update(coord, zone_mask);
+
+    let post = match global_mask {
+        Some(gm) => {
+            let mut probe = lm.clone();
+            probe.mask_update(coord, gm);
+            probe.m_n_px.unwrap_or(0)
+        }
+        None => lm.m_n_px.unwrap_or(0),
+    };
+
+    let fell_back = pre > 0 && (post as f64) < min_pixel_fraction * (pre as f64);
+    let picked = if fell_back { base.clone() } else { lm };
+    (picked, pre as u32, post as u32, fell_back)
 }
 
 impl Default for SolveConfig {
@@ -117,6 +480,9 @@ impl Default for SolveConfig {
             tolerance: 0.75,
             method: SolveMethod::Icgn,
             override_active: false,
+            preconditioning: Preconditioning::Rg,
+            layer_rg: LayerRgConfig::default(),
+            masking: Masking::Uniform,
         }
     }
 }
@@ -137,6 +503,122 @@ pub struct SeedConfig {
 pub enum SolveMethod {
     Icgn,
     Fagn,
+}
+
+/// Intra-mesh RG frontier traversal strategy — the `preconditioning` axis
+/// of `solver_options` (see `geopyv_dev_fresh/solver_options_restructure.md`).
+/// `Rg` is the serial cascade (`solve_impl`'s `Rg` branch), unchanged.
+/// `LayerRg` is the layer-parallel variant
+/// ([`Mesh::expand_parallel`], `geopyv_dev_fresh/layer_rg_plan.md` §3): the
+/// frontier is solved a graph-independent colour at a time, concurrently
+/// via `rayon`. It agrees with `Rg` within Tier C and is run-to-run
+/// deterministic (see the `layer_rg_*` tests in this module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Preconditioning {
+    #[default]
+    Rg,
+    LayerRg,
+}
+
+/// Tunables for `Preconditioning::LayerRg` — see
+/// `geopyv_dev_fresh/layer_rg_plan.md` §3.2. Ignored when
+/// `preconditioning == Rg`. `#[serde(default)]` on the `SolveConfig` field
+/// keeps old `.pyv` configs loading unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LayerRgConfig {
+    /// Frontier roots merged into one parallel round ≈ `batch_factor *
+    /// workers`. Over-decomposing (>1) lets rayon work-steal across a slow
+    /// node — see `layer_rg_plan.md` §5.7.
+    pub batch_factor: usize,
+    /// ε-band width: a queued root joins the current round while its
+    /// `c_zncc` key is `>= top_key * (1 - root_rel_eps)`.
+    pub root_rel_eps: f64,
+    /// Cap on rayon workers for this solve's parallel rounds. `None` uses
+    /// the global pool (shared with `Field`/`Image`/`Speckle`).
+    pub max_workers: Option<usize>,
+}
+
+impl Default for LayerRgConfig {
+    fn default() -> Self {
+        Self { batch_factor: 4, root_rel_eps: 0.02, max_workers: None }
+    }
+}
+
+/// The `masking` axis of `solver_options` (see
+/// `geopyv_dev_fresh/solver_options_restructure.md` §4's "Stage B"). `Uniform`
+/// is today's plain solve, unchanged. `Zonal` runs
+/// [`Mesh::solve_zonal_masking_impl`]: an ordinary solve, a `Field` built at
+/// the mesh's own node positions to get each node's shear strain, a robust
+/// per-node classification, a meshless rasterisation of that classification
+/// to a whole-image zone label, then a second solve with that label applied
+/// via the internal per-node zone cut ([`zone_cut_for_node`]).
+/// Not serialised (`#[serde(skip)]` on `SolveConfig::masking`) — like
+/// `zone_mask` itself, this is a one-shot solve input, not persisted mesh
+/// state (a solved mesh's own `MeshSolution` records only its final,
+/// already-zone-masked `p`/`c_zncc`, not which pipeline produced them).
+#[derive(Debug, Clone)]
+pub enum Masking {
+    Uniform,
+    Zonal(ZonalConfig),
+}
+
+impl Default for Masking {
+    fn default() -> Self {
+        Masking::Uniform
+    }
+}
+
+/// Tunables for `Masking::Zonal` — see
+/// `geopyv_dev_fresh/zonal_masking_gradient_correction.md`. Zones are
+/// defined from the shear-strain *gradient* `|∇γ|`: its ridges are the
+/// interfaces, the low-gradient regions between them are the regimes.
+///
+/// `min_pixel_fraction` is deliberately NOT a field here — it's a fixed
+/// safety invariant of the masking mechanism, not a classification tuning
+/// knob ([`ZONE_MASK_MIN_PIXEL_FRACTION`]).
+#[derive(Debug, Clone)]
+pub struct ZonalConfig {
+    /// Params for the Stage-2 field solve (`StrainMethod::Meshless`) that
+    /// computes each node's own shear strain **and its gradient** (one
+    /// radius for one signal — see `particle.rs`'s `gamma_max_grad` note).
+    pub meshless_params: MeshlessParams,
+    /// Robust-threshold multiplier: a node sits on an interface ridge when
+    /// its `|∇γ|` exceeds `median + k * 1.4826 * MAD` across all nodes.
+    pub k: f64,
+    /// Gaussian σ (pixels) applied to the rasterised `|∇γ|` image before
+    /// thresholding. `None` ⇒ default to the mesh's own node spacing.
+    pub smoothing_sigma: Option<f64>,
+    /// Classifier refit passes. `1` (default) = classify once — identical
+    /// to the pre-iterator behaviour. `>1` = after the first classification,
+    /// refit the Stage-2 field with `MeshlessParams::zone_aware = true`
+    /// seeded by that zone map and reclassify, up to this many times or
+    /// until the per-node zone partition stops moving. The zone-aware refit
+    /// removes the cross-zone neighbour blend that biases `γ_max`/
+    /// `γ_max_grad` near a discontinuity — see
+    /// `geopyv_dev_fresh/mds/zonal_masking_iterator_plan.md`.
+    pub iterations: usize,
+    /// Caller-supplied whole-image zone-label grid, `(H, W)`, matching the
+    /// reference image shape. When `Some`, the classifier (Stages 2–6) is
+    /// skipped entirely and this grid is used directly as pass 2's zone
+    /// mask — `iterations` is then irrelevant (there is nothing to refit)
+    /// and the `ZonalMaskingRecord`'s gradient fields are left zeroed.
+    /// Callers use this to drive the masking from a partition they already
+    /// know (e.g. one derived from known specimen geometry) rather than one
+    /// detected from the strain field. Reserve label `0` for "no zone"
+    /// (see `LocalMask::zone_mask_update`).
+    pub zone_map: Option<Array2<u8>>,
+}
+
+impl Default for ZonalConfig {
+    fn default() -> Self {
+        Self {
+            meshless_params: MeshlessParams::default(),
+            k: 2.0,
+            smoothing_sigma: None,
+            iterations: 1,
+            zone_map: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +733,52 @@ impl Mesh {
         self.solution.is_some()
     }
 
+    /// Construct the `Subset` for node `idx` on demand.
+    ///
+    /// `Mesh::solve` used to build every node's `Subset` eagerly and hold
+    /// the whole `Vec<Subset>` for the call's duration; at large meshes /
+    /// large local-mask radii that OOMs (see `mds/subset_lazy_construction.md`).
+    /// Each node's `Subset` is only ever needed transiently for the single
+    /// call that solves (or diagnoses) *that* node, so it's built here on
+    /// demand and dropped by the caller instead.
+    fn subset_at(
+        &self,
+        idx: usize,
+        tmpl: &SubsetTemplate,
+        subset_order: usize,
+    ) -> Result<Subset, Error> {
+        let coord = [self.nodes[[idx, 0]], self.nodes[[idx, 1]]];
+        // Zonal pass 2 only: restrict this node's own LocalMask clone to its
+        // centre's zone (+ minimum-pixel guard), shared with
+        // `solve_zonal_masking_impl`'s inspection record so the two never
+        // diverge. A per-node clone rather than a new `Subset::new`
+        // parameter, whose `global_mask` slot already carries the mesh's
+        // boundary/exclusion rasterisation.
+        let local_mask_owned;
+        let local_mask = match tmpl.zone_mask {
+            Some(zm) => {
+                let (picked, _pre, _post, _fell_back) = zone_cut_for_node(
+                    tmpl.local_mask,
+                    coord,
+                    self.mask.as_ref().map(|m| m.view()),
+                    zm,
+                    ZONE_MASK_MIN_PIXEL_FRACTION,
+                );
+                local_mask_owned = picked;
+                &local_mask_owned
+            }
+            None => tmpl.local_mask,
+        };
+        Subset::new(
+            coord,
+            local_mask,
+            self.mask.as_ref().map(|m| m.view()),
+            Arc::clone(&self.f_img),
+            Arc::clone(&self.g_img),
+            subset_order,
+        )
+    }
+
     /// The stored solve result, if any. Cheap to clone (`Arc`).
     pub fn solution(&self) -> Option<&Arc<MeshSolution>> {
         self.solution.as_ref()
@@ -272,8 +800,265 @@ impl Mesh {
         cfg: &SolveConfig,
         progress: Option<&indicatif::ProgressBar>,
     ) -> Result<(), Error> {
+        match &cfg.masking {
+            Masking::Uniform => self.solve_impl(&SubsetTemplate::plain(local_mask), seed, cfg, progress),
+            Masking::Zonal(zc) => self.solve_zonal_masking_impl(local_mask, seed, cfg, zc, progress),
+        }
+    }
+
+    /// `masking = Masking::Zonal(_)`'s implementation — see
+    /// `geopyv_dev_fresh/solver_options_restructure.md` §4's Stage B.
+    /// `pub(crate)` rather than a second public method: not a new user
+    /// surface, `masking` is a `SolveConfig`/`solver_options` value on the
+    /// one public `solve()`.
+    ///
+    /// 1. Pass 1: an ordinary solve (`masking` forced `Uniform` for this
+    ///    inner call, so this doesn't recurse).
+    /// 2. Build a `Field` at this mesh's own node positions, Rust-to-Rust
+    ///    (no PyO3 round-trip), solved with `StrainMethod::Meshless(zc.meshless_params)`.
+    /// 3. Rasterise each node's `gamma_max` to a dense image (meshless
+    ///    nearest-node, `nearest_node_values`), Gaussian-smooth it (σ = the
+    ///    mesh's node spacing by default) and take its Sobel magnitude, a
+    ///    dense `|∇γ|`. No mesh-element interpolation anywhere.
+    /// 4. Robust ridge threshold on that image, `median + k * 1.4826 * MAD`;
+    ///    the connected low-`|∇γ|` regions are the regime cores (cores
+    ///    smaller than one subset dropped; ≤1 core or <25 % core coverage
+    ///    ⇒ a single zone, i.e. no cut).
+    /// 5. Marker-controlled watershed of `|∇γ|` from the cores, so each
+    ///    zone seam lands on the ridge crest, then `fill_from_nearest_label`
+    ///    for any unreached pixels. Steps 2-5 repeat up to `zc.iterations`
+    ///    times (zone-aware refit), or are skipped entirely when
+    ///    `zc.zone_map` is supplied.
+    /// 6. Pass 2: solve again with every subset cut to its own centre's
+    ///    zone ([`SubsetTemplate::zone_mask`], guarded by
+    ///    [`ZONE_MASK_MIN_PIXEL_FRACTION`]), `masking` reset to `Uniform`
+    ///    (so this inner call doesn't recurse either).
+    /// 7. On pass-2 failure: fall back to pass 1's already-stored solution
+    ///    rather than propagating the error — decided in the doc above,
+    ///    never let the masking refinement make an already-solvable mesh
+    ///    unsolvable.
+    pub(crate) fn solve_zonal_masking_impl(
+        &mut self,
+        local_mask: &LocalMask,
+        seed: &SeedConfig,
+        cfg: &SolveConfig,
+        zc: &ZonalConfig,
+        progress: Option<&indicatif::ProgressBar>,
+    ) -> Result<(), Error> {
+        // --- Pass 1: plain solve, uniform masking. ---
+        let cfg1 = SolveConfig { masking: Masking::Uniform, ..cfg.clone() };
+        self.solve_impl(&SubsetTemplate::plain(local_mask), seed, &cfg1, progress)?;
+        let pass1_solution = Arc::clone(self.solution().expect("solve_impl succeeded, solution must be Some"));
+
+        let nodes = self.nodes().to_owned();
+        let n_nodes = nodes.nrows();
+        let img_shape = self.f_img.image_gs.dim(); // (height, width)
+
+        // The classifier's per-node outputs -- shear strain and its gradient
+        // magnitude, the ridge flags, the robust-threshold stats, and the
+        // whole-image zone grid pass 2 applies -- or their neutral
+        // stand-ins when the caller supplied a fixed `zone_map`.
+        #[allow(clippy::type_complexity)]
+        let (gamma_max, grad_mag, node_boundary, grad_median, grad_mad, grad_cutoff, zone_image):
+            (Vec<f64>, Vec<f64>, Vec<bool>, f64, f64, f64, Array2<u8>) =
+        if let Some(zmap) = zc.zone_map.as_ref() {
+            // --- Caller-supplied zone map: skip Stages 2-6 entirely. The
+            // partition is taken as given, so there is nothing to classify
+            // or refit (`iterations` is irrelevant) and the gradient-signal
+            // fields of the record are left zeroed. ---
+            if zmap.dim() != img_shape {
+                return Err(Error::InvalidInput(format!(
+                    "zonal zone_map shape {:?} does not match the reference image {:?}",
+                    zmap.dim(), img_shape,
+                )));
+            }
+            (
+                vec![0.0; n_nodes],
+                vec![0.0; n_nodes],
+                vec![false; n_nodes],
+                0.0,
+                0.0,
+                0.0,
+                zmap.clone(),
+            )
+        } else {
+        // --- Stages 2-6, iterated (`geopyv_dev_fresh/mds/zonal_masking_iterator_plan.md`).
+        // `zc.iterations == 1` (default) runs the loop body once and is
+        // byte-identical to the pre-iterator classifier. `> 1`: after the
+        // first (biased) classification, refit the Stage-2 meshless field
+        // with `zone_aware = true` seeded by the current zone map -- which
+        // drops the cross-zone neighbour blend that skews `gamma_max` /
+        // `gamma_max_grad` near a discontinuity -- and reclassify, until the
+        // per-node zone partition stops moving (`ZONAL_ITER_TOL`), it hits
+        // the cap, or a refit destabilises a good map.
+        let sigma = zc.smoothing_sigma.unwrap_or_else(|| node_spacing(&nodes));
+        let min_core_px = local_mask.n_px.max(1) as usize;
+        let iterations = zc.iterations.max(1);
+
+        let mut cls: Option<ClassifyResult> = None;
+        let mut prev_change = f64::INFINITY;
+
+        for it in 0..iterations {
+            // --- Stage 2: Field at the mesh nodes, Rust-to-Rust. it == 0
+            // uses the plain field; it > 0 refits zone-aware, seeded by the
+            // previous iteration's zone image (injected as a minimal record
+            // -- only `node_zone` + `zone_image` are read by the meshless
+            // `zone_aware` filter).
+            let source: Arc<MeshSolution> = if it == 0 {
+                Arc::clone(&pass1_solution)
+            } else {
+                let prev = cls.as_ref().expect("it > 0 ⇒ iteration 0 already ran");
+                let mut m = (*pass1_solution).clone();
+                m.zonal_masking = Some(minimal_zonal_record(
+                    prev.node_zone.clone(),
+                    prev.zone_image.clone(),
+                    n_nodes,
+                ));
+                Arc::new(m)
+            };
+            let mut mp = zc.meshless_params.clone();
+            if it > 0 {
+                mp.zone_aware = true;
+            }
+
+            let seq_sol = Arc::new(SequenceSolution::from_mesh_solution(source));
+            let mut field = Field::new(
+                seq_sol,
+                FieldDistribution::Explicit {
+                    coordinates: nodes.clone(),
+                    volumes: Array1::ones(n_nodes),
+                },
+                false,
+                1.0,
+            )?;
+            field.solve(0.0, true, None, StrainMethod::Meshless(mp))?;
+            let field_sol = field
+                .solution()
+                .expect("field.solve() succeeded, solution must be Some");
+
+            let new_cls =
+                classify_from_field(field_sol, &nodes, img_shape, sigma, zc, min_core_px);
+
+            if it == 0 {
+                let stop = new_cls.collapsed; // uniform field: no partition to refine
+                cls = Some(new_cls);
+                if stop {
+                    break;
+                }
+                continue;
+            }
+
+            let prev = cls.as_ref().expect("it > 0 ⇒ iteration 0 already ran");
+            let change = changed_zone_pixel_frac(&prev.zone_image, &new_cls.zone_image);
+
+            // Reject a refit that collapses a previously-real partition, or
+            // that moves the map MORE than the last refit did (oscillating)
+            // -- keep the previous, better map.
+            if (new_cls.collapsed && !prev.collapsed) || change > prev_change {
+                break;
+            }
+            let converged = change < ZONAL_ITER_TOL;
+            cls = Some(new_cls);
+            prev_change = change;
+            if converged {
+                break;
+            }
+        }
+
+        let cls = cls.expect("iteration 0 always runs");
+        (
+            cls.gamma_max,
+            cls.grad_mag,
+            cls.node_boundary,
+            cls.grad_median,
+            cls.grad_mad,
+            cls.grad_cutoff,
+            cls.zone_image,
+        )
+        };
+
+        // --- Inspection record: the per-node zone-cut outcome, computed
+        // with the exact same `zone_cut_for_node` the pass-2 solve uses, so
+        // `Mesh.inspect(zones=True)` / `inspect(subset_idx=...)` report what
+        // actually happened. Purely geometric -- no re-solve. ---
+        let mut node_zone = Array1::<u32>::zeros(n_nodes);
+        let mut node_pre_px = Array1::<u32>::zeros(n_nodes);
+        let mut node_post_px = Array1::<u32>::zeros(n_nodes);
+        let mut node_guard_fallback = vec![false; n_nodes];
+        for idx in 0..n_nodes {
+            let coord = [nodes[[idx, 0]], nodes[[idx, 1]]];
+            node_zone[idx] = zone_at(zone_image.view(), coord) as u32;
+            let (_picked, pre, post, fell_back) = zone_cut_for_node(
+                local_mask,
+                coord,
+                self.mask.as_ref().map(|m| m.view()),
+                zone_image.view(),
+                ZONE_MASK_MIN_PIXEL_FRACTION,
+            );
+            node_pre_px[idx] = pre;
+            node_post_px[idx] = post;
+            node_guard_fallback[idx] = fell_back;
+        }
+        let record = ZonalMaskingRecord {
+            node_gamma_max: Array1::from(gamma_max),
+            node_gamma_max_grad: Array1::from(grad_mag),
+            node_boundary,
+            node_zone,
+            node_pre_px,
+            node_post_px,
+            node_guard_fallback,
+            k: zc.k,
+            grad_median,
+            grad_mad,
+            grad_cutoff,
+            zone_image: zone_image.clone(),
+        };
+
+        // --- Pass 2: solve again with every subset cut to its own zone,
+        // uniform masking (no recursion). ---
+        let cfg2 = SolveConfig {
+            masking: Masking::Uniform,
+            override_active: true,
+            ..cfg.clone()
+        };
+        let tmpl2 = SubsetTemplate { local_mask, zone_mask: Some(zone_image.view()) };
+        match self.solve_impl(&tmpl2, seed, &cfg2, progress) {
+            Ok(()) => {
+                // Attach the record to pass 2's fresh solution (refcount 1
+                // here -- `pass1_solution` is a distinct `Arc` -- so
+                // `make_mut` does not clone).
+                let sol = self
+                    .solution
+                    .as_mut()
+                    .expect("solve_impl succeeded, solution must be Some");
+                Arc::make_mut(sol).zonal_masking = Some(record);
+                Ok(())
+            }
+            Err(_) => {
+                // Decided: never let the masking refinement make an
+                // already-solvable mesh unsolvable -- fall back to pass 1's
+                // own already-computed solution (which carries no zone cut,
+                // hence no `zonal_masking` record).
+                self.solution = Some(pass1_solution);
+                Ok(())
+            }
+        }
+    }
+
+    fn solve_impl(
+        &mut self,
+        masks: &SubsetTemplate,
+        seed: &SeedConfig,
+        cfg: &SolveConfig,
+        progress: Option<&indicatif::ProgressBar>,
+    ) -> Result<(), Error> {
         let n_nodes = self.nodes.nrows();
         let p_len = 6 * cfg.subset_order;
+
+        // Per-node adjacency, precomputed once -- see `Adjacency` and
+        // `layer_rg_plan.md` §11.6 (was a per-call `connectivity_indexed`
+        // HashSet build, ~5-10x per node across propagation + corrections).
+        let adj = Adjacency::build(&self.elements, self.mesh_order, n_nodes);
 
         // Normalise seed.warp to exactly p_len elements.
         let seed_warp_norm: Vec<f64> = {
@@ -291,21 +1076,6 @@ impl Mesh {
         let mut displacements = Array2::<f64>::zeros((n_nodes, 2));
         let mut iterations = Array1::<u32>::zeros(n_nodes);
         let mut norms = Array1::<f64>::zeros(n_nodes);
-
-        // Build per-node subsets, delegating masking to Subset::new.
-        let subsets: Vec<Subset> = (0..n_nodes)
-            .map(|i| {
-                let coord = [self.nodes[[i, 0]], self.nodes[[i, 1]]];
-                Subset::new(
-                    coord,
-                    local_mask,
-                    self.mask.as_ref().map(|m| m.view()),
-                    Arc::clone(&self.f_img),
-                    Arc::clone(&self.g_img),
-                    cfg.subset_order,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
 
         // Progress bar: use provided one, or create a local one.
         let own_pb;
@@ -330,7 +1100,8 @@ impl Mesh {
         let seed_node = find_seed_node(&self.nodes, seed.coord);
         let seed_cfg = SolveConfig { tolerance: seed.tolerance, ..cfg.clone() };
         let seed_result = self.solve_node(
-            &subsets[seed_node], seed_node, &[], &c_zncc, &p, &seed_cfg, Some(&seed_warp_norm),
+            &self.subset_at(seed_node, masks, cfg.subset_order)?,
+            seed_node, &[], &c_zncc, &p, &seed_cfg, Some(&seed_warp_norm),
         )?;
         store_result(seed_node, &seed_result, &mut quality_ok, &mut c_zncc, &mut p, &mut displacements, &mut iterations, &mut norms);
         pb.inc(1);
@@ -338,47 +1109,97 @@ impl Mesh {
         propagated[seed_node] = true;
         queue.push((c_zncc[seed_node].to_bits(), seed_node));
 
-        // --- Seed neighbours.
-        self.solve_neighbours_from(
-            seed_node,
-            &subsets,
-            cfg,
-            pb,
-            &mut stored,
-            &mut quality_ok,
-            &mut c_zncc,
-            &mut queue,
-            &mut p,
-            &mut displacements,
-            &mut iterations,
-            &mut norms,
-        )?;
+        // --- Frontier propagation. `Rg`: serial cascade (unchanged).
+        //     `LayerRg`: parallel independent-set rounds -- see
+        //     `geopyv_dev_fresh/layer_rg_plan.md` §3.
+        match cfg.preconditioning {
+            Preconditioning::Rg => {
+                // --- Seed neighbours.
+                self.solve_neighbours_from(
+                    seed_node, masks, cfg, pb,
+                    &mut stored, &mut quality_ok, &mut c_zncc, &mut queue,
+                    &mut p, &mut displacements, &mut iterations, &mut norms,
+                    &adj,
+                )?;
 
-        // --- Reliability-guided queue: highest-C_ZNCC first.
-        while let Some((_, cur_idx)) = queue.pop() {
-            if propagated[cur_idx] {
-                continue;
+                // --- Reliability-guided queue: highest-C_ZNCC first.
+                while let Some((_, cur_idx)) = queue.pop() {
+                    if propagated[cur_idx] {
+                        continue;
+                    }
+                    propagated[cur_idx] = true;
+                    self.solve_neighbours_from(
+                        cur_idx, masks, cfg, pb,
+                        &mut stored, &mut quality_ok, &mut c_zncc, &mut queue,
+                        &mut p, &mut displacements, &mut iterations, &mut norms,
+                        &adj,
+                    )?;
+                }
             }
-            propagated[cur_idx] = true;
-            self.solve_neighbours_from(
-                cur_idx,
-                &subsets,
-                cfg,
-                pb,
-                &mut stored,
-                &mut quality_ok,
-                &mut c_zncc,
-                &mut queue,
-                &mut p,
-                &mut displacements,
-                &mut iterations,
-                &mut norms,
-            )?;
+            Preconditioning::LayerRg => {
+                let root_cap = cfg.layer_rg.batch_factor.max(1).saturating_mul(
+                    cfg.layer_rg
+                        .max_workers
+                        .unwrap_or_else(rayon::current_num_threads)
+                        .max(1),
+                );
+                let eps = cfg.layer_rg.root_rel_eps;
+
+                // A capped worker pool is built ONCE here, not per round --
+                // `ThreadPoolBuilder::build` spawns OS threads and is far too
+                // expensive to call per colour. `None` = use the global pool.
+                let pool = match cfg.layer_rg.max_workers {
+                    Some(w) => Some(
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(w.max(1))
+                            .build()
+                            .map_err(|e| Error::InvalidInput(format!("rayon pool build: {e}")))?,
+                    ),
+                    None => None,
+                };
+
+                // --- Seed neighbours (first parallel round).
+                self.expand_parallel(
+                    &[seed_node], masks, cfg, pool.as_ref(), pb,
+                    &mut stored, &mut quality_ok, &mut c_zncc, &mut queue,
+                    &mut p, &mut displacements, &mut iterations, &mut norms,
+                    &adj,
+                )?;
+
+                // --- ε-band frontier loop.
+                while let Some((top_key, top_idx)) = queue.pop() {
+                    if propagated[top_idx] {
+                        continue;
+                    }
+                    propagated[top_idx] = true;
+                    let mut roots = vec![top_idx];
+                    let threshold = f64::from_bits(top_key) * (1.0 - eps);
+                    while roots.len() < root_cap {
+                        match queue.peek() {
+                            Some(&(k, _)) if f64::from_bits(k) >= threshold => {
+                                let (_, r) = queue.pop().unwrap();
+                                if propagated[r] {
+                                    continue;
+                                }
+                                propagated[r] = true;
+                                roots.push(r);
+                            }
+                            _ => break,
+                        }
+                    }
+                    self.expand_parallel(
+                        &roots, masks, cfg, pool.as_ref(), pb,
+                        &mut stored, &mut quality_ok, &mut c_zncc, &mut queue,
+                        &mut p, &mut displacements, &mut iterations, &mut norms,
+                        &adj,
+                    )?;
+                }
+            }
         }
 
         // --- Corrections (outlier re-solve).
         self.corrections(
-            &subsets,
+            masks,
             cfg,
             pb,
             &mut stored,
@@ -388,6 +1209,7 @@ impl Mesh {
             &mut displacements,
             &mut iterations,
             &mut norms,
+            &adj,
         )?;
 
         if progress.is_none() {
@@ -413,21 +1235,21 @@ impl Mesh {
             }
         }
 
+
         // --- Element areas, centroids and strains.
         let centroids = compute_centroids(&self.nodes, &self.elements);
         let areas = element_area(&self.nodes, &self.elements);
-        let warps = element_strains(
-            &self.nodes,
-            &self.elements,
-            &displacements,
-            self.mesh_order,
-        )?;
+        let warps = element_strains(&self.nodes, &self.elements, &displacements, self.mesh_order)?;
 
         // --- Compatibility check.
-        self.check_compatibility(&warps)?;
+        self.check_compatibility(&warps, &centroids)?;
 
         let f_img_path = self.f_img.filepath.clone().unwrap_or_default();
         let g_img_path = self.g_img.filepath.clone().unwrap_or_default();
+
+        // Template shape/size, retained for `Mesh.inspect(subset_idx=...)`.
+        let template_shape = Some(masks.local_mask.shape.clone());
+        let template_sizes = Some(Array1::from_elem(n_nodes, masks.local_mask.size as u32));
 
         self.solution = Some(Arc::new(MeshSolution {
             nodes: self.nodes.clone(),
@@ -449,6 +1271,11 @@ impl Mesh {
             g_img_path,
             solve_config: Some(cfg.clone()),
             seed: Some(seed.clone()),
+            template_shape,
+            template_sizes,
+            // Filled by `solve_zonal_masking_impl` after a successful pass 2;
+            // stays `None` for every uniform solve (including pass 1).
+            zonal_masking: None,
         }));
         Ok(())
     }
@@ -465,8 +1292,12 @@ impl Mesh {
         cfg: &SolveConfig,
     ) -> Result<SolveResult, Error> {
         match cfg.method {
-            SolveMethod::Icgn => subset.solve_icgn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
-            SolveMethod::Fagn => subset.solve_fagn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations),
+            SolveMethod::Icgn => {
+                subset.solve_icgn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations)
+            }
+            SolveMethod::Fagn => {
+                subset.solve_fagn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations)
+            }
         }
     }
 
@@ -543,7 +1374,7 @@ impl Mesh {
     fn solve_neighbours_from(
         &self,
         cur_idx: usize,
-        subsets: &[Subset],
+        masks: &SubsetTemplate,
         cfg: &SolveConfig,
         pb: &indicatif::ProgressBar,
         stored: &mut Vec<bool>,
@@ -554,18 +1385,22 @@ impl Mesh {
         displacements: &mut Array2<f64>,
         iterations: &mut Array1<u32>,
         norms: &mut Array1<f64>,
+        adj: &Adjacency,
     ) -> Result<(), Error> {
-        let neighbours = connectivity(&self.elements, self.mesh_order, cur_idx, false);
-        for &nb_idx in &neighbours {
+        for &nb_idx in adj.get(cur_idx, false) {
             if stored[nb_idx] {
                 continue;
             }
-            let candidates = connectivity(&self.elements, self.mesh_order, nb_idx, true);
-            let trusted: Vec<usize> = candidates
-                .into_iter()
+            let trusted: Vec<usize> = adj
+                .get(nb_idx, true)
+                .iter()
+                .copied()
                 .filter(|&n| stored[n] && quality_ok[n])
                 .collect();
-            let result = self.solve_node(&subsets[nb_idx], nb_idx, &trusted, c_zncc, p, cfg, None)?;
+            let result = self.solve_node(
+                &self.subset_at(nb_idx, masks, cfg.subset_order)?,
+                nb_idx, &trusted, c_zncc, p, cfg, None,
+            )?;
             store_result(nb_idx, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
             pb.inc(1);
             stored[nb_idx] = true;
@@ -576,6 +1411,104 @@ impl Mesh {
             // on `quality_ok == true` already, so this doesn't leak an
             // untrustworthy result into anyone else's precondition.
             queue.push((c_zncc[nb_idx].to_bits(), nb_idx));
+        }
+        Ok(())
+    }
+
+    /// `Preconditioning::LayerRg` frontier expansion — see
+    /// `geopyv_dev_fresh/layer_rg_plan.md` §3.3.
+    ///
+    /// Solves every currently-unsolved neighbour of every node in `roots`
+    /// (the same total set `solve_neighbours_from` would, called once per
+    /// root), but partitioned into graph-independent colours: within a
+    /// colour no two nodes share a mesh edge, so none can be in another's
+    /// `trusted` set and they are solved concurrently with `rayon`. Each
+    /// colour is folded serially, in ascending node-index order, before the
+    /// next colour starts — so a later-coloured node still sees an
+    /// adjacent earlier-coloured node's result, matching the serial
+    /// "lower index first" ordering. Fully deterministic (§5 of the plan).
+    #[allow(clippy::too_many_arguments)]
+    fn expand_parallel(
+        &self,
+        roots: &[usize],
+        masks: &SubsetTemplate,
+        cfg: &SolveConfig,
+        pool: Option<&rayon::ThreadPool>,
+        pb: &indicatif::ProgressBar,
+        stored: &mut Vec<bool>,
+        quality_ok: &mut Array1<bool>,
+        c_zncc: &mut Array1<f64>,
+        queue: &mut BinaryHeap<(u64, usize)>,
+        p: &mut Array2<f64>,
+        displacements: &mut Array2<f64>,
+        iterations: &mut Array1<u32>,
+        norms: &mut Array1<f64>,
+        adj: &Adjacency,
+    ) -> Result<(), Error> {
+        // 1. Candidates: sorted-unique unsolved neighbours of all roots.
+        let mut candidates: Vec<usize> = roots
+            .iter()
+            .flat_map(|&r| adj.get(r, false).iter().copied())
+            .filter(|&nb| !stored[nb])
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // 2. Greedy graph colouring over the full (edge-sharing) adjacency
+        //    -- the same relation `trusted` is built from.
+        let colour = greedy_graph_colour(adj, &candidates);
+        let n_colours = colour.iter().copied().max().map_or(0, |c| c + 1);
+
+        // 3. Per colour: freeze trusted sets, solve in parallel, fold serially.
+        for c in 0..n_colours {
+            let inputs: Vec<(usize, Vec<usize>)> = candidates
+                .iter()
+                .copied()
+                .zip(colour.iter().copied())
+                .filter(|&(_, col)| col == c)
+                .map(|(nb, _)| {
+                    let trusted: Vec<usize> = adj
+                        .get(nb, true)
+                        .iter()
+                        .copied()
+                        .filter(|&t| stored[t] && quality_ok[t])
+                        .collect();
+                    (nb, trusted)
+                })
+                .collect();
+
+            let c_zncc_ro: &Array1<f64> = c_zncc;
+            let p_ro: &Array2<f64> = p;
+            let solve_colour = || -> Result<Vec<(usize, SolveResult)>, Error> {
+                inputs
+                    .par_iter()
+                    .map(|(nb, trusted)| {
+                        let subset = self.subset_at(*nb, masks, cfg.subset_order)?;
+                        let r = self.solve_node(
+                            &subset, *nb, trusted, c_zncc_ro, p_ro, cfg, None,
+                        )?;
+                        Ok::<(usize, SolveResult), Error>((*nb, r))
+                    })
+                    .collect()
+            };
+            let mut results = match pool {
+                Some(p) => p.install(solve_colour)?,
+                None => solve_colour()?,
+            };
+
+            // Serial fold, canonical (ascending node-index) order.
+            results.sort_unstable_by_key(|(nb, _)| *nb);
+            for (nb, r) in results {
+                store_result(
+                    nb, &r, quality_ok, c_zncc, p, displacements, iterations, norms,
+                );
+                pb.inc(1);
+                stored[nb] = true;
+                queue.push((c_zncc[nb].to_bits(), nb));
+            }
         }
         Ok(())
     }
@@ -593,7 +1526,7 @@ impl Mesh {
     /// versus their peers.
     fn correlation_improvements(
         &self,
-        subsets: &[Subset],
+        masks: &SubsetTemplate,
         cfg: &SolveConfig,
         solved: &mut Vec<bool>,
         quality_ok: &mut Array1<bool>,
@@ -602,24 +1535,35 @@ impl Mesh {
         displacements: &mut Array2<f64>,
         iterations: &mut Array1<u32>,
         norms: &mut Array1<f64>,
+        adj: &Adjacency,
     ) -> Result<(), Error> {
         let mut order = corr(c_zncc.view());
         // Ascending by C_ZNCC (worst first), matching Python's np.argsort.
-        order.sort_by(|&a, &b| c_zncc[a].partial_cmp(&c_zncc[b]).unwrap());
+        // `total_cmp`, not `partial_cmp().unwrap_or(Equal)`: this array
+        // isn't pre-filtered to exclude non-finite values (unlike the
+        // *_stats functions' local sort inputs), so treating "NaN vs
+        // anything" as Equal is inconsistent with genuine orderings
+        // between two other finite, unequal values elsewhere in the same
+        // array -- not just wrong, but an invalid total order that Rust's
+        // sort now actively detects and panics on (see line ~748).
+        order.sort_by(|&a, &b| c_zncc[a].total_cmp(&c_zncc[b]));
 
         let mut unimproved: HashSet<usize> = HashSet::new();
         for i in 0..order.len() {
             let j = order[i];
             let excluded: HashSet<usize> =
                 order[i + 1..].iter().copied().chain(unimproved.iter().copied()).collect();
-            let full_neighbours = connectivity(&self.elements, self.mesh_order, j, true);
-            let trusted: Vec<usize> = full_neighbours
+            let trusted: Vec<usize> = adj
+                .get(j, true)
                 .iter()
                 .copied()
                 .filter(|&nb| !excluded.contains(&nb) && quality_ok[nb])
                 .collect();
 
-            let result = self.solve_node(&subsets[j], j, &trusted, c_zncc, p, cfg, None)?;
+            let result = self.solve_node(
+                &self.subset_at(j, masks, cfg.subset_order)?,
+                j, &trusted, c_zncc, p, cfg, None,
+            )?;
             if result.c_zncc > c_zncc[j] && result.quality_ok {
                 store_result(j, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
                 solved[j] = true;
@@ -642,7 +1586,7 @@ impl Mesh {
     /// silently indistinguishable from a clean solve.
     fn corrections(
         &self,
-        subsets: &[Subset],
+        masks: &SubsetTemplate,
         cfg: &SolveConfig,
         _pb: &indicatif::ProgressBar,
         solved: &mut Vec<bool>,
@@ -652,15 +1596,17 @@ impl Mesh {
         displacements: &mut Array2<f64>,
         iterations: &mut Array1<u32>,
         norms: &mut Array1<f64>,
+        adj: &Adjacency,
     ) -> Result<(), Error> {
         self.correlation_improvements(
-            subsets, cfg, solved, quality_ok, c_zncc, p, displacements, iterations, norms,
+            masks, cfg, solved, quality_ok, c_zncc, p, displacements, iterations, norms,
+            adj,
         )?;
 
         let (_, flow_ids, flow_lq, flow_iqr) =
-            flow_stats(&self.elements, self.mesh_order, displacements.view());
+            flow_stats(adj, displacements.view());
         let (r_vals, r_ids) =
-            r_stats(&self.elements, self.mesh_order, &self.nodes, displacements.view());
+            r_stats(adj, &self.elements, &self.nodes, displacements.view());
 
         // Merge and sort ascending by R — mildest displacement-magnitude
         // anomalies corrected first (not worst-first: `r_ids` flags only
@@ -672,7 +1618,18 @@ impl Mesh {
             let s: HashSet<usize> = flow_ids.iter().chain(r_ids.iter()).copied().collect();
             s.into_iter().collect()
         };
-        full_id.sort_by(|&a, &b| r_vals[a].partial_cmp(&r_vals[b]).unwrap());
+        // A node can enter `full_id` via `flow_ids` alone: flow_calc
+        // substitutes a *finite* sentinel (-1.0) for a non-finite
+        // displacement, so such a node can clear the flow fence even
+        // though its own `r_vals` entry (raw displacement magnitude, no
+        // such substitution) is still genuinely NaN. `total_cmp`, not
+        // `partial_cmp().unwrap_or(Equal)` -- this array mixes that NaN
+        // with multiple distinct finite values, and treating "NaN vs
+        // anything" as Equal isn't a valid total order there (confirmed:
+        // Rust's sort panics with "does not correctly implement a total
+        // order" on exactly this pattern, it doesn't just silently
+        // misorder).
+        full_id.sort_by(|&a, &b| r_vals[a].total_cmp(&r_vals[b]));
 
         // Exempt nodes whose flow is within normal bounds and not in R outliers.
         let full_id_set: HashSet<usize> = full_id.iter().copied().collect();
@@ -686,8 +1643,7 @@ impl Mesh {
                 let f = flow_calc_excluding(
                     j,
                     &full_id_set,
-                    &self.elements,
-                    self.mesh_order,
+                    adj,
                     displacements.view(),
                     None,
                 );
@@ -700,16 +1656,19 @@ impl Mesh {
 
         for i in 0..active_ids.len() {
             let j = active_ids[i];
-            let full_neighbours = connectivity(&self.elements, self.mesh_order, j, true);
             // Exclude current and later outliers from preconditioning.
             let later: HashSet<usize> = active_ids[i..].iter().copied().collect();
-            let trusted: Vec<usize> = full_neighbours
+            let trusted: Vec<usize> = adj
+                .get(j, true)
                 .iter()
                 .copied()
                 .filter(|&nb| !later.contains(&nb) && quality_ok[nb])
                 .collect();
 
-            let result = self.solve_node(&subsets[j], j, &trusted, c_zncc, p, cfg, None)?;
+            let result = self.solve_node(
+                &self.subset_at(j, masks, cfg.subset_order)?,
+                j, &trusted, c_zncc, p, cfg, None,
+            )?;
             store_result(j, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
             solved[j] = true;
         }
@@ -717,7 +1676,7 @@ impl Mesh {
     }
 
     /// Compatibility check: reject mesh if any element has det(F) ≤ 0 (fold-over).
-    fn check_compatibility(&self, warps: &Array2<f64>) -> Result<(), Error> {
+    fn check_compatibility(&self, warps: &Array2<f64>, centroids: &Array2<f64>) -> Result<(), Error> {
         for e in 0..warps.nrows() {
             let j00 = 1.0 + warps[[e, 2]]; // 1 + du/dx
             let j01 =       warps[[e, 3]]; //     dv/dx
@@ -725,8 +1684,8 @@ impl Mesh {
             let j11 = 1.0 + warps[[e, 5]]; // 1 + dv/dy
             let det = j00 * j11 - j01 * j10;
             if det <= 0.0 {
-                let cx = self.nodes.slice(s![.., 0]).mean().unwrap_or(0.0);
-                let cy = self.nodes.slice(s![.., 1]).mean().unwrap_or(0.0);
+                let cx = centroids[[e, 0]];
+                let cy = centroids[[e, 1]];
                 return Err(Error::InvalidInput(format!(
                     "mesh compatibility violated at element {e} near ({cx:.1},{cy:.1}): det(J)={det:.4}"
                 )));
@@ -1067,6 +2026,144 @@ pub fn connectivity(
     }
 }
 
+/// `node_id -> [element row indices containing it]`, built once per
+/// `Mesh::solve()` call (O(n_elements)) so that the solve pipeline's many
+/// per-node/per-element [`connectivity_indexed`] lookups don't each rescan
+/// the whole element array ([`connectivity`]'s brute-force scan is fine for the occasional one-off
+/// lookup `python/src/py_mesh.rs` exposes, but made the whole solve
+/// pipeline O(n_nodes * n_elements) when called ~once per node throughout
+/// propagation/corrections -- this index turns each lookup into
+/// O(node degree) instead).
+fn build_node_element_index(elements: &Array2<usize>, n_nodes: usize) -> Vec<Vec<usize>> {
+    let mut index = vec![Vec::new(); n_nodes];
+    for e in 0..elements.nrows() {
+        for k in 0..elements.ncols() {
+            index[elements[[e, k]]].push(e);
+        }
+    }
+    index
+}
+
+/// Identical output to [`connectivity`] for the same `(elements, mesh_order,
+/// idx, full)` -- only iterates the elements `incident[idx]` already says
+/// contain `idx` (from [`build_node_element_index`]) instead of rescanning
+/// every element to rediscover that membership. See
+/// `test_connectivity_indexed_matches_connectivity` for a direct
+/// equivalence check against the original.
+fn connectivity_indexed(
+    elements: &Array2<usize>,
+    mesh_order: u8,
+    idx: usize,
+    full: bool,
+    incident: &[Vec<usize>],
+) -> Vec<usize> {
+    let mut result: HashSet<usize> = HashSet::new();
+    if mesh_order == 1 || full {
+        for &e in &incident[idx] {
+            for k in 0..elements.ncols() {
+                let nb = elements[[e, k]];
+                if nb != idx {
+                    result.insert(nb);
+                }
+            }
+        }
+    } else {
+        // Order-2, full=false: edge-adjacent connectivity only.
+        for &e in &incident[idx] {
+            let ncols = elements.ncols();
+            for col in 0..ncols {
+                if elements[[e, col]] != idx {
+                    continue;
+                }
+                let row = &elements.row(e);
+                let adds: &[usize] = match col {
+                    0 => &[row[3], row[5]],     // corner 0 → mid01, mid20
+                    1 => &[row[3], row[4]],     // corner 1 → mid01, mid12
+                    2 => &[row[4], row[5]],     // corner 2 → mid12, mid20
+                    3 => &[row[0], row[1]],     // mid01 → corner 0, corner 1
+                    4 => &[row[1], row[2]],     // mid12 → corner 1, corner 2
+                    5 => &[row[0], row[2]],     // mid20 → corner 0, corner 2
+                    _ => &[],
+                };
+                for &nb in adds {
+                    if nb != idx {
+                        result.insert(nb);
+                    }
+                }
+            }
+        }
+    }
+    let mut v: Vec<usize> = result.into_iter().collect();
+    v.sort_unstable();
+    v
+}
+
+/// Per-node adjacency lists, precomputed once per `solve_impl`
+/// (`geopyv_dev_fresh/layer_rg_plan.md` §11.6). [`connectivity_indexed`]
+/// builds a `HashSet` + sorts on every call and is hit ~5–10× per node
+/// across propagation and corrections; this hoists all of that to O(n) up
+/// front. `full[i]` = every node sharing an element with `i` (the relation
+/// `trusted` and the corrections stats use); `edge[i]` = edge-adjacent
+/// only (order-2 `full=false`; identical to `full` for order-1). Both
+/// ascending-sorted, byte-for-byte what `connectivity_indexed` returned.
+pub struct Adjacency {
+    full: Vec<Vec<usize>>,
+    edge: Vec<Vec<usize>>,
+}
+
+impl Adjacency {
+    fn build(elements: &Array2<usize>, mesh_order: u8, n_nodes: usize) -> Self {
+        let incident = build_node_element_index(elements, n_nodes);
+        let full: Vec<Vec<usize>> = (0..n_nodes)
+            .map(|i| connectivity_indexed(elements, mesh_order, i, true, &incident))
+            .collect();
+        let edge = if mesh_order == 1 {
+            full.clone()
+        } else {
+            (0..n_nodes)
+                .map(|i| connectivity_indexed(elements, mesh_order, i, false, &incident))
+                .collect()
+        };
+        Adjacency { full, edge }
+    }
+
+    #[inline]
+    fn get(&self, idx: usize, full: bool) -> &[usize] {
+        if full { &self.full[idx] } else { &self.edge[idx] }
+    }
+}
+
+/// Greedy proper graph colouring of `candidates` under the full
+/// (edge-sharing) adjacency — see `geopyv_dev_fresh/layer_rg_plan.md` §3.3.
+///
+/// `candidates` must be sorted ascending. Each node is visited in that
+/// order and assigned the lowest colour not already used by one of its
+/// already-coloured `candidates` neighbours. Deterministic: [`Adjacency`]
+/// lists are sorted and the visit order is fixed, so the same input always
+/// yields the same `Vec`.
+///
+/// Returned: `colour[i]` for `candidates[i]`, in `0..k`.
+fn greedy_graph_colour(adj: &Adjacency, candidates: &[usize]) -> Vec<usize> {
+    let mut colour = vec![usize::MAX; candidates.len()];
+    let mut used: Vec<bool> = Vec::new();
+    for i in 0..candidates.len() {
+        used.clear();
+        for &nb in adj.get(candidates[i], true) {
+            if let Ok(pos) = candidates.binary_search(&nb) {
+                let cn = colour[pos];
+                if cn != usize::MAX {
+                    if cn >= used.len() {
+                        used.resize(cn + 1, false);
+                    }
+                    used[cn] = true;
+                }
+            }
+        }
+        colour[i] = (0..).find(|&k| k >= used.len() || !used[k]).unwrap();
+    }
+    colour
+}
+
 /// IQR-based outlier detection on C_ZNCC scores.
 /// Returns indices where `C_ZNCC < LQ - 2.5 * IQR`.
 pub fn corr(c_zncc: ArrayView1<f64>) -> Vec<usize> {
@@ -1131,15 +2228,53 @@ pub fn flow_calc(
     (disp[0] * vx + disp[1] * vy) / (d_mag * v_mag)
 }
 
+/// Same as [`flow_calc`] but takes a precomputed `incident` index
+/// ([`build_node_element_index`]) and uses [`connectivity_indexed`] instead
+/// of [`connectivity`]'s per-call element rescan. `flow_calc` itself stays
+/// untouched for its one external caller (`python/src/py_mesh.rs`'s
+/// single-node lookup); this variant is for the solve pipeline's hot loops
+/// (`flow_stats`, `flow_calc_excluding`), called ~once per node.
+fn flow_calc_indexed(
+    idx: usize,
+    adj: &Adjacency,
+    displacements: ArrayView2<f64>,
+    exclude: &HashSet<usize>,
+    displacement_override: Option<[f64; 2]>,
+) -> f64 {
+    let disp = displacement_override
+        .unwrap_or([displacements[[idx, 0]], displacements[[idx, 1]]]);
+    if !disp[0].is_finite() || !disp[1].is_finite() {
+        return -1.0;
+    }
+    let valid: Vec<usize> = adj
+        .get(idx, true)
+        .iter()
+        .copied()
+        .filter(|nb| !exclude.contains(nb))
+        .filter(|nb| displacements[[*nb, 0]].is_finite() && displacements[[*nb, 1]].is_finite())
+        .collect();
+    if valid.is_empty() {
+        return -1.0;
+    }
+    let n = valid.len() as f64;
+    let vx: f64 = valid.iter().map(|&nb| displacements[[nb, 0]]).sum::<f64>() / n;
+    let vy: f64 = valid.iter().map(|&nb| displacements[[nb, 1]]).sum::<f64>() / n;
+    let v_mag = (vx * vx + vy * vy).sqrt();
+    let d_mag = (disp[0] * disp[0] + disp[1] * disp[1]).sqrt();
+    if v_mag < f64::EPSILON || d_mag < f64::EPSILON {
+        return -1.0;
+    }
+    (disp[0] * vx + disp[1] * vy) / (d_mag * v_mag)
+}
+
 fn flow_calc_excluding(
     idx: usize,
     exclude: &HashSet<usize>,
-    elements: &Array2<usize>,
-    mesh_order: u8,
+    adj: &Adjacency,
     displacements: ArrayView2<f64>,
     displacement_override: Option<[f64; 2]>,
 ) -> f64 {
-    flow_calc(idx, elements, mesh_order, displacements, exclude, displacement_override)
+    flow_calc_indexed(idx, adj, displacements, exclude, displacement_override)
 }
 
 /// Absolute displacement magnitude.
@@ -1149,14 +2284,13 @@ pub fn r_calc(displacement: [f64; 2]) -> f64 {
 
 /// Flow outlier IDs, LQ, IQR for the full mesh (no exclusions).
 fn flow_stats(
-    elements: &Array2<usize>,
-    mesh_order: u8,
+    adj: &Adjacency,
     displacements: ArrayView2<f64>,
 ) -> (Vec<f64>, Vec<usize>, f64, f64) {
     let n = displacements.nrows();
     let empty = HashSet::new();
     let flow: Vec<f64> = (0..n)
-        .map(|i| flow_calc(i, elements, mesh_order, displacements, &empty, None))
+        .map(|i| flow_calc_indexed(i, adj, displacements, &empty, None))
         .collect();
     let mut sorted: Vec<f64> = flow.iter().copied().filter(|f| f.is_finite()).collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1170,8 +2304,8 @@ fn flow_stats(
 
 /// R (displacement magnitude) outlier IDs using element-local IQR.
 fn r_stats(
+    adj: &Adjacency,
     elements: &Array2<usize>,
-    mesh_order: u8,
     _nodes: &Array2<f64>,
     displacements: ArrayView2<f64>,
 ) -> (Vec<f64>, HashSet<usize>) {
@@ -1185,21 +2319,32 @@ fn r_stats(
         let mut local: HashSet<usize> = HashSet::new();
         for k in 0..3 {
             let corner = elements[[e, k]];
-            for nb in connectivity(elements, mesh_order, corner, true) {
+            for &nb in adj.get(corner, true) {
                 local.insert(nb);
             }
         }
-        let local_r: Vec<f64> = local.iter().map(|&nb| r[nb]).collect();
+        // Non-quality_ok nodes can carry a non-finite displacement (e.g. a
+        // diverged ICGN solve) at this point in the pipeline -- the final
+        // quality_ok gate runs after corrections(), not before, so this
+        // statistics pass must not assume every node converged. Mirrors
+        // flow_stats's identical `is_finite` filter just above; an
+        // unfiltered sort here previously panicked on NaN comparisons for
+        // meshes with any unconverged node (e.g. a subset straddling a
+        // sharp discontinuity that ICGN can't fit at all).
+        let local_r: Vec<f64> = local.iter().map(|&nb| r[nb]).filter(|f| f.is_finite()).collect();
         if local_r.is_empty() {
             continue;
         }
         let mut sr = local_r.clone();
-        sr.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sr.sort_by(|a, b| a.total_cmp(b));
         let lq = percentile(&sr, 25.0);
         let uq = percentile(&sr, 75.0);
         let iqr = uq - lq;
         let fence = uq + 4.0 * iqr;
         for &nb in &local {
+            // r[nb] > fence is false for NaN (IEEE-754), so a non-finite
+            // node is simply never flagged here -- it stays whatever
+            // quality_ok already says, handled by the caller's gate.
             if r[nb] > fence {
                 r_ids.insert(nb);
             }
@@ -1376,7 +2521,7 @@ fn store_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{array, s};
 
     fn unit_triangle_mesh() -> (Array2<f64>, Array2<usize>) {
         let nodes = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
@@ -1553,6 +2698,39 @@ mod tests {
         assert_eq!(result, vec![0, 1]);
     }
 
+    /// [`connectivity_indexed`] (used throughout the solve pipeline to avoid
+    /// connectivity's O(n_elements)-per-call rescan, see
+    /// `build_node_element_index`'s doc comment) must return byte-identical
+    /// results to the original [`connectivity`] for every node and both
+    /// `full` settings, in both mesh orders -- this is the correctness
+    /// guarantee the perf fix rests on.
+    #[test]
+    fn test_connectivity_indexed_matches_connectivity() {
+        let elements1 = array![[0usize, 1, 2], [1, 3, 2]];
+        let incident1 = build_node_element_index(&elements1, 4);
+        for idx in 0..4 {
+            for &full in &[false, true] {
+                assert_eq!(
+                    connectivity_indexed(&elements1, 1, idx, full, &incident1),
+                    connectivity(&elements1, 1, idx, full),
+                    "order=1 idx={idx} full={full}",
+                );
+            }
+        }
+
+        let elements2 = array![[0usize, 1, 2, 4, 5, 6], [1, 3, 2, 7, 8, 5]];
+        let incident2 = build_node_element_index(&elements2, 9);
+        for idx in 0..9 {
+            for &full in &[false, true] {
+                assert_eq!(
+                    connectivity_indexed(&elements2, 2, idx, full, &incident2),
+                    connectivity(&elements2, 2, idx, full),
+                    "order=2 idx={idx} full={full}",
+                );
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // find_seed_node
     // -----------------------------------------------------------------------
@@ -1711,4 +2889,686 @@ mod tests {
         assert!((one[1] - 4.0).abs() < 1e-12);
     }
 
+    // -----------------------------------------------------------------------
+    // r_stats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn r_stats_ignores_non_finite_displacement_without_panicking() {
+        // Node 1 failed to converge (e.g. ICGN diverged on a subset
+        // straddling a sharp discontinuity) and carries a NaN displacement
+        // -- corrections() runs r_stats before the final quality_ok gate,
+        // so this is a real, reachable state, not a hypothetical one.
+        // Previously panicked (`sr.sort_by(...).unwrap()` on a NaN
+        // comparison); must now complete and simply not flag node 1.
+        let (nodes, elements) = unit_triangle_mesh();
+        let displacements = array![
+            [0.0, 0.0],
+            [f64::NAN, f64::NAN],
+            [0.05, 0.0],
+            [0.05, 0.0],
+        ];
+        let adj = Adjacency::build(&elements, 1, nodes.nrows());
+        let (r, r_ids) = r_stats(&adj, &elements, &nodes, displacements.view());
+        assert!(r[1].is_nan());
+        assert!(!r_ids.contains(&1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Synthetic-texture solve fixtures
+    // -----------------------------------------------------------------------
+
+    fn make_synthetic_texture_mesh(size: usize) -> Array2<f64> {
+        let mut img = Array2::<f64>::zeros((size, size));
+        for y in 0..size {
+            for x in 0..size {
+                let xf = x as f64;
+                let yf = y as f64;
+                let v = (0.7 * xf).sin() * (0.5 * yf).cos()
+                    + (0.31 * xf + 0.2 * yf).sin()
+                    + (0.13 * xf - 0.42 * yf).cos();
+                img[[y, x]] = 128.0 + 40.0 * v;
+            }
+        }
+        img
+    }
+
+    /// Rigid horizontal shift via bilinear resampling -- doesn't need to
+    /// match the production B-spline evaluator, just needs realistic
+    /// shifted texture for the solver to correlate against (same approach
+    /// `subset.rs`'s own synthetic-image tests use).
+    fn shift_image_uniform(src: &Array2<f64>, u: f64) -> Array2<f64> {
+        let (h, w) = src.dim();
+        let mut out = Array2::<f64>::zeros((h, w));
+        for y in 0..h {
+            for x in 0..w {
+                let src_x = x as f64 - u;
+                let x0 = src_x.floor();
+                let frac = src_x - x0;
+                let x0i = (x0.max(0.0) as usize).min(w - 1);
+                let x1i = ((x0 + 1.0).max(0.0) as usize).min(w - 1);
+                out[[y, x]] = src[[y, x0i]] * (1.0 - frac) + src[[y, x1i]] * frac;
+            }
+        }
+        out
+    }
+
+    /// Fresh `(Mesh, SeedConfig, SolveConfig)` over a deterministic
+    /// synthetic uniformly-shifted texture -- `Mesh::new` is deterministic
+    /// (no RNG anywhere in `generate_mesh`), so two calls with identical
+    /// arguments produce an identical node/element layout, letting tests
+    /// build two independent `Mesh`es and compare their solved results
+    /// node-for-node.
+    fn make_test_mesh_and_solve_inputs() -> (Mesh, SeedConfig, SolveConfig) {
+        use crate::image::Image;
+        let size = 100usize;
+        let texture = make_synthetic_texture_mesh(size);
+        let shifted = shift_image_uniform(&texture, 1.5);
+        let ref_img = Arc::new(Image::from_array(texture, 15));
+        let tar_img = Arc::new(Image::from_array(shifted, 15));
+
+        let boundary = array![[20.0, 20.0], [80.0, 20.0], [80.0, 80.0], [20.0, 80.0]];
+        let mesh = Mesh::new(
+            boundary.view(), false, &[], &[], (1.0, 100.0), 12, 1,
+            Arc::clone(&ref_img), Arc::clone(&tar_img),
+        ).unwrap();
+
+        let seed = SeedConfig { coord: [50.0, 50.0], warp: vec![0.0; 6], tolerance: 0.5 };
+        let cfg = SolveConfig {
+            tolerance: 0.5, subset_order: 1, override_active: true, ..Default::default()
+        };
+        (mesh, seed, cfg)
+    }
+
+    // -----------------------------------------------------------------------
+    // Zone-mask minimum-pixel guard (geopyv_dev_fresh/zonal_masking_plan.md)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subset_at_zone_mask_min_pixel_guard_falls_back_when_cut_too_aggressive() {
+        let (mesh, _seed, _cfg) = make_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(10).unwrap();
+        let plain = SubsetTemplate::plain(&local_mask);
+
+        // Pick the interior node closest to the texture centre (50, 50) --
+        // far enough from the 20..80 boundary that its full circle(10)
+        // footprint is unclipped by the mesh's own boundary mask, isolating
+        // the zone-mask guard as the only thing under test.
+        let idx = (0..mesh.nodes.nrows())
+            .min_by(|&a, &b| {
+                let da = (mesh.nodes[[a, 0]] - 50.0).powi(2) + (mesh.nodes[[a, 1]] - 50.0).powi(2);
+                let db = (mesh.nodes[[b, 0]] - 50.0).powi(2) + (mesh.nodes[[b, 1]] - 50.0).powi(2);
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap();
+
+        let baseline = mesh.subset_at(idx, &plain, 1).unwrap();
+        let baseline_n_px = baseline.mask.n_px;
+
+        // Zone label uniform everywhere: the centre's own label covers the
+        // node's entire footprint, so the cut removes nothing -- guard must
+        // not fire (nothing to fall back from), and the result must match
+        // the no-zone baseline exactly.
+        let zone_uniform = Array2::<u8>::from_elem((100, 100), 1u8);
+        let uniform_result = mesh
+            .subset_at(idx, &SubsetTemplate { local_mask: &local_mask, zone_mask: Some(zone_uniform.view()) }, 1)
+            .unwrap();
+        assert_eq!(uniform_result.mask.n_px, baseline_n_px,
+            "a uniform zone label should cut nothing at all");
+
+        // Zone label: only a small 3x3 patch around the node's own centre is
+        // label 1, every other pixel (including virtually this node's whole
+        // circle(10) footprint) is label 2 -- an aggressive cut leaving only
+        // a handful of pixels (kept >1 so the surviving subset still has
+        // enough intensity variation to be solvable, not "featureless").
+        let mut zone_split = Array2::<u8>::from_elem((100, 100), 2u8);
+        let cx = mesh.nodes[[idx, 0]].round() as usize;
+        let cy = mesh.nodes[[idx, 1]].round() as usize;
+        zone_split.slice_mut(s![cy - 1..=cy + 1, cx - 1..=cx + 1]).fill(1);
+
+        // With the guard (ZONE_MASK_MIN_PIXEL_FRACTION), the cut is rejected
+        // as too aggressive -- result must match the no-zone baseline
+        // exactly, not the heavily-cut subset.
+        let guarded = mesh
+            .subset_at(idx, &SubsetTemplate { local_mask: &local_mask, zone_mask: Some(zone_split.view()) }, 1)
+            .unwrap();
+        assert_eq!(guarded.mask.n_px, baseline_n_px,
+            "an overly aggressive zone cut must fall back to the unmodified local mask");
+
+        // With the guard effectively disabled (fraction = 0.0, any nonzero
+        // survival passes), the SAME aggressive cut must actually apply --
+        // confirms the guard, not something else, was responsible for the
+        // fallback above.
+        let coord = [mesh.nodes[[idx, 0]], mesh.nodes[[idx, 1]]];
+        let (_unguarded, _pre, post, fell_back) = zone_cut_for_node(
+            &local_mask, coord, mesh.mask.as_ref().map(|m| m.view()), zone_split.view(), 0.0,
+        );
+        assert!(!fell_back && (post as usize) < baseline_n_px,
+            "with the guard disabled, the aggressive zone cut should actually reduce n_px \
+             (baseline={baseline_n_px}, got={post})");
+    }
+
+    #[test]
+    fn full_solve_with_zone_mask_differs_from_plain_solve() {
+        // End-to-end regression test, not just the isolated subset_at check
+        // above -- this project's own history (zone_mask_update_survives_a_
+        // later_mask_update's regression) found that a masking mechanism
+        // combined correctly in isolation had still been silently defeated
+        // once run through a REAL Mesh::solve() alongside the boundary mask
+        // every real mesh also applies. This is that same class of check,
+        // now for the min-pixel-guarded subset_at end to end.
+        let (mut mesh1, seed1, cfg1) = make_test_mesh_and_solve_inputs();
+        let (mut mesh2, seed2, cfg2) = make_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(10).unwrap();
+
+        mesh1.solve(&local_mask, &seed1, &cfg1, None).unwrap();
+        let sol1 = Arc::clone(mesh1.solution().unwrap());
+
+        // Left/right split zone label over the full 100x100 texture -- with
+        // circle(10) subsets and a boundary spanning 20..80, plenty of nodes
+        // should straddle x=50.
+        let mut zone = Array2::<u8>::from_elem((100, 100), 1u8);
+        zone.slice_mut(s![.., 50..]).fill(2);
+        let tmpl = SubsetTemplate { local_mask: &local_mask, zone_mask: Some(zone.view()) };
+        mesh2.solve_impl(&tmpl, &seed2, &cfg2, None).unwrap();
+        let sol2 = Arc::clone(mesh2.solution().unwrap());
+
+        let n_diff = (0..sol1.p.nrows())
+            .filter(|&i| {
+                (0..sol1.p.ncols()).any(|k| (sol1.p[[i, k]] - sol2.p[[i, k]]).abs() > 1e-9)
+            })
+            .count();
+        assert!(n_diff > 0, "a real left/right zone split should change at least some nodes");
+    }
+
+    // -----------------------------------------------------------------------
+    // Masking::Zonal end-to-end (geopyv_dev_fresh/solver_options_restructure.md
+    // §4's Stage B) -- the full classify-from-a-real-strain-field pipeline,
+    // not a hand-supplied zone_mask array like the test above.
+    // -----------------------------------------------------------------------
+
+    /// Step-discontinuity texture: rows `0..split_row` shift by `u_top`,
+    /// rows `split_row..` shift by `u_bottom` -- a genuine horizontal-
+    /// displacement discontinuity localised at `split_row`, so nodes near
+    /// it have real, elevated shear strain relative to nodes far from it
+    /// (unlike `shift_image_uniform`'s uniform shift, which has ~zero
+    /// strain everywhere and so nothing for a magnitude-threshold
+    /// classifier to distinguish).
+    fn shift_image_band(src: &Array2<f64>, split_row: usize, u_top: f64, u_bottom: f64) -> Array2<f64> {
+        let (h, w) = src.dim();
+        let mut out = Array2::<f64>::zeros((h, w));
+        for y in 0..h {
+            let u = if y < split_row { u_top } else { u_bottom };
+            for x in 0..w {
+                let src_x = x as f64 - u;
+                let x0 = src_x.floor();
+                let frac = src_x - x0;
+                let x0i = (x0.max(0.0) as usize).min(w - 1);
+                let x1i = ((x0 + 1.0).max(0.0) as usize).min(w - 1);
+                out[[y, x]] = src[[y, x0i]] * (1.0 - frac) + src[[y, x1i]] * frac;
+            }
+        }
+        out
+    }
+
+    fn make_band_test_mesh_and_solve_inputs() -> (Mesh, SeedConfig, SolveConfig) {
+        let size = 100usize;
+        let texture = make_synthetic_texture_mesh(size);
+        let shifted = shift_image_band(&texture, 50, 1.5, -1.5);
+        let ref_img = Arc::new(Image::from_array(texture, 15));
+        let tar_img = Arc::new(Image::from_array(shifted, 15));
+
+        // A FIXED structured grid built directly (not `Mesh::new`, whose
+        // Ruppert refinement is not deterministic across calls) -- the
+        // gradient-watershed classifier is sensitive enough to node
+        // placement that an A/B test needs identical nodes on both sides
+        // (see project_geopyv_zone_masking.md). 7.5px spacing over 20..80,
+        // denser than make_test_mesh_and_solve_inputs so "near the band" vs
+        // "far" has enough nodes to separate.
+        let n_side = 9usize;
+        let at = |k: usize| 20.0 + 7.5 * k as f64;
+        let nodes = Array2::from_shape_fn((n_side * n_side, 2), |(i, j)| {
+            if j == 0 { at(i % n_side) } else { at(i / n_side) }
+        });
+        let id = |c: usize, r: usize| r * n_side + c;
+        let mut elems: Vec<usize> = Vec::new();
+        for r in 0..n_side - 1 {
+            for c in 0..n_side - 1 {
+                elems.extend_from_slice(&[id(c, r), id(c + 1, r), id(c, r + 1)]);
+                elems.extend_from_slice(&[id(c + 1, r), id(c + 1, r + 1), id(c, r + 1)]);
+            }
+        }
+        let elements = Array2::from_shape_vec((elems.len() / 3, 3), elems).unwrap();
+        let boundary: Vec<usize> = (0..n_side * n_side)
+            .filter(|&i| {
+                let (c, r) = (i % n_side, i / n_side);
+                c == 0 || r == 0 || c == n_side - 1 || r == n_side - 1
+            })
+            .collect();
+        let corners = array![[20.0, 20.0], [80.0, 20.0], [80.0, 80.0], [20.0, 80.0]];
+        let roi = meshing::define_roi(corners.view(), false, &[], &[], Some((size, size)));
+        let mesh = Mesh {
+            nodes,
+            elements,
+            boundary,
+            exclusions: vec![],
+            mesh_order: 1,
+            mask: roi.mask,
+            f_img: Arc::clone(&ref_img),
+            g_img: Arc::clone(&tar_img),
+            solution: None,
+        };
+
+        // Seeded well clear of the y=50 discontinuity (circle(6) subsets,
+        // seeded at y=30 -- 20px clearance) so the seed node itself isn't
+        // straddling the band.
+        let seed = SeedConfig { coord: [50.0, 30.0], warp: vec![0.0; 6], tolerance: 0.5 };
+        let cfg = SolveConfig {
+            tolerance: 0.5, subset_order: 1, override_active: true, ..Default::default()
+        };
+        (mesh, seed, cfg)
+    }
+
+    #[test]
+    fn solve_zonal_masking_changes_results_for_a_real_step_discontinuity() {
+        let (mut mesh1, seed1, cfg1) = make_band_test_mesh_and_solve_inputs();
+        let (mut mesh2, seed2, cfg2) = make_band_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(6).unwrap();
+
+        mesh1.solve(&local_mask, &seed1, &cfg1, None).unwrap();
+        let sol1 = Arc::clone(mesh1.solution().unwrap());
+
+        let cfg2z = SolveConfig {
+            masking: Masking::Zonal(ZonalConfig {
+                // MeshlessParams::default()'s radius (50px) is much larger
+                // than this test mesh's own ~8px node spacing (60 nodes
+                // over a 60x60 boundary) -- it would average over almost
+                // the whole mesh and smooth the localised band signal away
+                // entirely (confirmed: with the default radius, 0/57 nodes
+                // ever differ). A radius tied to this mesh's own density,
+                // matching how the rest of this project always scales
+                // MeshlessParams to the mesh it's used on, not a fixed
+                // constant.
+                meshless_params: MeshlessParams { radius: 15.0, ..MeshlessParams::default() },
+                k: 1.0,
+                smoothing_sigma: None,
+                iterations: 1,
+                zone_map: None,
+            }),
+            ..cfg2
+        };
+        mesh2.solve(&local_mask, &seed2, &cfg2z, None).unwrap();
+        let sol2 = Arc::clone(mesh2.solution().unwrap());
+
+        let n_diff = (0..sol1.p.nrows())
+            .filter(|&i| (0..sol1.p.ncols()).any(|k| (sol1.p[[i, k]] - sol2.p[[i, k]]).abs() > 1e-9))
+            .count();
+        assert!(n_diff > 0,
+            "a real step-discontinuity mesh, solved via masking=Zonal end to end, should \
+             classify at least some nodes onto interface ridges and change their result \
+             relative to a plain solve -- got 0/{} nodes differing", sol1.p.nrows());
+
+        // Mean C_ZNCC is the standard summary this project's whole masking
+        // track uses (zone_mask_trial.py, benchmark.py) -- report it as a
+        // real (if modest, per this project's own history) sanity check,
+        // not just "did anything change at all".
+        let mean1 = sol1.c_zncc.mean().unwrap();
+        let mean2 = sol2.c_zncc.mean().unwrap();
+        eprintln!(
+            "solve_zonal_masking numeric observation: n_diff={}/{}, mean_c_zncc plain={:.6} \
+             zonal={:.6}, min_c_zncc plain={:.6} zonal={:.6}",
+            n_diff, sol1.p.nrows(), mean1, mean2,
+            sol1.c_zncc.iter().cloned().fold(f64::INFINITY, f64::min),
+            sol2.c_zncc.iter().cloned().fold(f64::INFINITY, f64::min),
+        );
+        assert!(mean1.is_finite() && mean2.is_finite());
+    }
+
+    #[test]
+    fn changed_zone_pixel_frac_is_label_invariant_and_counts_real_moves() {
+        let a = Array2::from_shape_vec((2, 3), vec![1u8, 1, 1, 2, 2, 2]).unwrap();
+        // Same partition, relabelled -> 0 changed.
+        let b = Array2::from_shape_vec((2, 3), vec![7u8, 7, 7, 3, 3, 3]).unwrap();
+        assert_eq!(changed_zone_pixel_frac(&a, &b), 0.0);
+
+        // One of six pixels genuinely moved regime.
+        let c = Array2::from_shape_vec((2, 3), vec![1u8, 1, 2, 2, 2, 2]).unwrap();
+        assert!((changed_zone_pixel_frac(&a, &c) - 1.0 / 6.0).abs() < 1e-12);
+
+        // Total re-partition (checkerboard vs stripes).
+        let d = Array2::from_shape_vec((2, 3), vec![1u8, 2, 1, 2, 1, 2]).unwrap();
+        assert!(changed_zone_pixel_frac(&a, &d) > 0.3);
+
+        // Shape mismatch / empty -> 0, no panic.
+        assert_eq!(
+            changed_zone_pixel_frac(&Array2::zeros((0, 0)), &Array2::zeros((0, 0))),
+            0.0
+        );
+        assert_eq!(
+            changed_zone_pixel_frac(&a, &Array2::<u8>::zeros((3, 3))),
+            0.0
+        );
+    }
+
+    #[test]
+    fn zonal_iterations_1_is_identical_to_single_pass() {
+        // `iterations = 1` must run the classifier loop body exactly once
+        // and produce a byte-identical zone_image / node_zone / solution to
+        // the pre-iterator code path. (Shares the band test mesh -- if that
+        // mesh regresses upstream this will surface it, but the point here
+        // is `iterations = 1` == default == no change.)
+        let base = || SolveConfig {
+            masking: Masking::Zonal(ZonalConfig {
+                meshless_params: MeshlessParams { radius: 15.0, ..MeshlessParams::default() },
+                k: 1.0,
+                smoothing_sigma: None,
+                iterations: 1,
+                zone_map: None,
+            }),
+            ..make_band_test_mesh_and_solve_inputs().2
+        };
+        let local_mask = LocalMask::circle(6).unwrap();
+
+        let (mut m1, s1, _) = make_band_test_mesh_and_solve_inputs();
+        m1.solve(&local_mask, &s1, &base(), None).unwrap();
+        let r1 = Arc::clone(m1.solution().unwrap());
+
+        let (mut m2, s2, _) = make_band_test_mesh_and_solve_inputs();
+        m2.solve(&local_mask, &s2, &base(), None).unwrap();
+        let r2 = Arc::clone(m2.solution().unwrap());
+
+        assert_eq!(r1.p, r2.p, "iterations=1 must be deterministic / unchanged");
+        let (z1, z2) = (
+            r1.zonal_masking.as_ref().map(|z| &z.zone_image),
+            r2.zonal_masking.as_ref().map(|z| &z.zone_image),
+        );
+        assert_eq!(z1, z2);
+    }
+
+    #[test]
+    fn zonal_iterations_gt_1_tightens_the_boundary() {
+        // The zone-aware refit should place `node_boundary`-flagged nodes
+        // CLOSER to the true y = 50 step than a single pass. Metric: the
+        // spread (std dev) of ridge nodes' |y - 50|.
+        let (mut m1, s1, cfg) = make_band_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(6).unwrap();
+        let mk = |iters| SolveConfig {
+            masking: Masking::Zonal(ZonalConfig {
+                meshless_params: MeshlessParams { radius: 15.0, ..MeshlessParams::default() },
+                k: 1.0,
+                smoothing_sigma: None,
+                iterations: iters,
+                zone_map: None,
+            }),
+            ..cfg.clone()
+        };
+        m1.solve(&local_mask, &s1, &mk(1), None).unwrap();
+        let (mut m3, s3, _) = make_band_test_mesh_and_solve_inputs();
+        m3.solve(&local_mask, &s3, &mk(4), None).unwrap();
+
+        let spread = |m: &Mesh| {
+            let rec = m.solution().unwrap().zonal_masking.clone().unwrap();
+            let nodes = m.nodes();
+            let dists: Vec<f64> = (0..rec.node_boundary.len())
+                .filter(|&i| rec.node_boundary[i])
+                .map(|i| (nodes[[i, 1]] - 50.0).abs())
+                .collect();
+            let n = dists.len().max(1) as f64;
+            let mean = dists.iter().sum::<f64>() / n;
+            (dists.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / n).sqrt()
+        };
+        let (s_1, s_4) = (spread(&m1), spread(&m3));
+        eprintln!("ridge-node |y-50| spread: iters=1 {s_1:.3}, iters=4 {s_4:.3}");
+        assert!(s_4 <= s_1 + 1e-6,
+            "zone-aware refit should not widen the ridge-node spread (1: {s_1}, 4: {s_4})");
+    }
+
+    #[test]
+    fn zonal_masking_record_is_populated_after_a_zonal_solve() {
+        let (mut mesh, seed, cfg) = make_band_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(6).unwrap();
+        let cfg_z = SolveConfig {
+            masking: Masking::Zonal(ZonalConfig {
+                meshless_params: MeshlessParams { radius: 15.0, ..MeshlessParams::default() },
+                k: 1.0,
+                smoothing_sigma: None,
+                iterations: 1,
+                zone_map: None,
+            }),
+            ..cfg
+        };
+        mesh.solve(&local_mask, &seed, &cfg_z, None).unwrap();
+        let sol = mesh.solution().unwrap();
+        let n = sol.nodes.nrows();
+
+        // Template metadata is recorded on every solve.
+        assert_eq!(sol.template_shape, Some(MaskShape::Circle));
+        let sizes = sol.template_sizes.as_ref().expect("template_sizes recorded");
+        assert_eq!(sizes.len(), n);
+        assert!(sizes.iter().all(|&s| s == 6));
+
+        let rec = sol.zonal_masking.as_ref().expect("zonal record populated");
+        assert_eq!(rec.node_gamma_max.len(), n);
+        assert_eq!(rec.node_gamma_max_grad.len(), n);
+        assert_eq!(rec.node_boundary.len(), n);
+        assert_eq!(rec.node_zone.len(), n);
+        assert_eq!(rec.node_pre_px.len(), n);
+        assert_eq!(rec.node_post_px.len(), n);
+        assert_eq!(rec.node_guard_fallback.len(), n);
+        assert_eq!(rec.zone_image.dim(), mesh.f_img.image_gs.dim());
+        assert!((rec.grad_cutoff - (rec.grad_median + rec.k * 1.4826 * rec.grad_mad)).abs() < 1e-12);
+        assert!(rec.node_gamma_max_grad.iter().all(|&g| g >= 0.0), "|∇γ| is a magnitude");
+        // A real step discontinuity at y=50 → at least 2 distinct regime
+        // zones (above the band, and the band/below).
+        let distinct: std::collections::HashSet<u32> =
+            rec.node_zone.iter().copied().collect();
+        assert!(distinct.len() >= 2,
+            "a step discontinuity should partition into >= 2 regime zones, got {}",
+            distinct.len());
+
+        for i in 0..n {
+            assert!(rec.node_post_px[i] <= rec.node_pre_px[i],
+                "post-cut px must not exceed pre-cut px (node {i})");
+            if rec.node_guard_fallback[i] {
+                // Guard tripped: the cut really was below 1/3 of pre.
+                assert!((rec.node_post_px[i] as f64) < (1.0 / 3.0) * (rec.node_pre_px[i] as f64));
+            }
+        }
+    }
+
+    #[test]
+    fn meshless_field_zone_aware_beats_zone_unaware_near_a_real_interface() {
+        // End-to-end: a real masking=Zonal solve on the y=50 step-shift band
+        // (u_true = 1.5 for y<50, -1.5 for y>=50), then two Fields built at
+        // the same mesh nodes -- zone_aware=false vs zone_aware=true -- to
+        // confirm zone-aware filtering actually recovers accuracy near the
+        // interface that the zone-agnostic meshless fit smooths away.
+        let (mut mesh, seed, cfg) = make_band_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(6).unwrap();
+        let cfg_z = SolveConfig {
+            masking: Masking::Zonal(ZonalConfig {
+                meshless_params: MeshlessParams { radius: 15.0, ..MeshlessParams::default() },
+                k: 1.0,
+                smoothing_sigma: None,
+                iterations: 1,
+                zone_map: None,
+            }),
+            ..cfg
+        };
+        mesh.solve(&local_mask, &seed, &cfg_z, None).unwrap();
+        let mesh_sol = Arc::clone(mesh.solution().unwrap());
+        let nodes = mesh_sol.nodes.clone();
+        let n = nodes.nrows();
+
+        let seq_sol = Arc::new(SequenceSolution::from_mesh_solution(Arc::clone(&mesh_sol)));
+        let coords = nodes.clone();
+        let volumes = Array1::<f64>::ones(n);
+
+        let make_field = |zone_aware: bool| {
+            let mut field = Field::new(
+                Arc::clone(&seq_sol),
+                FieldDistribution::Explicit { coordinates: coords.clone(), volumes: volumes.clone() },
+                false,
+                1.0,
+            ).unwrap();
+            let params = MeshlessParams { radius: 15.0, zone_aware, ..MeshlessParams::default() };
+            field.solve(0.0, true, None, StrainMethod::Meshless(params)).unwrap();
+            field
+        };
+        let field_unaware = make_field(false);
+        let field_aware = make_field(true);
+        let sol_unaware = field_unaware.solution().unwrap();
+        let sol_aware = field_aware.solution().unwrap();
+
+        let u_true = |y: f64| if y < 50.0 { 1.5 } else { -1.5 };
+
+        // Restrict to particles within one meshless radius of the interface
+        // -- exactly the population the zone-agnostic fit blends across.
+        let mut err_unaware = Vec::new();
+        let mut err_aware = Vec::new();
+        for i in 0..n {
+            let y = nodes[[i, 1]];
+            if (y - 50.0).abs() >= 15.0 {
+                continue;
+            }
+            let truth = u_true(y);
+            let u_un = sol_unaware.particles[i].warps[[1, 0]];
+            let u_aw = sol_aware.particles[i].warps[[1, 0]];
+            err_unaware.push((u_un - truth).abs());
+            err_aware.push((u_aw - truth).abs());
+        }
+        assert!(!err_unaware.is_empty(), "test mesh should have nodes near the y=50 interface");
+
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let mean_unaware = mean(&err_unaware);
+        let mean_aware = mean(&err_aware);
+        assert!(
+            mean_aware < mean_unaware,
+            "zone-aware meshless fit should recover accuracy near a real interface: \
+             mean |u error| zone_aware=false: {mean_unaware:.4}, zone_aware=true: {mean_aware:.4} \
+             (n={})", err_unaware.len(),
+        );
+    }
+
+    #[test]
+    fn zonal_masking_record_is_none_after_a_uniform_solve() {
+        let (mut mesh, seed, cfg) = make_band_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(6).unwrap();
+        mesh.solve(&local_mask, &seed, &cfg, None).unwrap();
+        let sol = mesh.solution().unwrap();
+        assert!(sol.zonal_masking.is_none());
+        // ...but the template metadata is still there.
+        assert_eq!(sol.template_shape, Some(MaskShape::Circle));
+        assert!(sol.template_sizes.as_ref().is_some_and(|s| s.iter().all(|&v| v == 6)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Preconditioning::LayerRg (geopyv_dev_fresh/layer_rg_plan.md)
+    // -----------------------------------------------------------------------
+
+    fn layer_rg_cfg(base: &SolveConfig, batch_factor: usize, eps: f64) -> SolveConfig {
+        SolveConfig {
+            preconditioning: Preconditioning::LayerRg,
+            layer_rg: LayerRgConfig { batch_factor, root_rel_eps: eps, max_workers: None },
+            ..base.clone()
+        }
+    }
+
+    /// §6.3: `LayerRg` agrees with serial `Rg` within Tier C, and matches
+    /// exactly on `quality_ok` and the seed node.
+    #[test]
+    fn layer_rg_matches_serial_rg_within_tier_c() {
+        let (mut m_rg, seed, cfg) = make_test_mesh_and_solve_inputs();
+        let local_mask = LocalMask::circle(8).unwrap();
+        m_rg.solve(&local_mask, &seed, &cfg, None).unwrap();
+        let a = Arc::clone(m_rg.solution().unwrap());
+
+        let (mut m_lrg, seed2, cfg2) = make_test_mesh_and_solve_inputs();
+        m_lrg.solve(&local_mask, &seed2, &layer_rg_cfg(&cfg2, 4, 0.02), None).unwrap();
+        let b = Arc::clone(m_lrg.solution().unwrap());
+
+        assert_eq!(a.seed_node, b.seed_node, "seed node must match");
+        assert_eq!(a.p.nrows(), b.p.nrows());
+        for i in 0..a.p.nrows() {
+            let du = (a.displacements[[i, 0]] - b.displacements[[i, 0]]).abs();
+            let dv = (a.displacements[[i, 1]] - b.displacements[[i, 1]]).abs();
+            let scale = a.displacements[[i, 0]].abs().max(a.displacements[[i, 1]].abs()).max(1.0);
+            assert!(
+                du <= 1e-5 * scale && dv <= 1e-5 * scale,
+                "node {i}: displacement diff ({du}, {dv}) exceeds Tier C"
+            );
+            let dc = (a.c_zncc[i] - b.c_zncc[i]).abs();
+            assert!(dc <= 1e-5, "node {i}: c_zncc diff {dc} exceeds Tier C");
+        }
+    }
+
+    /// §6.6: `LayerRg` is run-to-run deterministic (byte-identical p/c_zncc).
+    #[test]
+    fn layer_rg_is_deterministic() {
+        let local_mask = LocalMask::circle(8).unwrap();
+        let mut prev: Option<Arc<MeshSolution>> = None;
+        for _ in 0..3 {
+            let (mut m, seed, cfg) = make_test_mesh_and_solve_inputs();
+            m.solve(&local_mask, &seed, &layer_rg_cfg(&cfg, 4, 0.02), None).unwrap();
+            let sol = Arc::clone(m.solution().unwrap());
+            if let Some(p) = &prev {
+                assert_eq!(p.p, sol.p, "LayerRg p not run-to-run identical");
+                assert_eq!(p.c_zncc, sol.c_zncc, "LayerRg c_zncc not run-to-run identical");
+                assert_eq!(p.iterations, sol.iterations);
+            }
+            prev = Some(sol);
+        }
+    }
+
+    /// §6.5: `batch_factor = 1` (one root, minimal batching) is still a
+    /// valid RG order — within Tier C of serial `Rg`.
+    #[test]
+    fn layer_rg_batch_factor_1_matches_rg() {
+        let local_mask = LocalMask::circle(8).unwrap();
+        let (mut m_rg, seed, cfg) = make_test_mesh_and_solve_inputs();
+        m_rg.solve(&local_mask, &seed, &cfg, None).unwrap();
+        let a = Arc::clone(m_rg.solution().unwrap());
+
+        let (mut m_lrg, seed2, cfg2) = make_test_mesh_and_solve_inputs();
+        m_lrg.solve(&local_mask, &seed2, &layer_rg_cfg(&cfg2, 1, 0.0), None).unwrap();
+        let b = Arc::clone(m_lrg.solution().unwrap());
+
+        for i in 0..a.p.nrows() {
+            assert!((a.c_zncc[i] - b.c_zncc[i]).abs() <= 1e-5, "node {i} c_zncc");
+        }
+    }
+
+    /// §3.3: `greedy_graph_colour` produces a proper colouring — no edge
+    /// joins two same-colour candidates — and is deterministic.
+    #[test]
+    fn greedy_graph_colour_is_proper_and_deterministic() {
+        let (mesh, _seed, _cfg) = make_test_mesh_and_solve_inputs();
+        let adj = Adjacency::build(&mesh.elements, mesh.mesh_order, mesh.nodes.nrows());
+        // Use every node as a candidate — the densest possible conflict graph.
+        let candidates: Vec<usize> = (0..mesh.nodes.nrows()).collect();
+        let c1 = greedy_graph_colour(&adj, &candidates);
+        let c2 = greedy_graph_colour(&adj, &candidates);
+        assert_eq!(c1, c2, "colouring must be deterministic");
+        for &i in &candidates {
+            for &nb in adj.get(i, true) {
+                assert_ne!(
+                    c1[i], c1[nb],
+                    "edge ({i},{nb}) joins two colour-{} nodes", c1[i]
+                );
+            }
+        }
+    }
+
+    // NOTE: a test forcing pass 2 specifically to fail (with pass 1 already
+    // succeeded) is NOT included here -- engineering a real pass-2-only
+    // failure through the public solve_zonal_masking_impl surface turned
+    // out to need either mocking solve_impl or a hard-to-construct
+    // mesh-compatibility edge case (pass 2 hardcodes override_active=true,
+    // so the ordinary quality-gate failure modes are already bypassed; see
+    // solve_zonal_masking_impl's own deviation note in the implementation
+    // report). The fallback logic itself (`Err(_) => { self.solution =
+    // Some(pass1_solution); Ok(()) }`) is implemented per the plan's
+    // decision, but only verified by code inspection in this pass, not by
+    // a forced-failure test -- flagged honestly rather than shipped with a
+    // test that doesn't actually exercise the branch it claims to.
 }

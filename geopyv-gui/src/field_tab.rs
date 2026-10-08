@@ -1401,7 +1401,7 @@ fn run_solve(
 
     set_progress(&state, 0.15, "Solving field\u{2026}");
 
-    if let Err(e) = field.solve(params.factor, params.true_incs, None) {
+    if let Err(e) = field.solve(params.factor, params.true_incs, None, geopyv_dev::particle::StrainMethod::Mesh) {
         set_error(&state, format!("Solve error: {e}"));
         return;
     }

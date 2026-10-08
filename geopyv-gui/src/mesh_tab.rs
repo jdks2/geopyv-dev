@@ -1459,6 +1459,9 @@ fn run_solve(
             SolveMethod::Fagn => LibSolveMethod::Fagn,
         },
         override_active: false,
+        detect_shear_band: false,
+        shear_band_theta_steps: 36,
+        ..Default::default()
     };
     let seed_warp = vec![0.0f64; 6 * p_len];
     let seed_cfg = SeedConfig {

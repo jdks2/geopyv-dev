@@ -5,7 +5,12 @@ Tolerance tiers (per plan):
   Tier B  rtol=1e-8   B-spline intensity interpolation
   Tier C  rtol=1e-5   Solver outputs (ZNCC, warp at convergence)
 
-Golden values were captured from the original geopyv Python package.
+Golden values are captured from geopyv_dev.  They do NOT match the original
+geopyv Python package: geopyv_dev's B-spline prefilter
+(`image.rs::build_kernel`) corrects a one-sample kernel-phase error in
+geopyv's `image.py::_get_C` that shifts every interpolated intensity by
+(1, 1) px.  Reference-subset quantities (f_m, delta_f, sssig, ...) and the
+converged translation therefore differ from geopyv by that one-pixel offset.
 """
 
 import os
@@ -38,25 +43,25 @@ RADIUS = 25
 BORDER = 20
 
 GOLDEN_N_PX = 1961
-GOLDEN_F_M = 70.8558139299
-GOLDEN_DELTA_F = 3179.3809800153
-GOLDEN_SSSIG = 420037.8754963874
-GOLDEN_SIGMA_INT = 71.7965829255
+GOLDEN_F_M = 72.4607678591
+GOLDEN_DELTA_F = 3166.7538783369
+GOLDEN_SSSIG = 430193.4940805415
+GOLDEN_SIGMA_INT = 71.5114385032
 
-GOLDEN_ICGN_O1_ZNCC = 0.999987
+GOLDEN_ICGN_O1_ZNCC = 0.9999868056
 GOLDEN_ICGN_O1_ITERS = 3
 GOLDEN_ICGN_O1_P = [
-    3.41341653e-02, 3.53146414e-02,
-    9.80768226e-05, -9.05461037e-05,
-    2.90342155e-05, -8.11538336e-05,
+    3.38914761e-02, 3.51348955e-02,
+    9.94055325e-05, -5.21745977e-05,
+    4.29306692e-05, -5.84241277e-05,
 ]
 
-GOLDEN_FAGN_O1_ZNCC = 0.999987
+GOLDEN_FAGN_O1_ZNCC = 0.9999868042
 GOLDEN_FAGN_O1_ITERS = 3
 GOLDEN_FAGN_O1_P = [
-    3.36763959e-02, 3.45660975e-02,
-    9.56551027e-05, -8.60159524e-05,
-    2.57900894e-05, -7.25744604e-05,
+    3.34467004e-02, 3.44336229e-02,
+    9.55317604e-05, -5.02131885e-05,
+    4.17281040e-05, -4.96162986e-05,
 ]
 
 pytestmark = pytest.mark.skipif(
@@ -340,10 +345,16 @@ class TestSolveDispatcher:
         s = Subset(COORD, tmpl, ref_img, tar_img)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
+            # algorithm= is itself a deprecated alias for solver= (see
+            # solver_options_restructure.md §2) -- using it here (rather
+            # than solver=) additionally emits a DeprecationWarning, on top
+            # of the UserWarning this test actually checks for.
             s.solve(algorithm="unknown_algo")
-        assert len(w) == 1
-        assert issubclass(w[0].category, UserWarning)
-        assert "unknown_algo" in str(w[0].message).lower()
+        user_warnings = [x for x in w if issubclass(x.category, UserWarning)
+                         and not issubclass(x.category, DeprecationWarning)]
+        assert len(user_warnings) == 1
+        assert "unknown_algo" in str(user_warnings[0].message).lower()
+        assert any(issubclass(x.category, DeprecationWarning) for x in w)
         assert s.solved
 
     def test_case_insensitive(self, ref_img, tar_img, tmpl):
@@ -352,6 +363,89 @@ class TestSolveDispatcher:
         s2 = Subset(COORD, tmpl, ref_img, tar_img)
         s2.solve(algorithm="icgn")
         assert s1.c_zncc == pytest.approx(s2.c_zncc, rel=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Warp-adequacy diagnostic (eta_u/eta_v, residual_map) -- order-1 and order-2.
+#
+# Real photographed ref.jpg/tar.jpg at this coord/radius is a near-rigid,
+# well-converged case (GOLDEN_ICGN_O1_ZNCC ~ 0.999987) -- i.e. the "adequate"
+# side of the report's adequate/under-fit split, so both eta and the
+# residual map should be small, not merely "some finite number". This
+# doesn't exercise the "under-fit" side (that needs a manufactured
+# quadratic/localised-displacement image pair, not the fixed real fixture
+# images this test module uses) -- see the plan discussion for that gap.
+#
+# Order-2's omitted modes are cubic, not the report's own (order-1,
+# quadratic) case -- see `omitted_mode_diagnostic`'s doc comment in
+# `src/subset.rs` for the caveat that this extension isn't itself validated
+# by the report.
+# ---------------------------------------------------------------------------
+
+
+class TestWarpAdequacyDiagnostic:
+    def test_eta_present_for_order1(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        s.solve(algorithm="icgn")
+        assert s.eta_u is not None
+        assert s.eta_v is not None
+        assert s.eta_u >= 0.0
+        assert s.eta_v >= 0.0
+
+    def test_eta_present_for_order2(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=2)
+        s.solve(algorithm="icgn")
+        assert s.eta_u is not None
+        assert s.eta_v is not None
+        assert s.eta_u >= 0.0
+        assert s.eta_v >= 0.0
+
+    def test_eta_none_when_unsolved(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        assert s.eta_u is None
+        assert s.eta_v is None
+
+    def test_eta_small_for_well_converged_real_subset(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        s.solve(algorithm="icgn")
+        assert s.eta_u < 0.5
+        assert s.eta_v < 0.5
+
+    def test_eta_small_for_well_converged_real_subset_order2(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=2)
+        s.solve(algorithm="icgn")
+        assert s.eta_u < 0.5
+        assert s.eta_v < 0.5
+
+    def test_eta_fagn_also_populated(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        s.solve(algorithm="fagn")
+        assert s.eta_u is not None
+        assert s.eta_v is not None
+
+    def test_residual_map_shape_matches_n_px(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        s.solve(algorithm="icgn")
+        residual = s.residual_map()
+        assert residual.shape == (s.n_px,)
+
+    def test_residual_map_small_for_well_converged_real_subset(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        s.solve(algorithm="icgn")
+        residual = s.residual_map()
+        assert np.abs(residual).mean() < 0.1
+
+    def test_residual_map_raises_when_unsolved(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        with pytest.raises(Exception):
+            s.residual_map()
+
+    def test_inspect_residual_does_not_raise(self, ref_img, tar_img, tmpl):
+        import matplotlib.pyplot as plt
+        s = Subset(COORD, tmpl, ref_img, tar_img)
+        s.solve(algorithm="icgn")
+        fig, ax = s.inspect(residual=True, show=False, block=False)
+        plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +518,8 @@ class TestSaveLoad:
             for got, exp in zip(loaded.p, s.p):
                 assert got == pytest.approx(exp, rel=1e-12)
             assert loaded.solved is True
+            assert loaded.eta_u == pytest.approx(s.eta_u, rel=1e-12)
+            assert loaded.eta_v == pytest.approx(s.eta_v, rel=1e-12)
         finally:
             os.unlink(path)
 
@@ -466,3 +562,4 @@ class TestSolverConsistency:
         sf.solve(algorithm="fagn")
         assert abs(si.p[0] - sf.p[0]) < 1e-3
         assert abs(si.p[1] - sf.p[1]) < 1e-3
+

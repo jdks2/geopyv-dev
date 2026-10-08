@@ -72,9 +72,26 @@ impl PyImage {
     /// Pre-computed Q·C_block·Qᵀ matrix; shape (H*6, W*6), dtype float64.
     ///
     /// The B-spline block for pixel (i, j) is `qcqt[i*6:i*6+6, j*6:j*6+6]`.
+    ///
+    /// Internally the core stores this block-contiguous `(H, W, 36)`
+    /// (`layer_rg_plan.md` §11.5); this getter re-interleaves to the
+    /// historical `(H*6, W*6)` layout so the Python-visible shape and
+    /// block-indexing convention are unchanged.
     #[getter]
     fn qcqt<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.inner.qcqt.clone().into_pyarray_bound(py)
+        let q3 = &self.inner.qcqt; // (rows, cols, 36), block-contiguous
+        let (rows, cols, _) = q3.dim();
+        let mut out = numpy::ndarray::Array2::<f64>::zeros((rows * 6, cols * 6));
+        for i in 0..rows {
+            for j in 0..cols {
+                for r in 0..6 {
+                    for c in 0..6 {
+                        out[[i * 6 + r, j * 6 + c]] = q3[[i, j, r * 6 + c]];
+                    }
+                }
+            }
+        }
+        out.into_pyarray_bound(py)
     }
 
     /// Border padding used during B-spline coefficient computation.

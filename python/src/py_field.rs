@@ -10,7 +10,7 @@ use ndarray::Array2;
 
 use geopyv_dev::sequence::SequenceSolution;
 
-use crate::{py_calibration::PyCalibrationParams, py_mesh::PyMesh, py_particle::PyParticle, py_sequence::PySequence, Error};
+use crate::{py_calibration::PyCalibrationParams, py_mesh::PyMesh, py_particle::{PyParticle, strain_method_from_py}, py_sequence::PySequence, Error};
 
 // ---------------------------------------------------------------------------
 // FieldSolution class
@@ -124,20 +124,7 @@ impl PyField {
                 let mesh_sol = mesh.inner.solution().ok_or_else(|| {
                     pyo3::exceptions::PyRuntimeError::new_err("Mesh has not been solved")
                 })?;
-                Arc::new(SequenceSolution {
-                    mesh_solutions: vec![mesh_sol.clone()],
-                    mesh_paths: vec![],
-                    all_converged: true,
-                    unsolvable: false,
-                    override_log: vec![],
-                    reference_updates: vec![false],
-                    mesh_order: mesh_sol.mesh_order,
-                    first_f_img_path: Some(mesh_sol.f_img_path.clone()),
-                    boundary_region: geopyv_dev::sequence::default_boundary_region(),
-                    exclusion_regions: vec![],
-                    options: None,
-                    border: 0,
-                })
+                Arc::new(SequenceSolution::from_mesh_solution(mesh_sol.clone()))
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
                     "sequence_solution must be a solved Sequence or a solved Mesh",
@@ -165,16 +152,25 @@ impl PyField {
     ///     Volumetric correction factor. Default 0.0.
     /// true_incs : bool, optional
     ///     Logarithmic strain increments. Default ``True``.
-    #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None))]
+    /// strain_method : MeshlessParams or False, optional
+    ///     ``None`` (default): meshless (IRLS-robust MLS) strain estimator
+    ///     with default ``MeshlessParams`` -- the package-wide default. A
+    ///     ``MeshlessParams`` instance: meshless with those parameters.
+    ///     ``False``: force the original mesh-element (shape-function)
+    ///     interpolation instead -- retained for comparison, no longer the
+    ///     default.
+    #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None, strain_method=None))]
     fn solve(
         &mut self,
         factor: f64,
         true_incs: bool,
         calibration: Option<Bound<'_, PyCalibrationParams>>,
+        strain_method: Option<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let borrowed = calibration.as_ref().map(|b| b.borrow());
         let cal = borrowed.as_ref().map(|b| &b.inner);
-        Ok(self.inner.solve(factor, true_incs, cal).map_err(Error::from)?)
+        let sm = strain_method_from_py(strain_method.as_ref())?;
+        Ok(self.inner.solve(factor, true_incs, cal, sm).map_err(Error::from)?)
     }
 
     #[getter]

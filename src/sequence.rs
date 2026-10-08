@@ -190,6 +190,30 @@ pub fn default_boundary_region() -> Region {
 fn default_mesh_order() -> u8 { 1 }
 
 impl SequenceSolution {
+    /// Wrap a single solved [`MeshSolution`] as a degenerate one-pair
+    /// `SequenceSolution` — the shim `Field::new` needs to treat "a solved
+    /// `Mesh`" as "a solved `Sequence` of one pair" so the same strain-path
+    /// machinery serves both. Extracted from `python/src/py_field.rs`'s
+    /// `PyField::new` (behaviour-preserving refactor — same fields, same
+    /// values) so `Mesh::solve_zonal_masking_impl` can build the identical
+    /// wrapper Rust-to-Rust, with no PyO3 round-trip.
+    pub fn from_mesh_solution(mesh_sol: Arc<MeshSolution>) -> Self {
+        SequenceSolution {
+            mesh_order: mesh_sol.mesh_order,
+            first_f_img_path: Some(mesh_sol.f_img_path.clone()),
+            mesh_solutions: vec![mesh_sol],
+            mesh_paths: vec![],
+            all_converged: true,
+            unsolvable: false,
+            override_log: vec![],
+            reference_updates: vec![false],
+            boundary_region: default_boundary_region(),
+            exclusion_regions: vec![],
+            options: None,
+            border: 0,
+        }
+    }
+
     /// Number of mesh pairs, regardless of storage mode.
     pub fn n_meshes(&self) -> usize {
         if self.mesh_solutions.is_empty() {
@@ -726,7 +750,13 @@ pub fn deformation_preconditioning(
         Ok(p) => p,
         Err(_) => return ([0.0; 2], vec![0.0; 6 * subset_order as usize]),
     };
-    particle.solve_increment(0, sol, None);
+    // Pinned to mesh-element interpolation (not the meshless default):
+    // keeps reference-update preconditioning numerically unchanged.
+    let cfg = crate::particle::ParticleConfig {
+        strain_method: crate::particle::StrainMethod::Mesh,
+        ..Default::default()
+    };
+    particle.solve_increment(0, sol, &cfg, None);
 
     let p_len = 6 * mesh_order as usize;
     let warp_1: Vec<f64> = (0..p_len).map(|j| particle.warps[[1, j]]).collect();
@@ -902,6 +932,9 @@ mod tests {
             g_img_path: PathBuf::new(),
             solve_config: None,
             seed: None,
+            template_shape: None,
+            template_sizes: None,
+            zonal_masking: None,
         }
     }
 
@@ -1159,4 +1192,5 @@ mod tests {
 
         let _ = std::fs::remove_file(tmp);
     }
+
 }

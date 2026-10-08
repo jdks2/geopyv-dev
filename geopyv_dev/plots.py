@@ -5,6 +5,8 @@ import matplotlib.tri as tri
 from scipy.spatial import Delaunay
 from matplotlib.collections import LineCollection
 
+from . import _geopyv_dev as _core
+
 plt.rcParams["mathtext.fontset"] = "stix"
 matplotlib.rcParams["font.family"] = "STIXGeneral"
 
@@ -43,7 +45,19 @@ def _require_solved(obj):
         )
 
 
-def inspect_subset(subset, ax=None, show=True, block=True, save=False, **kwargs):
+def inspect_subset(subset, ax=None, show=True, block=True, save=False,
+                    residual=False, colorbar=True, **kwargs):
+    """Visualise a solved ``Subset``.
+
+    ``residual=True`` shows the converged per-pixel zero-normalised image
+    residual (recomputed on demand via ``Subset.residual_map()`` -- never
+    persisted, see ``omitted_mode_diagnostic`` in `src/subset.rs`) instead of
+    the reference-image crop, on a diverging colormap centred at zero. This
+    is the map the warp-adequacy score ``eta_u``/``eta_v`` is a projection
+    of: a spatially coherent patch of large residual within an otherwise
+    quiet subset is the signature the "partial masking" follow-up work
+    (`mds/...` -- see the plan) would cluster on.
+    """
     coord = subset.coord
     f_coords = np.asarray(subset.f_coords)
     f = np.asarray(subset.f)
@@ -55,6 +69,46 @@ def inspect_subset(subset, ax=None, show=True, block=True, save=False, **kwargs)
     template_shape = getattr(subset, 'template_shape', None)
     if template_size is None:
         template_size = int(np.ceil(np.sqrt(len(f) / np.pi)))
+
+    if residual:
+        values = np.asarray(subset.residual_map())
+        xi = f_coords[:, 0]
+        yi = f_coords[:, 1]
+        x_min = int(np.floor(xi.min()))
+        y_min = int(np.floor(yi.min()))
+        x_max = int(np.ceil(xi.max()))
+        y_max = int(np.ceil(yi.max()))
+        h = y_max - y_min + 1
+        w = x_max - x_min + 1
+        display = np.full((h, w), np.nan)
+        for k in range(len(values)):
+            ix = int(round(float(xi[k]))) - x_min
+            iy = int(round(float(yi[k]))) - y_min
+            if 0 <= iy < h and 0 <= ix < w:
+                display[iy, ix] = float(values[k])
+        vmax = np.nanmax(np.abs(display)) if np.isfinite(display).any() else 1.0
+        imshow_kwargs = {"cmap": "coolwarm", "vmin": -vmax, "vmax": vmax}
+        imshow_kwargs.update(kwargs)
+
+        owned = ax is None
+        if ax is None:
+            fig, ax = plt.subplots()
+        else:
+            fig = ax.get_figure()
+        im = ax.imshow(display, **imshow_kwargs)
+        if colorbar:
+            fig.colorbar(im, ax=ax, label="Residual (zn)")
+        eta_u = getattr(subset, 'eta_u', None)
+        eta_v = getattr(subset, 'eta_v', None)
+        if eta_u is not None and eta_v is not None:
+            label = f"η_u = {eta_u:.4f}; η_v = {eta_v:.4f}"
+        else:
+            label = "η not available (subset_order != 1, or unsolved)"
+        ax.text(0.5, -0.05, label, transform=ax.transAxes, ha="center")
+        ax.set_axis_off()
+        plt.tight_layout()
+        _show_save_close(fig, show, block, save, owned=owned)
+        return fig, ax
 
     # Build display image (square crop centred on subset)
     if f_img_path is not None:
@@ -109,34 +163,200 @@ def inspect_subset(subset, ax=None, show=True, block=True, save=False, **kwargs)
     return fig, ax
 
 
-def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None, show=True, block=True, save=False, **kwargs):
+def _load_img_gs(img_path):
+    """Grayscale reference image as float ndarray, or None if no path."""
+    if img_path is None:
+        return None
+    import cv2
+    return cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(float)
+
+
+def _render_template_crop(ax, img_gs, coord, size, shape, cut_coords=None):
+    """Draw a subset template as a square crop of ``img_gs`` centred on
+    ``coord`` (absolute ``[x, y]``); ``circle`` / ``semicircle`` templates
+    are masked to their own shape. ``cut_coords`` (absolute ``[x, y]`` from
+    :func:`_geopyv_dev.zoned_subset_footprint`) are the zone-removed pixels,
+    overlaid in red.
+
+    Mirrors :func:`inspect_subset`'s crop rendering; kept separate because
+    that function also has an image-less (f/f_coords) path meshes never hit.
+    """
+    x, y = float(coord[0]), float(coord[1])
+    r = int(size)
+    if img_gs is None:
+        blank = np.zeros((2 * r + 1, 2 * r + 1))
+        x0, y0 = int(round(x)) - r, int(round(y)) - r
+        x1, y1 = x0 + blank.shape[1], y0 + blank.shape[0]
+        display = blank
+    else:
+        h, w = img_gs.shape
+        x0, x1 = max(0, int(round(x)) - r), min(w, int(round(x)) + r + 1)
+        y0, y1 = max(0, int(round(y)) - r), min(h, int(round(y)) + r + 1)
+        display = img_gs[y0:y1, x0:x1].astype(float).copy()
+
+    hh, ww = display.shape
+    cy, cx = y - y0, x - x0
+    if shape in ("circle", "semicircle"):
+        row_idx, col_idx = np.ogrid[:hh, :ww]
+        outside = (row_idx - cy) ** 2 + (col_idx - cx) ** 2 > r ** 2
+        if shape == "semicircle":
+            outside = outside | (row_idx < cy)  # keep y-offset >= 0 (bottom half)
+        display[outside] = np.nan
+
+    ax.imshow(display, cmap="gist_gray", extent=[x0, x1, y1, y0])
+    if cut_coords is not None and len(cut_coords):
+        ax.scatter(cut_coords[:, 0], cut_coords[:, 1], s=10, c="red", marker="s",
+                   linewidths=0, alpha=0.55, zorder=5)
+    ax.scatter([x], [y], color="red", s=40, marker="x", zorder=6)
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y1, y0)
+    ax.set_axis_off()
+
+
+_ZONE_COLOURS = [
+    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4",
+    "#f032e6", "#bfef45", "#fabed4", "#469990", "#dcbeff", "#9a6324",
+    "#fffac8", "#800000", "#aaffc3", "#808000", "#ffd8b1", "#000075",
+]
+
+
+def _overlay_zone_map(ax, zonal, legend=True):
+    """Sharp, high-contrast per-zone colour overlay + black zone-boundary
+    lines over the current axes.
+
+    Raw zone ids are sparse (connected-component labels: 1, 5, 21, ...), so
+    ``imshow``-ing them directly on a continuous colormap puts neighbouring
+    zones on near-identical colours. This remaps them to a dense range and
+    assigns each a distinct saturated hue.
+    """
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.patches import Patch
+
+    zi = np.asarray(zonal.zone_image)
+    ids = np.array(sorted(int(v) for v in np.unique(zi) if v != 0))
+    if ids.size == 0:
+        return
+    remap = np.zeros(int(zi.max()) + 1, dtype=int)
+    for k, zid in enumerate(ids):
+        remap[zid] = k
+    dense = np.ma.array(remap[zi], mask=(zi == 0))
+
+    colours = [_ZONE_COLOURS[k % len(_ZONE_COLOURS)] for k in range(ids.size)]
+    cmap = ListedColormap(colours)
+    norm = BoundaryNorm(np.arange(-0.5, ids.size + 0.5), ids.size)
+    ax.imshow(dense, cmap=cmap, norm=norm, alpha=0.5, interpolation="nearest")
+
+    # Crisp black boundary lines wherever the label changes. Contour on a
+    # coarsened copy -- marching-squares over a full 2000^2 grid is seconds
+    # per call and the lines only need to read as sharp, not pixel-exact.
+    if ids.size > 1:
+        h, w = zi.shape
+        step = max(1, int(round(max(h, w) / 700)))
+        lab = remap[zi][::step, ::step].astype(float)
+        ax.contour(np.arange(0, w, step), np.arange(0, h, step), lab,
+                   levels=np.arange(0.5, ids.size - 0.5),
+                   colors="k", linewidths=1.1)
+
+    if legend and ids.size > 1:
+        ax.legend(handles=[Patch(facecolor=c, edgecolor="k", label=f"zone {zid}")
+                           for c, zid in zip(colours, ids)],
+                  loc="upper right", fontsize=8, framealpha=0.9)
+
+
+def inspect_mesh(mesh, subset_idx=None, show_areas=False, zones=False, ax=None,
+                 show=True, block=True, save=False, **kwargs):
+    """Render the mesh over its reference image.
+
+    ``subset_idx`` : int, optional
+        Highlight one node. When the mesh records its subset template
+        (every solve from schema ``0x07`` on), and ``zones`` is not set,
+        the plot becomes a crop of that node's subset template (like
+        ``subset.inspect()``); for a zonally-solved mesh the zone-removed
+        template pixels are shaded red and the pre/post pixel counts,
+        ``|∇γ|`` and any minimum-pixel-guard fallback are captioned.
+    ``zones`` : bool, default False
+        Overlay the whole-image zone-label map from a
+        ``solver_options={"masking": "zonal"}`` solve. Raises
+        ``RuntimeError`` if the mesh was not solved that way (or its pass 2
+        fell back). When combined with ``subset_idx`` the chosen subset's
+        kept (green) / removed (red) footprint is drawn at its true
+        location on the full map.
+    """
     nodes = np.asarray(mesh.nodes)
     elements = np.asarray(mesh.elements)
     f_img_path = getattr(mesh, 'f_img_path', None)
+    zonal = getattr(mesh, 'zonal_masking', None)
+    tmpl_shape = getattr(mesh, 'template_shape', None)
+    tmpl_sizes = getattr(mesh, 'template_sizes', None)
+    if tmpl_sizes is not None:
+        tmpl_sizes = np.asarray(tmpl_sizes)
+
+    if zones and zonal is None:
+        raise RuntimeError(
+            "mesh was not solved with solver_options={'masking': 'zonal'} "
+            "(or its pass 2 fell back) -- no zone map to inspect"
+        )
 
     owned = ax is None
     if ax is None:
         fig, ax = plt.subplots()
     else:
         fig = ax.get_figure()
+
+    has_idx = subset_idx is not None and 0 <= subset_idx < len(nodes)
+
+    # --- Per-subset template crop (only when not showing the zone map) -----
+    if has_idx and not zones and tmpl_shape is not None and tmpl_sizes is not None:
+        coord = nodes[subset_idx]
+        size = int(tmpl_sizes[subset_idx])
+        img_gs = _load_img_gs(f_img_path)
+        cut = None
+        caption = f"Subset {subset_idx}: {tmpl_shape} r={size}"
+        if zonal is not None:
+            fp = _core.zoned_subset_footprint(
+                np.asarray(zonal.zone_image), [float(coord[0]), float(coord[1])],
+                str(tmpl_shape), size,
+            )
+            cut = np.asarray(fp["coords_cut"])
+            pre = int(np.asarray(zonal.node_pre_px)[subset_idx])
+            post = int(np.asarray(zonal.node_post_px)[subset_idx])
+            ggrad = float(np.asarray(zonal.node_gamma_max_grad)[subset_idx])
+            zid = int(np.asarray(zonal.node_zone)[subset_idx])
+            fell_back = bool(np.asarray(zonal.node_guard_fallback)[subset_idx])
+            caption = (f"Subset {subset_idx}  zone {zid}: kept {post}/{pre} px, "
+                       f"$|\\nabla\\gamma|$={ggrad:.3g}")
+            if fell_back:
+                caption += "  — GUARD FALLBACK (solved un-zoned)"
+        _render_template_crop(ax, img_gs, coord, size, str(tmpl_shape), cut_coords=cut)
+        ax.text(0.5, -0.06, caption, transform=ax.transAxes, ha="center")
+        plt.tight_layout()
+        _show_save_close(fig, show, block, save, owned=owned)
+        return fig, ax
+
+    # --- Full-mesh view --------------------------------------------------
     imshow_kwargs = {"cmap": "gist_gray"}
     imshow_kwargs.update(kwargs)
     _imshow_or_blank(ax, f_img_path, **imshow_kwargs)
 
-    # Element edges
-    n_corner = 3
-    for elem in elements:
-        corners = nodes[elem[:n_corner]]
-        for i in range(n_corner):
-            j = (i + 1) % n_corner
-            ax.plot([corners[i, 0], corners[j, 0]], [corners[i, 1], corners[j, 1]],
-                    'b-', linewidth=0.5)
+    if zones:
+        _overlay_zone_map(ax, zonal)
+    else:
+        # Element edges -- one LineCollection, not tens of thousands of
+        # ax.plot() calls (an 8000-node mesh has ~16k elements). Omitted
+        # under the zone overlay, where they only obscure the zones.
+        tri = nodes[elements[:, :3]]                   # (M, 3, 2)
+        segs = np.concatenate(
+            [tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=0)
+        ax.add_collection(LineCollection(
+            segs, colors="b", linewidths=0.5 if len(elements) <= 2000 else 0.2))
 
-    # Element index annotations
-    for i, elem in enumerate(elements):
-        cx = nodes[elem[:3], 0].mean()
-        cy = nodes[elem[:3], 1].mean()
-        ax.text(cx, cy, str(i), ha='center', va='center', color='red', fontsize=8)
+    if not zones and len(elements) <= 400:
+        # Element index annotations (skipped under the zone wash, and on a
+        # dense mesh where 10^4 labels are unreadable and slow anyway).
+        for i, elem in enumerate(elements):
+            cx = nodes[elem[:3], 0].mean()
+            cy = nodes[elem[:3], 1].mean()
+            ax.text(cx, cy, str(i), ha='center', va='center', color='red', fontsize=8)
 
     if show_areas:
         from matplotlib.patches import Circle as MplCircle
@@ -144,9 +364,22 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None, show=True, bl
         for nd in nodes:
             ax.add_patch(MplCircle((nd[0], nd[1]), radius, alpha=0.2, color='blue'))
 
-    if subset_idx is not None and subset_idx < len(nodes):
+    if has_idx:
         node = nodes[subset_idx]
         ax.scatter([node[0]], [node[1]], color='red', s=60, zorder=10)
+        if zones and zonal is not None and tmpl_shape is not None and tmpl_sizes is not None:
+            fp = _core.zoned_subset_footprint(
+                np.asarray(zonal.zone_image), [float(node[0]), float(node[1])],
+                str(tmpl_shape), int(tmpl_sizes[subset_idx]),
+            )
+            kept = np.asarray(fp["coords_kept"])
+            cut = np.asarray(fp["coords_cut"])
+            if len(kept):
+                ax.scatter(kept[:, 0], kept[:, 1], s=6, c="lime", marker="s",
+                           linewidths=0, alpha=0.5, zorder=8)
+            if len(cut):
+                ax.scatter(cut[:, 0], cut[:, 1], s=6, c="red", marker="s",
+                           linewidths=0, alpha=0.5, zorder=8)
 
     plt.tight_layout()
     _show_save_close(fig, show, block, save, owned=owned)
@@ -547,10 +780,37 @@ def trace_field(field, quantity="warps", component=0,
     return fig, ax
 
 
+def _reduce_series(v, dt, absolute):
+    """Collapse a per-increment scalar series (already window-sliced) to one
+    number, per contour_field's existing convention: dt=None -> last-minus-
+    first (or the sum of |increment deltas| if absolute), dt given -> mean
+    rate. Shared by every contour_field quantity, including each component
+    of gamma_max_grad's [dx, dy] pair."""
+    v = np.atleast_1d(v)
+    if dt is None:
+        if absolute:
+            return float(np.sum(np.abs(np.diff(v)))) if len(v) > 1 else 0.0
+        return float(v[-1] - v[0]) if len(v) > 1 else float(v[-1])
+    if len(v) > 1:
+        return float((v[-1] - v[0]) / (len(v) * dt))
+    return 0.0
+
+
 def contour_field(field, quantity, window=None, dt=None, absolute=False,
                    ax=None, show=True, block=True, save=False, **kwargs):
+    """gamma_max_grad requires the Field to have been solved via
+    Field.solve() with strain_method left as meshless (the default) --
+    the spatial gradient of gamma_max is computed once, at solve time,
+    directly from the mesh's own particle distribution (no new query grid),
+    using the exact MeshlessParams the solve itself used. There is no
+    meshless_params parameter here any more: a second, independently
+    supplied radius at plot time was the earlier design and is exactly
+    what previously risked a silent mismatch against the solve's own
+    radius -- see Particle.gamma_max_grad's docstring.
+    """
     _require_solved(field)
-    valid = {"u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol"}
+    valid = {"u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol",
+             "ep1", "ep2", "gamma_max", "theta_p", "gamma_max_grad"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
 
@@ -559,6 +819,8 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     coords = np.array([[p.coordinates[0, 0], p.coordinates[0, 1]] for p in particles])
 
     strain_col = {"ep_xx": 0, "ep_yy": 1, "ep_xy": 5}
+    # [ep1, ep2, gamma_max, theta_p] -- see particle::principal_strains.
+    principal_col = {"ep1": 0, "ep2": 1, "gamma_max": 2, "theta_p": 3}
 
     # Build window slice
     if window is not None:
@@ -571,6 +833,16 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
 
     values = np.zeros(n)
     for i, p in enumerate(particles):
+        if quantity == "gamma_max_grad":
+            # Pure lookup -- no post-computation. Raises via
+            # Particle.gamma_max_grad's own getter if this Field wasn't
+            # solved meshless (no silent NaN/garbage in the plot).
+            grad = np.asarray(p.gamma_max_grad)  # (inc_no, 2)
+            gx = _reduce_series(grad[w, 0], dt, absolute)
+            gy = _reduce_series(grad[w, 1], dt, absolute)
+            values[i] = float(np.hypot(gx, gy))
+            continue
+
         warps = np.asarray(p.warps)  # (inc_no, warp_len)
         vol_strains = np.asarray(p.vol_strains)
         strains = np.asarray(p.strains)  # (inc_no, 6)
@@ -585,18 +857,13 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
             v = strains[w, strain_col[quantity]]
         elif quantity == "ep_vol":
             v = vol_strains[w]
+        elif quantity in principal_col:
+            # Pure lookup -- computed once at solve time (see
+            # Particle.principal_strains), not re-derived here.
+            principal = np.asarray(p.principal_strains)  # (inc_no, 4)
+            v = principal[w, principal_col[quantity]]
 
-        v = np.atleast_1d(v)
-        if dt is None:
-            if absolute:
-                values[i] = float(np.sum(np.abs(np.diff(v)))) if len(v) > 1 else 0.0
-            else:
-                values[i] = float(v[-1] - v[0]) if len(v) > 1 else float(v[-1])
-        else:
-            if len(v) > 1:
-                values[i] = float((v[-1] - v[0]) / (len(v) * dt))
-            else:
-                values[i] = 0.0
+        values[i] = _reduce_series(v, dt, absolute)
 
     # Delaunay triangulation
     if n >= 3:

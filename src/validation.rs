@@ -327,6 +327,7 @@ mod tests {
             "/tmp".into(), "vs".into(), ".jpg".into(),
             (200, 200),
             1.0, 10,
+            false,
             Progression::Deformation,
             comp, [100.0, 100.0],
             0.0, 0.0,
@@ -358,6 +359,8 @@ mod tests {
             image_0_path: None,
             calibrated: false,
             config: None,
+            principal_strains: None,
+            gamma_max_grad: None,
         }
     }
 
@@ -416,6 +419,8 @@ mod tests {
                 image_0_path: None,
                 calibrated: false,
                 config: None,
+                principal_strains: None,
+                gamma_max_grad: None,
             }));
         }
 
