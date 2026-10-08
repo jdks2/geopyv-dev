@@ -183,6 +183,11 @@ class TestSubsetConstruction:
     def test_g_img_accessible(self, unsolved_subset):
         assert unsolved_subset.g_img is not None
 
+    def test_order0_construction(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=0)
+        assert s.subset_order == 0
+        assert s.solved is False
+
     def test_order2_construction(self, ref_img, tar_img, tmpl):
         s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=2)
         assert s.subset_order == 2
@@ -384,6 +389,14 @@ class TestSolveDispatcher:
 
 
 class TestWarpAdequacyDiagnostic:
+    def test_eta_present_for_order0(self, ref_img, tar_img, tmpl):
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=0)
+        s.solve(algorithm="icgn")
+        assert s.eta_u is not None
+        assert s.eta_v is not None
+        assert s.eta_u >= 0.0
+        assert s.eta_v >= 0.0
+
     def test_eta_present_for_order1(self, ref_img, tar_img, tmpl):
         s = Subset(COORD, tmpl, ref_img, tar_img)
         s.solve(algorithm="icgn")
@@ -404,6 +417,15 @@ class TestWarpAdequacyDiagnostic:
         s = Subset(COORD, tmpl, ref_img, tar_img)
         assert s.eta_u is None
         assert s.eta_v is None
+
+    def test_eta_small_for_well_converged_real_subset_order0(self, ref_img, tar_img, tmpl):
+        # This fixture pair's true deformation is nearly rigid (order-1's
+        # golden gradient terms are ~1e-4, see GOLDEN_ICGN_O1_P), so a
+        # translation-only fit should still converge well here.
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=0)
+        s.solve(algorithm="icgn")
+        assert s.eta_u < 0.5
+        assert s.eta_v < 0.5
 
     def test_eta_small_for_well_converged_real_subset(self, ref_img, tar_img, tmpl):
         s = Subset(COORD, tmpl, ref_img, tar_img)
@@ -454,6 +476,20 @@ class TestWarpAdequacyDiagnostic:
 
 
 class TestP0Mismatch:
+    def test_p0_mismatch_order0_truncates(self, ref_img, tar_img, tmpl):
+        """p_0 length 6 with subset_order=0: silently truncated to 2."""
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=0)
+        p_0_long = [0.0] * 6
+        s._inner.solve_icgn(p_0=p_0_long)
+        assert len(s.p) == 2
+
+    def test_default_p0_order0(self, ref_img, tar_img, tmpl):
+        """p_0=None defaults to zeros (order-0)."""
+        s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=0)
+        s._inner.solve_icgn()
+        assert s.solved
+        assert len(s.p) == 2
+
     def test_p0_mismatch_order1_truncates(self, ref_img, tar_img, tmpl):
         """p_0 length 12 with subset_order=1: silently truncated to 6."""
         s = Subset(COORD, tmpl, ref_img, tar_img, subset_order=1)

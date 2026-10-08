@@ -15,6 +15,7 @@
 //!
 //! | Order | Parameters | Description |
 //! |-------|------------|-------------|
+//! | 0     | 2          | `[u, v]` |
 //! | 1     | 6          | `[u, v, u_x, v_x, u_y, v_y]` |
 //! | 2     | 12         | `[u, v, u_x, v_x, u_y, v_y, u_xx, v_xx, u_xy, v_xy, u_yy, v_yy]` |
 //!
@@ -74,7 +75,8 @@ pub struct Subset {
     // Always populated — image-independent or recoverable from SubsetSolution.
     /// Centre coordinate `[coord0, coord1]`.
     pub coord: [f64; 2],
-    /// Warp order: 1 (affine, 6 params) or 2 (quadratic, 12 params).
+    /// Warp order: 0 (translation, 2 params), 1 (affine, 6 params), or 2
+    /// (quadratic, 12 params).
     pub subset_order: usize,
     /// Local mask shape/size/n_px summary.
     pub mask: MaskSummary,
@@ -129,7 +131,7 @@ pub struct SubsetSolution {
 /// Output of a DIC solve ([`Subset::solve_icgn`] / [`Subset::solve_fagn`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolveResult {
-    /// Final warp parameter vector (6 or 12 elements).
+    /// Final warp parameter vector (2, 6, or 12 elements).
     pub p: Vec<f64>,
     /// Final ZNCC score: 1 = perfect correlation.
     pub c_zncc: f64,
@@ -152,7 +154,8 @@ pub struct SolveResult {
     pub max_norm: f64,
     #[serde(default)]
     pub tolerance: f64,
-    /// Warp order: 1 (affine, 6 params) or 2 (quadratic, 12 params).
+    /// Warp order: 0 (translation, 2 params), 1 (affine, 6 params), or 2
+    /// (quadratic, 12 params).
     #[serde(default)]
     pub subset_order: usize,
     /// Iteration limit passed to the solver.
@@ -162,8 +165,8 @@ pub struct SolveResult {
     #[serde(default = "default_solve_method")]
     pub method: SolveMethod,
     /// Gradient-weighted omitted-mode warp-adequacy score `(eta_u, eta_v)`
-    /// -- see [`omitted_mode_diagnostic`]. `Some` for `subset_order` 1 or 2;
-    /// `None` for any other order, and for results loaded from a
+    /// -- see [`omitted_mode_diagnostic`]. `Some` for `subset_order` 0, 1,
+    /// or 2; `None` for any other order, and for results loaded from a
     /// pre-existing `.pyv` saved before this field existed.
     #[serde(default)]
     pub eta_omitted: Option<(f64, f64)>,
@@ -303,12 +306,24 @@ fn poly_vec(t: f64) -> SplineVec {
 // Warp application
 // ---------------------------------------------------------------------------
 
-/// Apply a first- or second-order warp to a set of reference coordinates.
+/// Warp parameter vector length for a given `subset_order` -- 2 (order 0,
+/// translation only), 6 (order 1, affine), or 12 (order 2, quadratic).
+fn p_len(order: usize) -> usize {
+    match order {
+        0 => 2,
+        1 => 6,
+        _ => 12,
+    }
+}
+
+/// Apply a zeroth-, first-, or second-order warp to a set of reference
+/// coordinates.
 ///
-/// `coord` = subset centre; `p` = warp vector (6 or 12 elements);
+/// `coord` = subset centre; `p` = warp vector (2, 6, or 12 elements);
 /// `f_coords` shape = `(n, 2)`.
 ///
-/// Matches `_g_coords` in `_subset.cpp`.
+/// Matches `_g_coords` in `_subset.cpp` (for order 1/2; order 0 is a
+/// geopyv-dev addition with no Python/C++ counterpart).
 fn apply_warp(coord: [f64; 2], p: &[f64], f_coords: &Array2<f64>) -> Array2<f64> {
     let mut gc = Array2::zeros((f_coords.nrows(), 2));
     apply_warp_into(&mut gc, coord, p, f_coords);
@@ -324,7 +339,14 @@ fn apply_warp_into(gc: &mut Array2<f64>, coord: [f64; 2], p: &[f64], f_coords: &
     let xc = coord[0];
     let yc = coord[1];
 
-    if p.len() <= 7 {
+    if p.len() == 2 {
+        // Order 0: pure translation, no spatial gradient terms.
+        let (u, v) = (p[0], p[1]);
+        for i in 0..n {
+            gc[[i, 0]] = f_coords[[i, 0]] + u;
+            gc[[i, 1]] = f_coords[[i, 1]] + v;
+        }
+    } else if p.len() <= 7 {
         // Order 1
         let (u, v) = (p[0], p[1]);
         let (ux, vx, uy, vy) = (p[2], p[3], p[4], p[5]);
@@ -358,8 +380,9 @@ fn apply_warp_into(gc: &mut Array2<f64>, coord: [f64; 2], p: &[f64], f_coords: &
 
 /// Compute steepest descent images (SDI) for a set of coordinates.
 ///
-/// Returns a `(n, 6)` or `(n, 12)` array depending on `order`.
-/// Matches `_sdi` in `_subset.cpp`.
+/// Returns a `(n, 2)`, `(n, 6)`, or `(n, 12)` array depending on `order`.
+/// Matches `_sdi` in `_subset.cpp` for order 1/2; order 0 (translation only,
+/// `[gx, gy]` columns) is a geopyv-dev addition.
 fn steepest_descent(
     coord: [f64; 2],
     coords: &Array2<f64>,
@@ -367,7 +390,7 @@ fn steepest_descent(
     order: usize,
 ) -> Array2<f64> {
     let n = coords.nrows();
-    let m = if order == 1 { 6 } else { 12 };
+    let m = p_len(order);
     let mut sdi = Array2::zeros((n, m));
     for i in 0..n {
         let dx = coords[[i, 0]] - coord[0];
@@ -375,6 +398,9 @@ fn steepest_descent(
         let (gx, gy) = (grad[[i, 0]], grad[[i, 1]]);
         sdi[[i, 0]] = gx;
         sdi[[i, 1]] = gy;
+        if m < 6 {
+            continue;
+        }
         sdi[[i, 2]] = gx * dx;
         sdi[[i, 3]] = gy * dx;
         sdi[[i, 4]] = gx * dy;
@@ -528,9 +554,16 @@ fn delta_p_fagn(
 /// Compositional warp update for ICGN: `p_new = compose(p_old, Δp⁻¹)`.
 ///
 /// Uses the homogeneous warp matrix representation for order 1 (3×3) and
-/// order 2 (6×6). Matches `_p_new_ICGN` in `_subset.cpp`.
+/// order 2 (6×6); matches `_p_new_ICGN` in `_subset.cpp`. Order 0 (pure
+/// translation, a geopyv-dev addition with no Python/C++ counterpart) is the
+/// special case of that same 3×3 formula with every gradient term fixed at
+/// zero: `W_old = [[1,0,u],[0,1,v],[0,0,1]]`, `W_delta^-1` negates the
+/// translation, so `W_new` gives `u_new = u - du`, `v_new = v - dv` directly.
 fn compose_icgn(p: &[f64], delta_p: &[f64]) -> Vec<f64> {
-    if p.len() == 6 {
+    if p.len() == 2 {
+        // Order 0: pure translation.
+        vec![p[0] - delta_p[0], p[1] - delta_p[1]]
+    } else if p.len() == 6 {
         // Order 1: 3×3 homogeneous warp matrix
         let (u, v) = (p[0], p[1]);
         let (ux, vx, uy, vy) = (p[2], p[3], p[4], p[5]);
@@ -653,11 +686,14 @@ fn compose_icgn(p: &[f64], delta_p: &[f64]) -> Vec<f64> {
 
 /// Gao et al. (2015) convergence norm for the warp parameter increment.
 ///
-/// Matches `_norm` in `_subset.cpp`. `size` = `sqrt(n_px)` (representative
-/// subset dimension).
+/// Matches `_norm` in `_subset.cpp` for order 1/2; order 0 (translation
+/// only, no size-scaled gradient terms) is a geopyv-dev addition.
+/// `size` = `sqrt(n_px)` (representative subset dimension).
 pub fn convergence_norm(delta_p: &[f64], size: f64) -> f64 {
     let n = delta_p.len();
-    if n <= 7 {
+    if n == 2 {
+        (delta_p[0].powi(2) + delta_p[1].powi(2)).sqrt()
+    } else if n <= 7 {
         (delta_p[0].powi(2)
             + delta_p[1].powi(2)
             + (delta_p[2] * size).powi(2)
@@ -762,13 +798,14 @@ fn eta_component<const K: usize>(modes: &[[f64; K]], grad_zn: &[f64], e_centered
 
 /// Gradient-weighted omitted-mode warp-adequacy score, generalised from the
 /// report's vertical-only, order-1-only manufactured case to both
-/// displacement components and both warp orders geopyv-dev supports:
+/// displacement components and all three warp orders geopyv-dev supports:
 /// `eta_u` uses the reference horizontal gradient `I_x` (omitted `u`
 /// modes), `eta_v` uses the reference vertical gradient `I_y` (omitted `v`
 /// modes). The omitted-mode basis is the *next* polynomial degree up from
-/// `subset_order` -- quadratic for order-1, cubic for order-2 (see the
-/// section doc comment above for the order-2 caveat). Returns `None` for
-/// any other order (there is no order-3 solver to be "one below").
+/// `subset_order` -- linear for order-0, quadratic for order-1, cubic for
+/// order-2 (see the section doc comment above for the order-2 caveat).
+/// Returns `None` for any other order (there is no order-3 solver to be
+/// "one below").
 ///
 /// Uses the reference-frame gradient `grad_f` (not a per-iteration target
 /// gradient) because inverse-compositional ICGN holds the reference frame,
@@ -776,7 +813,8 @@ fn eta_component<const K: usize>(modes: &[[f64; K]], grad_zn: &[f64], e_centered
 /// gradient always available on `Subset` regardless of which solver
 /// (ICGN or FAGN) produced the converged `p`.
 ///
-/// Returns `Some((eta_u, eta_v))`, or `None` if `subset_order` isn't 1 or 2.
+/// Returns `Some((eta_u, eta_v))`, or `None` if `subset_order` isn't 0, 1,
+/// or 2.
 fn omitted_mode_diagnostic(
     coord: [f64; 2],
     subset_order: usize,
@@ -808,6 +846,19 @@ fn omitted_mode_diagnostic(
     };
 
     match subset_order {
+        0 => {
+            // Omitted (order-1) modes: [ξ, ζ].
+            let modes: Vec<[f64; 2]> = (0..n)
+                .map(|i| {
+                    let (xi, zeta) = local_coords(i);
+                    [xi, zeta]
+                })
+                .collect();
+            Some((
+                eta_component(&modes, &zn_ix, &e_centered),
+                eta_component(&modes, &zn_iy, &e_centered),
+            ))
+        }
         1 => {
             // Omitted (order-2) modes: [ξ², ξζ, ζ²].
             let modes: Vec<[f64; 3]> = (0..n)
@@ -994,8 +1045,8 @@ impl Subset {
     /// any single attempt), see [`Subset::solve_icgn_result`].
     ///
     /// # Arguments
-    /// * `p_0` — initial warp vector; `None` → zeros of length `6 * subset_order`;
-    ///   provided slice is silently resized to `6 * subset_order`.
+    /// * `p_0` — initial warp vector; `None` → zeros of length `p_len(subset_order)`
+    ///   (2/6/12 for order 0/1/2); provided slice is silently resized to match.
     /// * `tolerance` — minimum ZNCC for `quality_ok = true`.
     /// * `max_norm` — convergence criterion on `||Δp||`.
     /// * `max_iterations` — iteration limit.
@@ -1081,7 +1132,7 @@ impl Subset {
 
         let n = f_coords.nrows();
         let size = (n as f64).sqrt();
-        let expected = 6 * self.subset_order;
+        let expected = p_len(self.subset_order);
         let mut p = p_0.map(|v| v.to_vec()).unwrap_or_else(|| vec![0.0; expected]);
         p.resize(expected, 0.0);
         let gv = g_img.qcqt.view();
@@ -1173,7 +1224,7 @@ impl Subset {
 
         let n = f_coords.nrows();
         let size = (n as f64).sqrt();
-        let expected = 6 * self.subset_order;
+        let expected = p_len(self.subset_order);
         let mut p = p_0.map(|v| v.to_vec()).unwrap_or_else(|| vec![0.0; expected]);
         p.resize(expected, 0.0);
         let gv = g_img.qcqt.view();
@@ -1326,6 +1377,14 @@ mod tests {
         assert!((convergence_norm(&dp, size) - expected).abs() < 1e-12);
     }
 
+    /// Order-0 convergence_norm is plain `||(du, dv)||`, independent of
+    /// `size` (there are no gradient terms to scale).
+    #[test]
+    fn test_norm_order0_pure_translation() {
+        let dp = vec![0.3, 0.4];
+        assert!((convergence_norm(&dp, 123.0) - 0.5).abs() < 1e-12);
+    }
+
     // ---- Warp-adequacy diagnostic (Tier A: pure computation, atol = 1e-12) ----
 
     #[test]
@@ -1380,6 +1439,30 @@ mod tests {
         assert!((eta - expected).abs() < 1e-12, "eta = {eta}, expected {expected}");
     }
 
+    /// `eta_component` at `K=2` (the order-0/linear-omitted-mode case)
+    /// against a hand-computed projection -- same symmetric-cross pixel
+    /// layout as [`test_eta_component_hand_computed`], but with linear
+    /// modes `[ξ, ζ]`. Gradient-weighted, the `ξ` column is `[1,1,0,0]`
+    /// (mean 0.5, population std 0.5, standardised `[1,1,-1,-1]`) and the
+    /// `ζ` column is `[0,0,1,1]` (standardised `[-1,-1,1,1]`). Projecting
+    /// onto `e_centered = [1,0,0,0]` and dividing by `N=4` gives
+    /// `proj = [0.25, -0.25]`, so `eta = sqrt(0.25² + 0.25²) = √2/4` --
+    /// the same magnitude as the K=3 and K=4 cases on this layout.
+    #[test]
+    fn test_eta_component_hand_computed_order0_linear() {
+        let modes = [
+            [1.0, 0.0],  // (ξ,ζ) = (1, 0)
+            [-1.0, 0.0], // (ξ,ζ) = (-1, 0)
+            [0.0, 1.0],  // (ξ,ζ) = (0, 1)
+            [0.0, -1.0], // (ξ,ζ) = (0, -1)
+        ];
+        let grad_zn = [1.0, -1.0, 1.0, -1.0];
+        let e_centered = [1.0, 0.0, 0.0, 0.0];
+        let eta = eta_component(&modes, &grad_zn, &e_centered);
+        let expected = std::f64::consts::SQRT_2 / 4.0;
+        assert!((eta - expected).abs() < 1e-12, "eta = {eta}, expected {expected}");
+    }
+
     /// `eta_component` is non-negative (it's an L2 norm) regardless of sign
     /// patterns in the inputs.
     #[test]
@@ -1417,7 +1500,8 @@ mod tests {
     /// target subset is pixel-for-pixel identical to the reference, the
     /// zero-normalised residual is exactly zero everywhere regardless of the
     /// omitted-mode/gradient weighting, so both components must be ~0 --
-    /// checked at both order-1 (quadratic omitted modes) and order-2 (cubic).
+    /// checked at order-0 (linear omitted modes), order-1 (quadratic), and
+    /// order-2 (cubic).
     #[test]
     fn test_omitted_mode_diagnostic_zero_for_identical_images() {
         let coord = [0.0, 0.0];
@@ -1435,7 +1519,7 @@ mod tests {
         let f_m = f.mean().unwrap();
         let delta_f = f.iter().map(|&fi: &f64| (fi - f_m).powi(2)).sum::<f64>().sqrt();
 
-        for order in [1, 2] {
+        for order in [0, 1, 2] {
             let (eta_u, eta_v) = omitted_mode_diagnostic(
                 coord, order, &f_coords, &grad_f, &f, f_m, delta_f, &f, f_m, delta_f,
             )
@@ -1445,8 +1529,8 @@ mod tests {
         }
     }
 
-    /// `omitted_mode_diagnostic` returns `None` for any order other than 1
-    /// or 2 (there is no order-3 solver to be "one below").
+    /// `omitted_mode_diagnostic` returns `None` for any order other than 0,
+    /// 1, or 2 (there is no order-3 solver to be "one below").
     #[test]
     fn test_omitted_mode_diagnostic_none_for_unsupported_order() {
         let coord = [0.0, 0.0];
@@ -1556,6 +1640,56 @@ mod tests {
                 "compose_icgn identity failed: {a} != {b}"
             );
         }
+    }
+
+    /// compose_icgn order-0: `p_new = p - delta_p` (the order-1 formula's
+    /// pure-translation special case, verified independently here).
+    #[test]
+    fn test_compose_icgn_order0() {
+        let p = vec![1.0, 2.0];
+        let dp = vec![0.5, 0.3];
+        let p_new = compose_icgn(&p, &dp);
+        assert_eq!(p_new.len(), 2);
+        assert!((p_new[0] - 0.5).abs() < 1e-12, "u: {}", p_new[0]);
+        assert!((p_new[1] - 1.7).abs() < 1e-12, "v: {}", p_new[1]);
+    }
+
+    /// compose_icgn order-0 with zero delta → p unchanged.
+    #[test]
+    fn test_compose_icgn_order0_zero_delta_identity() {
+        let p = vec![1.5, -0.7];
+        let p_new = compose_icgn(&p, &[0.0, 0.0]);
+        assert!((p_new[0] - p[0]).abs() < 1e-12);
+        assert!((p_new[1] - p[1]).abs() < 1e-12);
+    }
+
+    /// Order-0 `apply_warp`: every coordinate shifts by exactly `(u, v)`,
+    /// with no gradient-dependent term.
+    #[test]
+    fn test_apply_warp_order0_pure_translation() {
+        let coord = [10.0, 20.0];
+        let f_coords = Array2::from_shape_vec((2, 2), vec![10.0, 20.0, 15.0, 25.0]).unwrap();
+        let p = vec![1.5, -0.5];
+        let gc = apply_warp(coord, &p, &f_coords);
+        assert!((gc[[0, 0]] - 11.5).abs() < 1e-12);
+        assert!((gc[[0, 1]] - 19.5).abs() < 1e-12);
+        assert!((gc[[1, 0]] - 16.5).abs() < 1e-12);
+        assert!((gc[[1, 1]] - 24.5).abs() < 1e-12);
+    }
+
+    /// Order-0 `steepest_descent` is `(n, 2)`, columns `[gx, gy]` only --
+    /// no `dx`/`dy`-weighted gradient terms.
+    #[test]
+    fn test_steepest_descent_order0_shape() {
+        let coord = [0.0, 0.0];
+        let coords = Array2::from_shape_vec((2, 2), vec![3.0, 4.0, -1.0, 2.0]).unwrap();
+        let grad = Array2::from_shape_vec((2, 2), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
+        let sdi = steepest_descent(coord, &coords, &grad, 0);
+        assert_eq!(sdi.shape(), &[2, 2]);
+        assert!((sdi[[0, 0]] - 0.1).abs() < 1e-12);
+        assert!((sdi[[0, 1]] - 0.2).abs() < 1e-12);
+        assert!((sdi[[1, 0]] - 0.3).abs() < 1e-12);
+        assert!((sdi[[1, 1]] - 0.4).abs() < 1e-12);
     }
 
     /// compose_icgn order-1 with pure translation from zero warp.
@@ -1693,6 +1827,51 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../geopyv/tests")
             .join(name)
+    }
+
+    /// Tier C: ICGN order-0 converges on the real DIC test pair. No golden
+    /// values exist for order-0 (new in geopyv-dev, no Python/C++
+    /// counterpart to compare against) -- this checks the solve behaves
+    /// sanely: converges, meets the quality tolerance, has a 2-element `p`,
+    /// recovers a displacement close to order-1's `p[0:2]` (translation
+    /// should dominate for this well-matched, near-rigid pair), and reports
+    /// an `eta_omitted` (the K=2 linear-omitted-mode diagnostic).
+    #[test]
+    fn test_solve_icgn_order0_real_pair() {
+        let ref_path = test_image_path("ref.jpg");
+        let tar_path = test_image_path("tar.jpg");
+        if !ref_path.exists() || !tar_path.exists() {
+            eprintln!("Skipping: test images not found");
+            return;
+        }
+
+        use crate::image::Image;
+        use crate::masks::LocalMask;
+        let ref_img = Arc::new(Image::from_file(&ref_path, 20).unwrap());
+        let tar_img = Arc::new(Image::from_file(&tar_path, 20).unwrap());
+
+        let coord = [200.43, 200.76];
+        let local_mask = LocalMask::circle(25).unwrap();
+        let subset = Subset::new(
+            coord, &local_mask, None,
+            Arc::clone(&ref_img), Arc::clone(&tar_img), 0,
+        ).unwrap();
+        assert_eq!(subset.subset_order, 0);
+
+        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
+
+        assert!(result.converged, "ICGN order-0 did not converge");
+        assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
+        assert_eq!(result.p.len(), 2, "order-0 p should have 2 elements");
+        assert!(
+            (result.p[0] - 0.034043).abs() < 1e-2,
+            "p[0] = {} (expected close to order-1's ~0.034043)", result.p[0]
+        );
+        assert!(
+            (result.p[1] - 0.035697).abs() < 1e-2,
+            "p[1] = {} (expected close to order-1's ~0.035697)", result.p[1]
+        );
+        assert!(result.eta_omitted.is_some(), "order-0 should report eta_omitted");
     }
 
     /// Tier C: ICGN order-1 converges on the real DIC test pair.

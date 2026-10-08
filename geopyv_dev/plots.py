@@ -1,8 +1,9 @@
+import warnings
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 import matplotlib.tri as tri
-from scipy.spatial import Delaunay
 from matplotlib.collections import LineCollection
 
 from . import _geopyv_dev as _core
@@ -103,7 +104,7 @@ def inspect_subset(subset, ax=None, show=True, block=True, save=False,
         if eta_u is not None and eta_v is not None:
             label = f"η_u = {eta_u:.4f}; η_v = {eta_v:.4f}"
         else:
-            label = "η not available (subset_order != 1, or unsolved)"
+            label = "η not available (unsolved, or unsupported subset_order)"
         ax.text(0.5, -0.05, label, transform=ax.transAxes, ha="center")
         ax.set_axis_off()
         plt.tight_layout()
@@ -780,33 +781,44 @@ def trace_field(field, quantity="warps", component=0,
     return fig, ax
 
 
-def _reduce_series(v, dt, absolute):
-    """Collapse a per-increment scalar series (already window-sliced) to one
-    number, per contour_field's existing convention: dt=None -> last-minus-
-    first (or the sum of |increment deltas| if absolute), dt given -> mean
-    rate. Shared by every contour_field quantity, including each component
-    of gamma_max_grad's [dx, dy] pair."""
-    v = np.atleast_1d(v)
-    if dt is None:
-        if absolute:
-            return float(np.sum(np.abs(np.diff(v)))) if len(v) > 1 else 0.0
-        return float(v[-1] - v[0]) if len(v) > 1 else float(v[-1])
-    if len(v) > 1:
-        return float((v[-1] - v[0]) / (len(v) * dt))
-    return 0.0
+def _resolve_window(window, inc_no):
+    """contour_field's ``window`` as a concrete half-open ``(start, stop)``
+    increment range (``None`` -> ``None``, i.e. all increments). Accepts a
+    2-element list/tuple (slice bounds, ``None``/negative allowed), a
+    ``slice`` (step 1 only), or an int (that single increment)."""
+    if window is None:
+        return None
+    if isinstance(window, (list, tuple)) and len(window) == 2:
+        window = slice(window[0], window[1])
+    if isinstance(window, slice):
+        start, stop, step = window.indices(inc_no)
+        if step != 1:
+            raise ValueError(f"window slice step must be 1, got {step}")
+        return (start, stop)
+    k = int(window)
+    if k < 0:
+        k += inc_no
+    return (k, k + 1)
 
 
-def contour_field(field, quantity, window=None, dt=None, absolute=False,
+def contour_field(field, quantity, window=None, dt=None, absolute=False, deformed=False,
                    ax=None, show=True, block=True, save=False, **kwargs):
-    """gamma_max_grad requires the Field to have been solved via
+    """Filled contour of one reduced value per particle.
+
+    Values, positions and triangles all come from the core
+    (``Field.contour_values`` / ``contour_coordinates`` /
+    ``contour_triangles``), the same functions the GUI draws from. The
+    triangulation covers only the field's region (exclusions and concave
+    boundary sections left empty); a field saved before regions were stored
+    falls back to the full convex hull, with a warning.
+
+    ``deformed=True`` draws at the particle positions at the window's last
+    increment instead of the initial ones (same triangles).
+
+    gamma_max_grad requires the Field to have been solved via
     Field.solve() with strain_method left as meshless (the default) --
     the spatial gradient of gamma_max is computed once, at solve time,
-    directly from the mesh's own particle distribution (no new query grid),
-    using the exact MeshlessParams the solve itself used. There is no
-    meshless_params parameter here any more: a second, independently
-    supplied radius at plot time was the earlier design and is exactly
-    what previously risked a silent mismatch against the solve's own
-    radius -- see Particle.gamma_max_grad's docstring.
+    using the exact MeshlessParams the solve itself used.
     """
     _require_solved(field)
     valid = {"u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol",
@@ -814,63 +826,16 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
 
-    particles = field.particles
-    n = len(particles)
-    coords = np.array([[p.coordinates[0, 0], p.coordinates[0, 1]] for p in particles])
-
-    strain_col = {"ep_xx": 0, "ep_yy": 1, "ep_xy": 5}
-    # [ep1, ep2, gamma_max, theta_p] -- see particle::principal_strains.
-    principal_col = {"ep1": 0, "ep2": 1, "gamma_max": 2, "theta_p": 3}
-
-    # Build window slice
-    if window is not None:
-        if isinstance(window, (list, tuple)) and len(window) == 2:
-            w = slice(window[0], window[1])
-        else:
-            w = window
-    else:
-        w = slice(None)
-
-    values = np.zeros(n)
-    for i, p in enumerate(particles):
-        if quantity == "gamma_max_grad":
-            # Pure lookup -- no post-computation. Raises via
-            # Particle.gamma_max_grad's own getter if this Field wasn't
-            # solved meshless (no silent NaN/garbage in the plot).
-            grad = np.asarray(p.gamma_max_grad)  # (inc_no, 2)
-            gx = _reduce_series(grad[w, 0], dt, absolute)
-            gy = _reduce_series(grad[w, 1], dt, absolute)
-            values[i] = float(np.hypot(gx, gy))
-            continue
-
-        warps = np.asarray(p.warps)  # (inc_no, warp_len)
-        vol_strains = np.asarray(p.vol_strains)
-        strains = np.asarray(p.strains)  # (inc_no, 6)
-
-        if quantity == "u":
-            v = warps[w, 0]
-        elif quantity == "v":
-            v = warps[w, 1]
-        elif quantity == "R":
-            v = np.sqrt(warps[w, 0]**2 + warps[w, 1]**2)
-        elif quantity in strain_col:
-            v = strains[w, strain_col[quantity]]
-        elif quantity == "ep_vol":
-            v = vol_strains[w]
-        elif quantity in principal_col:
-            # Pure lookup -- computed once at solve time (see
-            # Particle.principal_strains), not re-derived here.
-            principal = np.asarray(p.principal_strains)  # (inc_no, 4)
-            v = principal[w, principal_col[quantity]]
-
-        values[i] = _reduce_series(v, dt, absolute)
-
-    # Delaunay triangulation
-    if n >= 3:
-        delaunay = Delaunay(coords)
-        triangles = delaunay.simplices
-    else:
-        triangles = None
+    w = _resolve_window(window, field.inc_no)
+    values = np.asarray(field.contour_values(quantity, window=w, dt=dt, absolute=absolute))
+    coords = np.asarray(field.contour_coordinates(deformed=deformed, window=w))
+    triangles = np.asarray(field.contour_triangles())
+    if field.region is None:
+        warnings.warn(
+            "this Field predates stored regions (.pyv < 0x08): the contour fills the "
+            "particles' full convex hull, including any exclusions -- re-solve to fix",
+            stacklevel=2,
+        )
 
     owned = ax is None
     if ax is None:
@@ -880,7 +845,7 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False,
     img_path = getattr(field, 'image_0_path', None)
     _imshow_or_blank(ax, img_path)
 
-    if triangles is not None and len(triangles) > 0:
+    if len(triangles) > 0:
         mpl_tri = tri.Triangulation(coords[:, 0], coords[:, 1], triangles)
         cf = ax.tricontourf(mpl_tri, values, **kwargs)
     else:

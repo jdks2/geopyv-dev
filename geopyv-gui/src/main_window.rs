@@ -336,8 +336,7 @@ impl MainWindow {
                     ) {
                         self.error_modal = Some(format!("Save error: {e}"));
                     } else {
-                        self.field.view.solution = Some(solution);
-                        self.field.view.loaded_path = Some(save_path);
+                        self.field.view.set_solution(Some(save_path), Some(solution));
                         self.mode = PaneMode::View;
                         self.pending_refresh = true;
                     }
@@ -862,7 +861,6 @@ impl MainWindow {
                         viewer_rect,
                         mode,
                         selected_path,
-                        images,
                         cache,
                     )
                 })
@@ -992,7 +990,7 @@ impl MainWindow {
                         self.field.show_right_view(ui, selected_path, out_dir);
                     }
                     (Tab::Fields, PaneMode::New, _) => {
-                        field_spawn = self.field.show_right_new(ui, images, sequences);
+                        field_spawn = self.field.show_right_new(ui, sequences);
                     }
                 }
             });

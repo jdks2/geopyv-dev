@@ -553,6 +553,119 @@ class TestContourFieldGammaMaxGrad:
 
 
 # ===========================================================================
+# TestContourFieldCore
+#
+# contour_field's values, positions and triangles now come from the core
+# (Field.contour_values / contour_coordinates / contour_triangles), shared
+# with the GUI. _legacy_contour_values is the numpy reduction contour_field
+# used before that move, kept here verbatim as the parity reference.
+# ===========================================================================
+
+def _legacy_reduce_series(v, dt, absolute):
+    v = np.atleast_1d(v)
+    if dt is None:
+        if absolute:
+            return float(np.sum(np.abs(np.diff(v)))) if len(v) > 1 else 0.0
+        return float(v[-1] - v[0]) if len(v) > 1 else float(v[-1])
+    if len(v) > 1:
+        return float((v[-1] - v[0]) / (len(v) * dt))
+    return 0.0
+
+
+def _legacy_contour_values(field, quantity, window, dt, absolute):
+    strain_col = {"ep_xx": 0, "ep_yy": 1, "ep_xy": 5}
+    principal_col = {"ep1": 0, "ep2": 1, "gamma_max": 2, "theta_p": 3}
+    if window is not None:
+        if isinstance(window, (list, tuple)) and len(window) == 2:
+            w = slice(window[0], window[1])
+        else:
+            w = window
+    else:
+        w = slice(None)
+    values = []
+    for p in field.particles:
+        if quantity == "gamma_max_grad":
+            grad = np.asarray(p.gamma_max_grad)
+            gx = _legacy_reduce_series(grad[w, 0], dt, absolute)
+            gy = _legacy_reduce_series(grad[w, 1], dt, absolute)
+            values.append(float(np.hypot(gx, gy)))
+            continue
+        warps = np.asarray(p.warps)
+        strains = np.asarray(p.strains)
+        if quantity == "u":
+            v = warps[w, 0]
+        elif quantity == "v":
+            v = warps[w, 1]
+        elif quantity == "R":
+            v = np.sqrt(warps[w, 0]**2 + warps[w, 1]**2)
+        elif quantity in strain_col:
+            v = strains[w, strain_col[quantity]]
+        elif quantity == "ep_vol":
+            v = np.asarray(p.vol_strains)[w]
+        else:
+            v = np.asarray(p.principal_strains)[w, principal_col[quantity]]
+        values.append(_legacy_reduce_series(v, dt, absolute))
+    return np.array(values)
+
+
+_ALL_FIELD_QUANTITIES = ("u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol",
+                         "ep1", "ep2", "gamma_max", "theta_p", "gamma_max_grad")
+
+
+class TestContourFieldCore:
+    @pytest.mark.parametrize("window", [None, [0, 1], [1, 2], [0, 2], [None, None], -1, 0, slice(0, 2)])
+    @pytest.mark.parametrize("dt,absolute", [(None, False), (None, True), (0.1, False)])
+    def test_core_values_match_legacy_numpy(self, solved_field_meshless, window, dt, absolute):
+        from geopyv_dev.plots import _resolve_window
+        field = solved_field_meshless
+        w = _resolve_window(window, field.inc_no)
+        for q in _ALL_FIELD_QUANTITIES:
+            core = np.asarray(field.contour_values(q, window=w, dt=dt, absolute=absolute))
+            legacy = _legacy_contour_values(field, q, window, dt, absolute)
+            np.testing.assert_allclose(core, legacy, rtol=1e-12, atol=1e-15, err_msg=q)
+
+    def test_region_stored_and_triangles_inside_it(self, solved_field_meshless):
+        boundary, exclusions = solved_field_meshless.region
+        assert np.asarray(boundary).shape[1] == 2
+        assert exclusions == []
+        tris = np.asarray(solved_field_meshless.contour_triangles())
+        assert tris.ndim == 2 and tris.shape[1] == 3 and len(tris) > 0
+        assert tris.max() < solved_field_meshless.n_particles
+
+    def test_deformed_coordinates(self, solved_field_meshless):
+        field = solved_field_meshless
+        ref = np.asarray(field.contour_coordinates())
+        np.testing.assert_array_equal(ref, np.asarray(field.coordinates))
+        deformed = np.asarray(field.contour_coordinates(deformed=True))
+        last = np.array([np.asarray(p.coordinates)[-1] for p in field.particles])
+        np.testing.assert_array_equal(deformed, last)
+
+    def test_deformed_contour_plots(self, solved_field_meshless):
+        fig, ax = contour_field(solved_field_meshless, "u", deformed=True, show=False)
+        assert len(ax.collections) > 0
+
+    def test_no_region_warning_on_fresh_solve(self, solved_field_meshless):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            contour_field(solved_field_meshless, "u", show=False)
+
+    def test_bad_window_step_raises(self, solved_field_meshless):
+        with pytest.raises(ValueError, match="step"):
+            contour_field(solved_field_meshless, "u", window=slice(0, 2, 2), show=False)
+
+    def test_region_survives_save_load(self, solved_field_meshless, tmp_path):
+        import geopyv_dev as gp
+        path = str(tmp_path / "field.pyv")
+        solved_field_meshless.save(path)
+        loaded = gp.load(path)
+        b0, _ = solved_field_meshless.region
+        b1, _ = loaded.region
+        np.testing.assert_array_equal(np.asarray(b0), np.asarray(b1))
+        np.testing.assert_array_equal(np.asarray(loaded.contour_triangles()),
+                                      np.asarray(solved_field_meshless.contour_triangles()))
+
+
+# ===========================================================================
 # TestUnsolvedGuards
 #
 # Plotting solve-dependent data on an object that has never had solve()

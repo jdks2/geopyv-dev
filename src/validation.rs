@@ -381,6 +381,7 @@ mod tests {
             calibrated: false,
             depth: 1.0,
             track: false,
+            region: None,
         }
     }
 
@@ -436,6 +437,7 @@ mod tests {
             calibrated: false,
             depth: 1.0,
             track: false,
+            region: None,
         };
 
         let validation = Validation::new(
