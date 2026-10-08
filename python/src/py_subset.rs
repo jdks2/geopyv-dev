@@ -47,11 +47,7 @@ impl PySubset {
         let order = (sol.result.p.len() / 6).max(1);
 
         // Reconstruct LocalMask from template summary.
-        let local_mask = match sol.mask.shape {
-            MaskShape::Circle => LocalMask::circle(sol.mask.size),
-            MaskShape::Square => LocalMask::square(sol.mask.size),
-            MaskShape::Semicircle => LocalMask::semicircle(sol.mask.size),
-        }.map_err(Error::from)?;
+        let local_mask = LocalMask::new(sol.mask.shape.clone(), sol.mask.size).map_err(Error::from)?;
         let py_mask: Py<PyMask> = Py::new(py, PyMask::from_local(local_mask.clone()))?;
 
         // Attempt to load reference image.

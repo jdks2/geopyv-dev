@@ -34,6 +34,10 @@ pub enum Error {
     /// Solve-dependent data was requested before `solve()` was called.
     #[error("{0} has not been solved; call solve() first")]
     NotSolved(String),
+
+    /// The solve was stopped by its [`SolveProgress`](crate::progress::SolveProgress) observer.
+    #[error("solve cancelled")]
+    Cancelled,
 }
 
 impl From<std::io::Error> for Error {

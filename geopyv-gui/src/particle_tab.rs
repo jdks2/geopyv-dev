@@ -74,8 +74,8 @@ impl Default for NewParticleForm {
             ref_image_idx: None,
             draw: DrawState::new(),
             lagrangian: true,
-            factor_text: "1.0".to_string(),
-            factor: 1.0,
+            factor_text: geopyv_dev::particle::ParticleConfig::default().factor.to_string(),
+            factor: geopyv_dev::particle::ParticleConfig::default().factor,
             true_incs: true,
             form_error: None,
         }
@@ -819,18 +819,18 @@ fn run_solve(
         }
     };
 
-    let n_meshes = seq_sol.mesh_solutions.len();
+    let n_meshes = seq_sol.n_meshes();
     if n_meshes == 0 {
         set_error(&state, "Sequence contains no mesh solutions".to_string());
         return;
     }
 
-    let mesh_order = seq_sol.mesh_solutions[0].mesh_order;
+    let mesh_order = seq_sol.mesh_order;
     let initial_warp = vec![0.0f64; 6 * mesh_order as usize];
     let cfg = ParticleConfig {
         factor: params.factor,
         true_incs: params.true_incs,
-        strain_method: geopyv_dev::particle::StrainMethod::Mesh,
+        ..Default::default()
     };
 
     let source = ParticleSource::Sequence(Arc::new(seq_sol));

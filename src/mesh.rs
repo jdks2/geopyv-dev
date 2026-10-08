@@ -32,6 +32,7 @@ use crate::{
     sequence::SequenceSolution,
     subset::{Subset, SolveResult},
     masks::{zone_at, LocalMask, MaskShape},
+    progress::{self, SolveProgress, TerminalProgress},
     Error,
 };
 
@@ -499,6 +500,11 @@ pub struct SeedConfig {
     pub tolerance: f64,
 }
 
+impl SeedConfig {
+    /// Default seed-node C_ZNCC tolerance.
+    pub const DEFAULT_TOLERANCE: f64 = 0.9;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SolveMethod {
     Icgn,
@@ -792,14 +798,24 @@ impl Mesh {
     /// * `local_mask` — Subset local mask (cloned per node when a global mask is present).
     /// * `seed`       — Seed-node parameters (coord, initial warp, tolerance).
     /// * `cfg`        — Solver configuration.
-    /// * `progress`   — Optional external progress bar (used by Sequence).
+    /// * `progress`   — Progress/cancellation observer; `None` shows a
+    ///                  terminal progress bar. A cancelled solve returns
+    ///                  [`Error::Cancelled`] and stores no solution.
     pub fn solve(
         &mut self,
         local_mask: &LocalMask,
         seed: &SeedConfig,
         cfg: &SolveConfig,
-        progress: Option<&indicatif::ProgressBar>,
+        progress: Option<&dyn SolveProgress>,
     ) -> Result<(), Error> {
+        let terminal;
+        let progress: &dyn SolveProgress = match progress {
+            Some(p) => p,
+            None => {
+                terminal = TerminalProgress::mesh();
+                &terminal
+            }
+        };
         match &cfg.masking {
             Masking::Uniform => self.solve_impl(&SubsetTemplate::plain(local_mask), seed, cfg, progress),
             Masking::Zonal(zc) => self.solve_zonal_masking_impl(local_mask, seed, cfg, zc, progress),
@@ -843,7 +859,7 @@ impl Mesh {
         seed: &SeedConfig,
         cfg: &SolveConfig,
         zc: &ZonalConfig,
-        progress: Option<&indicatif::ProgressBar>,
+        progress: &dyn SolveProgress,
     ) -> Result<(), Error> {
         // --- Pass 1: plain solve, uniform masking. ---
         let cfg1 = SolveConfig { masking: Masking::Uniform, ..cfg.clone() };
@@ -1050,7 +1066,7 @@ impl Mesh {
         masks: &SubsetTemplate,
         seed: &SeedConfig,
         cfg: &SolveConfig,
-        progress: Option<&indicatif::ProgressBar>,
+        progress: &dyn SolveProgress,
     ) -> Result<(), Error> {
         let n_nodes = self.nodes.nrows();
         let p_len = 6 * cfg.subset_order;
@@ -1077,21 +1093,8 @@ impl Mesh {
         let mut iterations = Array1::<u32>::zeros(n_nodes);
         let mut norms = Array1::<f64>::zeros(n_nodes);
 
-        // Progress bar: use provided one, or create a local one.
-        let own_pb;
-        let pb: &indicatif::ProgressBar = if let Some(p) = progress {
-            p
-        } else {
-            own_pb = indicatif::ProgressBar::new(n_nodes as u64);
-            own_pb.set_style(
-                indicatif::ProgressStyle::with_template(
-                    "  Solving mesh:  [{bar:40.cyan}] {pos}/{len} subsets  eta {eta}"
-                )
-                .unwrap()
-                .progress_chars("█░"),
-            );
-            &own_pb
-        };
+        let pb = progress;
+        pb.mesh_start(n_nodes);
 
         // --- Seed node (uses seed.tolerance, stricter than cfg.tolerance).
         // Forced preconditioning warp = the user's seed_warp; falls back to a
@@ -1104,7 +1107,7 @@ impl Mesh {
             seed_node, &[], &c_zncc, &p, &seed_cfg, Some(&seed_warp_norm),
         )?;
         store_result(seed_node, &seed_result, &mut quality_ok, &mut c_zncc, &mut p, &mut displacements, &mut iterations, &mut norms);
-        pb.inc(1);
+        progress::node_done(pb)?;
         stored[seed_node] = true;
         propagated[seed_node] = true;
         queue.push((c_zncc[seed_node].to_bits(), seed_node));
@@ -1211,10 +1214,6 @@ impl Mesh {
             &mut norms,
             &adj,
         )?;
-
-        if progress.is_none() {
-            pb.finish_and_clear();
-        }
 
         // --- Post-corrections quality gate ("subset decorrelation").
         //
@@ -1376,7 +1375,7 @@ impl Mesh {
         cur_idx: usize,
         masks: &SubsetTemplate,
         cfg: &SolveConfig,
-        pb: &indicatif::ProgressBar,
+        pb: &dyn SolveProgress,
         stored: &mut Vec<bool>,
         quality_ok: &mut Array1<bool>,
         c_zncc: &mut Array1<f64>,
@@ -1402,7 +1401,7 @@ impl Mesh {
                 nb_idx, &trusted, c_zncc, p, cfg, None,
             )?;
             store_result(nb_idx, &result, quality_ok, c_zncc, p, displacements, iterations, norms);
-            pb.inc(1);
+            progress::node_done(pb)?;
             stored[nb_idx] = true;
             // Pushed regardless of `quality_ok` — for mesh-graph connectivity
             // completeness (a not-`quality_ok` node can still be the only
@@ -1434,7 +1433,7 @@ impl Mesh {
         masks: &SubsetTemplate,
         cfg: &SolveConfig,
         pool: Option<&rayon::ThreadPool>,
-        pb: &indicatif::ProgressBar,
+        pb: &dyn SolveProgress,
         stored: &mut Vec<bool>,
         quality_ok: &mut Array1<bool>,
         c_zncc: &mut Array1<f64>,
@@ -1505,7 +1504,7 @@ impl Mesh {
                 store_result(
                     nb, &r, quality_ok, c_zncc, p, displacements, iterations, norms,
                 );
-                pb.inc(1);
+                progress::node_done(pb)?;
                 stored[nb] = true;
                 queue.push((c_zncc[nb].to_bits(), nb));
             }
@@ -1588,7 +1587,7 @@ impl Mesh {
         &self,
         masks: &SubsetTemplate,
         cfg: &SolveConfig,
-        _pb: &indicatif::ProgressBar,
+        _pb: &dyn SolveProgress,
         solved: &mut Vec<bool>,
         quality_ok: &mut Array1<bool>,
         c_zncc: &mut Array1<f64>,
@@ -3070,7 +3069,7 @@ mod tests {
         let mut zone = Array2::<u8>::from_elem((100, 100), 1u8);
         zone.slice_mut(s![.., 50..]).fill(2);
         let tmpl = SubsetTemplate { local_mask: &local_mask, zone_mask: Some(zone.view()) };
-        mesh2.solve_impl(&tmpl, &seed2, &cfg2, None).unwrap();
+        mesh2.solve_impl(&tmpl, &seed2, &cfg2, &()).unwrap();
         let sol2 = Arc::clone(mesh2.solution().unwrap());
 
         let n_diff = (0..sol1.p.nrows())
@@ -3109,6 +3108,49 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Counts `node_done` calls; cancels once `stop_after` are reported.
+    struct CountingProgress {
+        stop_after: usize,
+        started: std::sync::atomic::AtomicUsize,
+        done: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::progress::SolveProgress for CountingProgress {
+        fn mesh_start(&self, n: usize) {
+            self.started.store(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn node_done(&self) {
+            self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn cancelled(&self) -> bool {
+            self.done.load(std::sync::atomic::Ordering::Relaxed) >= self.stop_after
+        }
+    }
+
+    #[test]
+    fn solve_progress_reports_every_node_and_cancels() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let local_mask = LocalMask::circle(6).unwrap();
+
+        // Uncancelled: one mesh_start(n) and at least n node_done calls
+        // (corrections may re-report), same result as the terminal bar.
+        let (mut mesh, seed, cfg) = make_band_test_mesh_and_solve_inputs();
+        let n = mesh.nodes().nrows();
+        let p = CountingProgress { stop_after: usize::MAX, started: AtomicUsize::new(0), done: AtomicUsize::new(0) };
+        mesh.solve(&local_mask, &seed, &cfg, Some(&p)).unwrap();
+        assert_eq!(p.started.load(Ordering::Relaxed), n);
+        assert!(p.done.load(Ordering::Relaxed) >= n);
+        let (mut reference, _, _) = make_band_test_mesh_and_solve_inputs();
+        reference.solve(&local_mask, &seed, &cfg, Some(&())).unwrap();
+        assert_eq!(mesh.solution().unwrap().displacements, reference.solution().unwrap().displacements);
+
+        // Cancelled part-way: Error::Cancelled, nothing stored.
+        let (mut mesh, seed, cfg) = make_band_test_mesh_and_solve_inputs();
+        let p = CountingProgress { stop_after: 5, started: AtomicUsize::new(0), done: AtomicUsize::new(0) };
+        assert!(matches!(mesh.solve(&local_mask, &seed, &cfg, Some(&p)), Err(Error::Cancelled)));
+        assert_eq!(p.done.load(Ordering::Relaxed), 5);
+        assert!(mesh.solution().is_none());
     }
 
     fn make_band_test_mesh_and_solve_inputs() -> (Mesh, SeedConfig, SolveConfig) {

@@ -62,17 +62,22 @@ pub struct SolverConfig {
     pub parse_error: Option<String>,
 }
 
+/// Mesh/Sequence solver defaults, taken from the core's `SolveConfig::default()`.
 impl Default for SolverConfig {
     fn default() -> Self {
+        let core = geopyv_dev::mesh::SolveConfig::default();
         Self {
-            method: SolveMethod::Icgn,
-            order: SubsetOrder::First,
-            max_norm_text: "1e-5".to_string(),
-            max_norm: 1e-5,
-            max_iterations_text: "50".to_string(),
-            max_iterations: 50,
-            zncc_tol_text: "0.75".to_string(),
-            zncc_tol: 0.75,
+            method: match core.method {
+                geopyv_dev::mesh::SolveMethod::Icgn => SolveMethod::Icgn,
+                geopyv_dev::mesh::SolveMethod::Fagn => SolveMethod::Fagn,
+            },
+            order: if core.subset_order == 1 { SubsetOrder::First } else { SubsetOrder::Second },
+            max_norm_text: format!("{:e}", core.max_norm),
+            max_norm: core.max_norm,
+            max_iterations_text: core.max_iterations.to_string(),
+            max_iterations: core.max_iterations,
+            zncc_tol_text: core.tolerance.to_string(),
+            zncc_tol: core.tolerance,
             parse_error: None,
         }
     }
@@ -111,7 +116,8 @@ impl Default for NewSubsetForm {
             template_size_text: "20".to_string(),
             template_size: 20,
             template_size_error: None,
-            solver: SolverConfig::default(),
+            // Python's `Subset` defaults to first order.
+            solver: SolverConfig { order: SubsetOrder::First, ..SolverConfig::default() },
             draw: crate::draw::DrawState::new(),
             form_error: None,
         }
@@ -198,6 +204,7 @@ pub struct SubsetSpawnParams {
     pub order: SubsetOrder,
     pub max_norm: f64,
     pub max_iterations: usize,
+    pub zncc_tol: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +718,7 @@ impl SubsetTabState {
         let shape_str = match sol.mask.shape {
             MaskShape::Circle => "Circle",
             MaskShape::Square => "Square",
+            MaskShape::Semicircle => "Semicircle",
         };
 
         meta_row(ui, "Reference", &ref_name);
@@ -920,6 +928,7 @@ impl SubsetTabState {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut form.template_shape, MaskShape::Circle, "Circle");
                     ui.radio_value(&mut form.template_shape, MaskShape::Square, "Square");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Semicircle, "Semicircle");
                 });
                 ui.end_row();
 
@@ -1143,6 +1152,7 @@ impl SubsetTabState {
                     order: form.solver.order,
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
+                    zncc_tol: form.solver.zncc_tol,
                 });
                 form.form_error = None;
             }
@@ -1281,10 +1291,7 @@ fn run_solve(
     state: Arc<Mutex<SubsetSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    let local_mask = match params.template_shape {
-        MaskShape::Circle => LocalMask::circle(params.template_size as usize),
-        MaskShape::Square => LocalMask::square(params.template_size as usize),
-    };
+    let local_mask = LocalMask::new(params.template_shape.clone(), params.template_size as usize);
     let local_mask = match local_mask {
         Ok(t) => t,
         Err(e) => {
@@ -1299,7 +1306,7 @@ fn run_solve(
     }
 
     set_progress(&state, 0.1, "Loading reference image…");
-    let ref_img = match Image::from_file(&params.ref_path, 20) {
+    let ref_img = match Image::from_file(&params.ref_path, geopyv_dev::image::DEFAULT_BORDER) {
         Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Reference image error: {e}"));
@@ -1313,7 +1320,7 @@ fn run_solve(
     }
 
     set_progress(&state, 0.3, "Loading target image…");
-    let target_img = match Image::from_file(&params.target_path, 20) {
+    let target_img = match Image::from_file(&params.target_path, geopyv_dev::image::DEFAULT_BORDER) {
         Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Target image error: {e}"));
@@ -1355,10 +1362,10 @@ fn run_solve(
 
     let solve_result = match params.method {
         SolveMethod::Icgn => {
-            subset.solve_icgn(Some(&p_0), 0.75, params.max_norm, params.max_iterations)
+            subset.solve_icgn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations)
         }
         SolveMethod::Fagn => {
-            subset.solve_fagn(Some(&p_0), 0.75, params.max_norm, params.max_iterations)
+            subset.solve_fagn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations)
         }
     };
 
@@ -1408,6 +1415,23 @@ fn paint_deformed_template(
                     let dx = r * theta.cos();
                     let dy = r * theta.sin();
                     // [u, v, ux, vx, uy, vy]: x' = x + u + ux*dx + uy*dy
+                    let u = p[0] + p[2] * dx + p[4] * dy;
+                    let v = p[1] + p[3] * dx + p[5] * dy;
+                    coord.to_screen(egui::pos2(
+                        (cx + dx + u) as f32,
+                        (cy + dy + v) as f32,
+                    ))
+                })
+                .collect()
+        }
+        MaskShape::Semicircle => {
+            const N: usize = 32;
+            (0..=N + 1)
+                .map(|i| {
+                    // Arc through the bottom half (dy >= 0), then close along the diameter.
+                    let theta = std::f64::consts::PI * (i % (N + 1)) as f64 / N as f64;
+                    let dx = r * theta.cos();
+                    let dy = r * theta.sin();
                     let u = p[0] + p[2] * dx + p[4] * dy;
                     let v = p[1] + p[3] * dx + p[5] * dy;
                     coord.to_screen(egui::pos2(
@@ -1485,6 +1509,8 @@ fn build_inspect_texture(
             let inside = match sol.mask.shape {
                 MaskShape::Circle => dx * dx + dy * dy <= r * r,
                 MaskShape::Square => true,
+                // Bottom half only: rows at or below the centre (dy >= 0).
+                MaskShape::Semicircle => dx * dx + dy * dy <= r * r && dy >= 0,
             };
             if !inside {
                 continue; // stays transparent
@@ -1536,6 +1562,9 @@ fn paint_template_outline_color(
         MaskShape::Circle => {
             painter.circle_stroke(center, screen_radius, stroke);
         }
+        MaskShape::Semicircle => {
+            painter.add(egui::Shape::closed_line(half_disc_points(center, screen_radius), stroke));
+        }
         MaskShape::Square => {
             let rect = egui::Rect::from_center_size(
                 center,
@@ -1544,6 +1573,18 @@ fn paint_template_outline_color(
             painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Middle);
         }
     }
+}
+
+/// Screen-space points of the bottom half-disc (screen y increases downward,
+/// matching image rows), used for the `Semicircle` template.
+fn half_disc_points(center: egui::Pos2, screen_radius: f32) -> Vec<egui::Pos2> {
+    const N: usize = 32;
+    (0..=N)
+        .map(|i| {
+            let theta = std::f32::consts::PI * i as f32 / N as f32;
+            center + egui::vec2(screen_radius * theta.cos(), screen_radius * theta.sin())
+        })
+        .collect()
 }
 
 fn paint_template_fill(
@@ -1557,6 +1598,13 @@ fn paint_template_fill(
     match shape {
         MaskShape::Circle => {
             painter.circle_filled(center, screen_radius, fill);
+        }
+        MaskShape::Semicircle => {
+            painter.add(egui::Shape::convex_polygon(
+                half_disc_points(center, screen_radius),
+                fill,
+                egui::Stroke::NONE,
+            ));
         }
         MaskShape::Square => {
             let rect = egui::Rect::from_center_size(

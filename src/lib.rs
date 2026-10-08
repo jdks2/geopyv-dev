@@ -5,6 +5,7 @@ pub mod image;
 pub mod io;
 pub mod mesh;
 pub mod particle;
+pub mod progress;
 pub mod field;
 pub mod sequence;
 pub mod subset;

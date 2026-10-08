@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 
-use geopyv_dev::field::{Field, FieldDistribution, FieldSolution};
+use geopyv_dev::field::{grid_particles, Field, FieldDistribution, FieldSolution};
 use geopyv_dev::io::GeopyvObject;
 use geopyv_dev::particle::ParticleSolution;
 
 use crate::colormap::{self, ColormapType};
-use crate::draw::{ActiveDrawMode, DrawState, point_in_polygon};
+use crate::draw::{ActiveDrawMode, DrawState, DrawnRegion};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
 
 // ---------------------------------------------------------------------------
@@ -55,21 +55,14 @@ impl FieldComponent {
             Self::Exx => sol.strains[[f, 0]],
             Self::Eyy => sol.strains[[f, 1]],
             Self::Exy => sol.strains[[f, 5]],
-            Self::E1 => {
-                let exx = sol.strains[[f, 0]];
-                let eyy = sol.strains[[f, 1]];
-                let exy = sol.strains[[f, 5]];
-                let mean = (exx + eyy) / 2.0;
-                let dev = (((exx - eyy) / 2.0).powi(2) + exy.powi(2)).sqrt();
-                mean + dev
-            }
-            Self::E2 => {
-                let exx = sol.strains[[f, 0]];
-                let eyy = sol.strains[[f, 1]];
-                let exy = sol.strains[[f, 5]];
-                let mean = (exx + eyy) / 2.0;
-                let dev = (((exx - eyy) / 2.0).powi(2) + exy.powi(2)).sqrt();
-                mean - dev
+            // Stored at solve time (core `principal_strains`); recomputed only
+            // for solutions saved before that field existed.
+            Self::E1 | Self::E2 => {
+                let col = if self == Self::E1 { 0 } else { 1 };
+                match &sol.principal_strains {
+                    Some(ps) => ps[[f, col]],
+                    None => geopyv_dev::particle::principal_strains(&sol.strains)[[f, col]],
+                }
             }
             Self::VolStrain => {
                 let f2 = frame.min(sol.vol_strains.len().saturating_sub(1));
@@ -82,38 +75,6 @@ impl FieldComponent {
 // ---------------------------------------------------------------------------
 // Grid generation
 // ---------------------------------------------------------------------------
-
-pub fn generate_grid(
-    boundary: &[egui::Pos2],
-    exclusions: &[Vec<egui::Pos2>],
-    spacing: f32,
-) -> Vec<egui::Pos2> {
-    if boundary.len() < 3 || spacing <= 0.0 {
-        return Vec::new();
-    }
-
-    let min_x = boundary.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
-    let max_x = boundary.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
-    let min_y = boundary.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
-    let max_y = boundary.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
-
-    let mut points = Vec::new();
-    let mut x = min_x + spacing * 0.5;
-    while x <= max_x {
-        let mut y = min_y + spacing * 0.5;
-        while y <= max_y {
-            let p = egui::pos2(x, y);
-            if point_in_polygon(p, boundary)
-                && !exclusions.iter().any(|ex| point_in_polygon(p, ex))
-            {
-                points.push(p);
-            }
-            y += spacing;
-        }
-        x += spacing;
-    }
-    points
-}
 
 // ---------------------------------------------------------------------------
 // New field form
@@ -151,8 +112,8 @@ impl Default for NewFieldForm {
             lagrangian: true,
             depth_text: "1.0".to_string(),
             depth: 1.0,
-            factor_text: "1.0".to_string(),
-            factor: 1.0,
+            factor_text: geopyv_dev::particle::ParticleConfig::default().factor.to_string(),
+            factor: geopyv_dev::particle::ParticleConfig::default().factor,
             true_incs: true,
             form_error: None,
             cached_grid: Vec::new(),
@@ -161,6 +122,12 @@ impl Default for NewFieldForm {
             last_spacing: 0.0,
         }
     }
+}
+
+/// A drawn region as an `(N, 2)` `[x, y]` vertex array (image-pixel space).
+fn polygon_array(region: &DrawnRegion) -> Array2<f64> {
+    let verts = region.to_nodes();
+    Array2::from_shape_fn((verts.len(), 2), |(i, j)| verts[i][j])
 }
 
 impl NewFieldForm {
@@ -189,14 +156,22 @@ impl NewFieldForm {
         self.last_exclusions_sig = exclusions_sig;
         self.last_spacing = self.spacing;
 
-        if let Some(b) = &self.draw.boundary {
-            let b_verts = b.to_egui_verts();
-            let exclusion_verts: Vec<Vec<egui::Pos2>> =
-                self.draw.exclusions.iter().map(|e| e.to_egui_verts()).collect();
-            self.cached_grid = generate_grid(&b_verts, &exclusion_verts, self.spacing);
-        } else {
-            self.cached_grid = Vec::new();
-        }
+        // Preview exactly what `FieldDistribution::Grid` will place.
+        self.cached_grid = match &self.draw.boundary {
+            Some(b) => {
+                let boundary = polygon_array(b);
+                let exclusions: Vec<Array2<f64>> =
+                    self.draw.exclusions.iter().map(polygon_array).collect();
+                let views: Vec<_> = exclusions.iter().map(|e| e.view()).collect();
+                let (coords, _) = grid_particles(boundary.view(), &views, self.spacing as f64, 1.0);
+                coords
+                    .rows()
+                    .into_iter()
+                    .map(|r| egui::pos2(r[0] as f32, r[1] as f32))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
     }
 
     pub fn invalidate_grid(&mut self) {
@@ -314,8 +289,11 @@ impl FieldSolveState {
 pub struct FieldSpawnParams {
     pub name: String,
     pub sequence_path: PathBuf,
-    pub grid_points: Vec<[f64; 2]>,
-    pub volume_per_particle: f64,
+    /// Field boundary and exclusion polygons, `(N, 2)` `[x, y]`.
+    pub boundary: Array2<f64>,
+    pub exclusions: Vec<Array2<f64>>,
+    /// Grid pitch for `FieldDistribution::Grid`.
+    pub spacing: f64,
     pub track: bool,
     pub depth: f64,
     pub factor: f64,
@@ -1104,17 +1082,12 @@ impl FieldTabState {
                 .add_enabled(can_run, egui::Button::new("Run").min_size(egui::vec2(60.0, 26.0)))
                 .clicked()
             {
-                let grid_points: Vec<[f64; 2]> = form
-                    .cached_grid
-                    .iter()
-                    .map(|p| [p.x as f64, p.y as f64])
-                    .collect();
-                let volume_per_particle = (form.spacing as f64).powi(2);
                 spawn = Some(FieldSpawnParams {
                     name: form.name.trim().to_string(),
                     sequence_path: sequences[form.seq_idx.unwrap()].clone(),
-                    grid_points,
-                    volume_per_particle,
+                    boundary: form.draw.boundary.as_ref().map(polygon_array).unwrap_or_else(|| Array2::zeros((0, 2))),
+                    exclusions: form.draw.exclusions.iter().map(polygon_array).collect(),
+                    spacing: form.spacing as f64,
                     track: form.lagrangian,
                     depth: form.depth,
                     factor: form.factor,
@@ -1356,33 +1329,19 @@ fn run_solve(
         }
     };
 
-    let n_meshes = seq_sol.mesh_solutions.len();
-    if n_meshes == 0 {
+    if seq_sol.n_meshes() == 0 {
         set_error(&state, "Sequence contains no mesh solutions".to_string());
-        return;
-    }
-
-    let n_particles = params.grid_points.len();
-    if n_particles == 0 {
-        set_error(
-            &state,
-            "No grid points — draw a boundary and set spacing".to_string(),
-        );
         return;
     }
 
     set_progress(&state, 0.1, "Building field\u{2026}");
 
-    let mut coords = Array2::<f64>::zeros((n_particles, 2));
-    for (i, pt) in params.grid_points.iter().enumerate() {
-        coords[[i, 0]] = pt[0];
-        coords[[i, 1]] = pt[1];
-    }
-    let volume = params.volume_per_particle.max(f64::MIN_POSITIVE);
-    let vols = Array1::<f64>::from_elem(n_particles, volume);
-
     let depth = params.depth.max(f64::MIN_POSITIVE);
-    let distribution = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
+    let distribution = FieldDistribution::Grid {
+        boundary_nodes: params.boundary,
+        exclusion_nodes: params.exclusions,
+        spacing: params.spacing,
+    };
     let source = Arc::new(seq_sol);
     let mut field = match Field::new(source, distribution, params.track, depth) {
         Ok(f) => f,
@@ -1401,7 +1360,7 @@ fn run_solve(
 
     set_progress(&state, 0.15, "Solving field\u{2026}");
 
-    if let Err(e) = field.solve(params.factor, params.true_incs, None, geopyv_dev::particle::StrainMethod::Mesh) {
+    if let Err(e) = field.solve(params.factor, params.true_incs, None, geopyv_dev::particle::StrainMethod::default()) {
         set_error(&state, format!("Solve error: {e}"));
         return;
     }

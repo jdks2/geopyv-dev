@@ -304,7 +304,7 @@ impl PySequence {
             border,
             save: save.map(PathBuf::from),
         };
-        self.inner.solve(&cfg).map_err(Error::from)?;
+        self.inner.solve(&cfg, None).map_err(Error::from)?;
         let sol = self.inner.solution().expect("solve() succeeded, solution must be Some");
 
         // Write the final tracked boundary/exclusion state back into the

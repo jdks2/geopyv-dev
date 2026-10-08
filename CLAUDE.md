@@ -34,12 +34,18 @@ pytest tests/python/mesh/test_mesh.py
 source .venv/bin/activate && python basictest.py
 ```
 
-### Build the GUI (separate binary crate)
+### Build the GUI
 
 ```bash
 cargo build -p geopyv-gui
 cargo run -p geopyv-gui
 ```
+
+`geopyv-gui` is a library (`geopyv_gui::run`) plus a thin binary. The Python
+extension links it and exposes `run_gui`; `pyproject.toml` installs a
+`geopyv-gui` console script (`geopyv_dev/gui.py`), so after `maturin develop`
+or `pip install geopyv-dev` users just run `geopyv-gui`. The GUI is a thin
+front-end: solving, defaults and derived quantities belong in the core.
 
 ### Publishing a release to PyPI
 

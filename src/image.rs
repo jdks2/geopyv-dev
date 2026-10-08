@@ -27,6 +27,9 @@ type Mat6 = SMatrix<f64, 6, 6>;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Default padding border (pixels) for B-spline coefficient computation.
+pub const DEFAULT_BORDER: usize = 20;
+
 /// Pre-processed image ready for bi-quintic B-spline DIC interpolation.
 pub struct Image {
     /// Grayscale pixel intensities (height × width), values 0.0–255.0.
