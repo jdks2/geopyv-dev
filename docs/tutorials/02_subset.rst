@@ -33,8 +33,9 @@ A ``Subset`` is defined by four things:
      - The patch's radius (circle) or half-width (square), set on the
        ``local_mask`` itself
    * - Order
-     - ``subset_order`` — 1 (affine) or 2 (quadratic); how complex a warp the
-       solver is allowed to fit (see *The warp function*, below)
+     - ``subset_order`` — 0 (translation), 1 (affine), or 2 (quadratic); how
+       complex a warp the solver is allowed to fit (see *The warp function*,
+       below). Default ``1``.
 
 .. image:: /_static/gifs/subset_shape_order.gif
    :alt: A circle and a square subset template growing and shrinking, then fixed
@@ -117,7 +118,12 @@ The warp function
 -------------------
 
 The DIC solver describes how a subset deforms using a **warp vector** ``p``. For
-**order 1** (affine, 6 parameters)::
+**order 0** (translation only, 2 parameters)::
+
+   u(x,y) = p[0]
+   v(x,y) = p[1]
+
+For **order 1** (affine, 6 parameters)::
 
    u(x,y) = p[0] + p[2]·Δx + p[4]·Δy
    v(x,y) = p[1] + p[3]·Δx + p[5]·Δy
@@ -130,7 +136,9 @@ ordering used by ``Speckle``'s ``comp`` array in :doc:`00_introduction` and
 
 For **order 2** (quadratic, 12 parameters), six second-order terms
 (``p[6..11]``) are added. Most analyses use order 1 for ``Subset`` and order 2
-for ``Mesh``/``Sequence``.
+for ``Mesh``/``Sequence``; order 0 is mainly useful as a deliberately
+under-specified baseline, e.g. for warp-adequacy diagnostics that compare a
+solve's residual against the modes a lower order couldn't fit.
 
 Solve
 ------

@@ -144,7 +144,7 @@ class TestErrorCases:
 
     def test_load_wrong_version(self, tmp_path):
         path = str(tmp_path / "badver.pyv")
-        # 0x7f is unrecognised (supported: 0x01-0x03 and the current 0x07).
+        # 0x7f is unrecognised (supported: 0x01-0x03, 0x07 and the current 0x08).
         with open(path, "wb") as f:
             f.write(b"GPYV\x7f" + b"\x00" * 8)
         with pytest.raises(RuntimeError, match="version"):

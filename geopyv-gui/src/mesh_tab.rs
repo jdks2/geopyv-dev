@@ -1486,36 +1486,10 @@ pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType) -> Vec<f64> 
 
 /// Derive a coordinate transform for displaying the mesh without an image underlay.
 pub fn mesh_coord_from_bounds(sol: &MeshSolution, viewport: egui::Rect) -> ImageCoord {
-    let n = sol.nodes.nrows();
-    if n == 0 {
-        return ImageCoord {
-            canvas_center: viewport.center(),
-            offset: egui::Vec2::ZERO,
-            zoom: 1.0,
-            img_size: egui::Vec2::ZERO,
-        };
-    }
-
-    let xs: Vec<f32> = (0..n).map(|i| sol.nodes[[i, 0]] as f32).collect();
-    let ys: Vec<f32> = (0..n).map(|i| sol.nodes[[i, 1]] as f32).collect();
-    let min_x = xs.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_x = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_y = ys.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_y = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-    let w = (max_x - min_x).max(1.0);
-    let h = (max_y - min_y).max(1.0);
-    let zoom = (viewport.width() / w).min(viewport.height() / h) * 0.85;
-
-    let cx = (min_x + max_x) * 0.5;
-    let cy = (min_y + max_y) * 0.5;
-
-    ImageCoord {
-        canvas_center: viewport.center(),
-        offset: egui::vec2(-cx * zoom, -cy * zoom),
-        zoom,
-        img_size: egui::Vec2::ZERO,
-    }
+    crate::overlay::coord_from_points(
+        sol.nodes.rows().into_iter().map(|r| [r[0], r[1]]),
+        viewport,
+    )
 }
 
 /// Render the coloured-triangle mesh overlay onto `painter`.
@@ -1604,88 +1578,7 @@ pub fn render_mesh_overlay(
     }
 }
 
-/// Render a vertical colorbar overlay in the top-right corner of the viewer.
-pub fn render_colorbar(
-    painter: &egui::Painter,
-    viewer_rect: egui::Rect,
-    vmin: f64,
-    vmax: f64,
-    cmap: ColormapType,
-    label: &str,
-) {
-    const BAR_W: f32 = 22.0;
-    const MARGIN: f32 = 12.0;
-    const TITLE_H: f32 = 22.0;
-    const LABEL_W: f32 = 64.0;
-    const LABEL_PAD: f32 = 4.0;
-    const N: usize = 64;
-
-    let bar_h = (viewer_rect.height() - MARGIN * 2.0 - TITLE_H - 20.0).max(40.0);
-    let bar_x = viewer_rect.max.x - MARGIN - BAR_W - LABEL_W;
-    let bar_y = viewer_rect.min.y + MARGIN + TITLE_H;
-
-    let bg_rect = egui::Rect::from_min_max(
-        egui::pos2(bar_x - 4.0, viewer_rect.min.y + MARGIN - 2.0),
-        egui::pos2(viewer_rect.max.x - MARGIN + 2.0, bar_y + bar_h + 14.0),
-    );
-    painter.rect_filled(
-        bg_rect,
-        egui::CornerRadius::same(4),
-        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
-    );
-
-    // Title.
-    painter.text(
-        egui::pos2(bar_x + BAR_W * 0.5, viewer_rect.min.y + MARGIN + TITLE_H * 0.5),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::new(14.0, egui::FontFamily::Proportional),
-        egui::Color32::from_rgb(210, 210, 210),
-    );
-
-    // Gradient bar (N strips, top = max).
-    let strip_h = bar_h / N as f32;
-    for i in 0..N {
-        let t = 1.0 - i as f32 / (N - 1) as f32;
-        let color = colormap::sample(t, cmap);
-        let y0 = bar_y + i as f32 * strip_h;
-        let strip = egui::Rect::from_min_size(
-            egui::pos2(bar_x, y0),
-            egui::vec2(BAR_W, strip_h + 0.5),
-        );
-        painter.rect_filled(strip, egui::CornerRadius::same(0), color);
-    }
-
-    // Min / max labels.
-    let lc = egui::Color32::from_rgb(220, 220, 220);
-    let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-    let lx = bar_x + BAR_W + LABEL_PAD;
-    painter.text(
-        egui::pos2(lx, bar_y),
-        egui::Align2::LEFT_CENTER,
-        format_sci(vmax),
-        font.clone(),
-        lc,
-    );
-    painter.text(
-        egui::pos2(lx, bar_y + bar_h),
-        egui::Align2::LEFT_CENTER,
-        format_sci(vmin),
-        font,
-        lc,
-    );
-}
-
-pub fn format_sci(v: f64) -> String {
-    if v.abs() < 1e-12 {
-        return "0".to_string();
-    }
-    if v.abs() >= 1000.0 || (v.abs() < 0.001 && v.abs() > 0.0) {
-        format!("{:.2e}", v)
-    } else {
-        format!("{:.4}", v)
-    }
-}
+pub use crate::overlay::{format_sci, render_colorbar};
 
 // ---------------------------------------------------------------------------
 // UI helpers

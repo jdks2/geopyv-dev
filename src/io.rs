@@ -9,13 +9,14 @@
 //! ```text
 //! [0..4]   magic  b"GPYV"
 //! [4]      version  0x01 (uncompressed, schema v0) | 0x02 (zstd, schema v0)
-//!                    | 0x03 (zstd, schema v1) | 0x07 (zstd, schema v2 — current)
+//!                    | 0x03 (zstd, schema v1) | 0x07 (zstd, schema v2)
+//!                    | 0x08 (zstd, schema v3 — current)
 //! [5..]    bincode v2 (standard config) encoded GeopyvObject (schema-version-
 //!          dependent shape — see "Schema versioning" below), zstd-compressed
 //!          (level 3) for every version except 0x01
 //! ```
 //!
-//! New files are always written with version 0x07 (zstd + current schema).
+//! New files are always written with version 0x08 (zstd + current schema).
 //! Bytes 0x04-0x06 were used only by unreleased development builds and are
 //! deliberately rejected as unsupported.
 //!
@@ -87,14 +88,17 @@ const VERSION_ZSTD_V0: u8 = 0x02;
 /// package (GitHub `main` at `df92b03`). Still readable on load, but no
 /// longer written.
 const VERSION_ZSTD_V1: u8 = 0x03;
-/// zstd-compressed, schema v2 (current). Relative to v1: `MeshSolution`
+/// zstd-compressed, schema v2. Relative to v1: `MeshSolution`
 /// gains `template_shape` / `template_sizes` / `zonal_masking`;
 /// `SolveConfig` gains `preconditioning` / `layer_rg`; `SolveResult` gains
 /// `eta_omitted`; `ParticleSolution` gains `principal_strains` /
 /// `gamma_max_grad`; `ParticleConfig` gains `strain_method`; `Speckle` gains
-/// `speckle_limit`. Always written by [`save`]. (0x04-0x06 skipped: used by
-/// unreleased development builds with incompatible shapes.)
-const CURRENT_VERSION: u8 = 0x07;
+/// `speckle_limit`. Still readable on load, but no longer written. (0x04-0x06
+/// skipped: used by unreleased development builds with incompatible shapes.)
+const VERSION_ZSTD_V2: u8 = 0x07;
+/// zstd-compressed, schema v3 (current). Relative to v2: `FieldSolution`
+/// gains `region`. Always written by [`save`].
+const CURRENT_VERSION: u8 = 0x08;
 
 // ---------------------------------------------------------------------------
 // Tagged union for all serialisable object types
@@ -344,6 +348,7 @@ impl From<LegacyFieldSolution> for FieldSolution {
             calibrated: l.calibrated,
             depth: 0.0,
             track: false,
+            region: None,
         }
     }
 }
@@ -638,6 +643,7 @@ impl From<LegacyFieldSolutionV1> for FieldSolution {
             calibrated: l.calibrated,
             depth: l.depth,
             track: l.track,
+            region: None,
         }
     }
 }
@@ -736,6 +742,70 @@ impl From<LegacyGeopyvObject> for GeopyvObject {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy shapes (schema v2 — the 0x07 format). Frozen: do not edit these to
+// match future changes — freeze a new `Legacy*V3` set instead and chain it
+// in `load`. Only `FieldSolution` changed in v3; every other variant reuses
+// the current type.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyFieldSolutionV2 {
+    particles: Vec<Arc<ParticleSolution>>,
+    initial_coordinates: ndarray::Array2<f64>,
+    vol_totals: ndarray::Array1<f64>,
+    reference_update_register: Vec<usize>,
+    #[serde(default)]
+    image_0_path: Option<PathBuf>,
+    #[serde(default)]
+    calibrated: bool,
+    #[serde(default)]
+    depth: f64,
+    #[serde(default)]
+    track: bool,
+}
+
+impl From<LegacyFieldSolutionV2> for FieldSolution {
+    fn from(l: LegacyFieldSolutionV2) -> Self {
+        FieldSolution {
+            particles: l.particles,
+            initial_coordinates: l.initial_coordinates,
+            vol_totals: l.vol_totals,
+            reference_update_register: l.reference_update_register,
+            image_0_path: l.image_0_path,
+            calibrated: l.calibrated,
+            depth: l.depth,
+            track: l.track,
+            region: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV2 {
+    Subset(SubsetSolution),
+    Mesh(MeshSolution),
+    Field(LegacyFieldSolutionV2),
+    Sequence(SequenceSolution),
+    Particle(ParticleSolution),
+    Speckle(Speckle),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV2> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV2) -> Self {
+        match l {
+            LegacyGeopyvObjectV2::Subset(s) => GeopyvObject::Subset(s),
+            LegacyGeopyvObjectV2::Mesh(m) => GeopyvObject::Mesh(m),
+            LegacyGeopyvObjectV2::Field(f) => GeopyvObject::Field(f.into()),
+            LegacyGeopyvObjectV2::Sequence(s) => GeopyvObject::Sequence(s),
+            LegacyGeopyvObjectV2::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV2::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV2::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // save / load
 // ---------------------------------------------------------------------------
 
@@ -762,8 +832,8 @@ pub fn save<P: AsRef<Path>>(path: P, object: &GeopyvObject) -> Result<(), Error>
 /// Returns [`Error::InvalidMagic`] if the file does not start with `b"GPYV"`.
 /// Returns [`Error::UnsupportedVersion`] for any unrecognised version byte.
 ///
-/// Files with version `0x01`/`0x02` (schema v0) or `0x03` (schema v1, the
-/// released package's format) are decoded via the frozen `Legacy*` /
+/// Files with version `0x01`/`0x02` (schema v0), `0x03` (schema v1, the
+/// released package's format) or `0x07` (schema v2) are decoded via the frozen `Legacy*` /
 /// `Legacy*V1` types and migrated into the current shapes — see "Schema
 /// versioning" in the module docs.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
@@ -785,7 +855,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
 
     let data = match ver_buf[0] {
         VERSION_UNCOMPRESSED => raw,
-        VERSION_ZSTD_V0 | VERSION_ZSTD_V1 | CURRENT_VERSION => {
+        VERSION_ZSTD_V0 | VERSION_ZSTD_V1 | VERSION_ZSTD_V2 | CURRENT_VERSION => {
             zstd::decode_all(raw.as_slice()).map_err(|e| Error::Io(e.to_string()))?
         }
         v => return Err(Error::UnsupportedVersion(v)),
@@ -800,6 +870,15 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
                 )
                 .map_err(|e| Error::Io(e.to_string()))?;
             Ok(object)
+        }
+        VERSION_ZSTD_V2 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV2, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
         }
         VERSION_ZSTD_V1 => {
             let (legacy, _) =
@@ -1121,6 +1200,89 @@ mod tests {
             assert!(matches!(load(&tmp), Err(Error::UnsupportedVersion(x)) if x == v));
             let _ = std::fs::remove_file(tmp);
         }
+    }
+
+    fn make_particle_solution() -> ParticleSolution {
+        ParticleSolution {
+            coordinates: array![[1.0_f64, 2.0], [1.5, 2.5]],
+            warps: Array2::zeros((2, 6)),
+            incs: Array2::zeros((2, 6)),
+            volumes: array![1.0_f64, 1.0],
+            strains: Array2::zeros((2, 6)),
+            strain_incs: Array2::zeros((1, 6)),
+            vol_strains: array![0.0_f64, 0.0],
+            reference_update_register: vec![],
+            image_0_path: None,
+            calibrated: false,
+            config: None,
+            principal_strains: Some(Array2::zeros((2, 4))),
+            gamma_max_grad: None,
+        }
+    }
+
+    /// FieldSolution (with its region) round-trips through the current schema.
+    #[test]
+    fn test_field_region_round_trip() {
+        let region = crate::field::FieldRegion {
+            boundary: array![[0.0_f64, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+            exclusions: vec![array![[1.0_f64, 1.0], [2.0, 1.0], [2.0, 2.0]]],
+        };
+        let sol = FieldSolution {
+            particles: vec![Arc::new(make_particle_solution())],
+            initial_coordinates: array![[1.0_f64, 2.0]],
+            vol_totals: array![1.0_f64, 1.0],
+            reference_update_register: vec![],
+            image_0_path: None,
+            calibrated: false,
+            depth: 1.0,
+            track: true,
+            region: Some(region.clone()),
+        };
+        let tmp = std::env::temp_dir().join("geopyv_test_field_region.pyv");
+        save(&tmp, &GeopyvObject::Field(sol)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Field(f) => {
+                let r = f.region.expect("region survives round trip");
+                assert_eq!(r.boundary, region.boundary);
+                assert_eq!(r.exclusions, region.exclusions);
+            }
+            _ => panic!("expected Field"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v2 (0x07) field file loads via the legacy path with no region.
+    #[test]
+    fn test_schema_v2_field_file_loads_via_legacy_path() {
+        let legacy = LegacyGeopyvObjectV2::Field(LegacyFieldSolutionV2 {
+            particles: vec![Arc::new(make_particle_solution())],
+            initial_coordinates: array![[1.0_f64, 2.0]],
+            vol_totals: array![1.0_f64, 1.0],
+            reference_update_register: vec![1],
+            image_0_path: None,
+            calibrated: false,
+            depth: 2.0,
+            track: true,
+        });
+        let encoded = bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
+        let compressed = zstd::encode_all(encoded.as_slice(), 3).unwrap();
+        let tmp = std::env::temp_dir().join("geopyv_test_v2_field.pyv");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            f.write_all(MAGIC).unwrap();
+            f.write_all(&[VERSION_ZSTD_V2]).unwrap();
+            f.write_all(&compressed).unwrap();
+        }
+        match load(&tmp).unwrap() {
+            GeopyvObject::Field(f) => {
+                assert!(f.region.is_none());
+                assert_eq!(f.depth, 2.0);
+                assert_eq!(f.reference_update_register, vec![1]);
+                assert_eq!(f.particles[0].coordinates, array![[1.0_f64, 2.0], [1.5, 2.5]]);
+            }
+            _ => panic!("expected Field"),
+        }
+        let _ = std::fs::remove_file(tmp);
     }
 
     /// A version 0x01 (legacy uncompressed, schema v0) file is still readable

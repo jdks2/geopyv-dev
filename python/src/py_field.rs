@@ -5,7 +5,7 @@ use std::sync::Arc;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
-use geopyv_dev::field::{self, Field, FieldDistribution, FieldSolution};
+use geopyv_dev::field::{self, ContourReduction, Field, FieldDistribution, FieldQuantity, FieldSolution};
 use ndarray::Array2;
 
 use geopyv_dev::sequence::SequenceSolution;
@@ -241,6 +241,65 @@ impl PyField {
         Ok(self.require_solved()?.calibrated)
     }
 
+    /// The region the particles were placed in, as ``(boundary,
+    /// [exclusion, ...])`` ``(N, 2)`` arrays, or ``None`` for a field saved
+    /// before regions were stored (re-solve to populate).
+    #[getter]
+    fn region<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<(Bound<'py, PyArray2<f64>>, Vec<Bound<'py, PyArray2<f64>>>)>> {
+        Ok(self.require_solved()?.region.as_ref().map(|r| {
+            (
+                r.boundary.clone().into_pyarray_bound(py),
+                r.exclusions.iter().map(|e| e.clone().into_pyarray_bound(py)).collect(),
+            )
+        }))
+    }
+
+    /// One reduced value of ``quantity`` per particle ``(N,)``.
+    ///
+    /// ``window`` is a half-open increment range ``(start, stop)`` (``None``:
+    /// all). With ``dt`` unset the value is last-minus-first over the window,
+    /// or the sum of |increment deltas| if ``absolute``; with ``dt`` it is the
+    /// mean rate. ``gamma_max_grad`` reduces each gradient component and
+    /// returns the magnitude.
+    #[pyo3(signature = (quantity, window=None, dt=None, absolute=false))]
+    fn contour_values<'py>(
+        &self,
+        py: Python<'py>,
+        quantity: &str,
+        window: Option<(usize, usize)>,
+        dt: Option<f64>,
+        absolute: bool,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let q: FieldQuantity = quantity.parse().map_err(value_error)?;
+        let red = ContourReduction { window, dt, absolute };
+        let v = self.require_solved()?.contour_values(q, &red).map_err(value_error)?;
+        Ok(v.into_pyarray_bound(py))
+    }
+
+    /// Particle positions ``(N, 2)`` to contour at: initial, or (``deformed``)
+    /// at the last increment of ``window``.
+    #[pyo3(signature = (deformed=false, window=None))]
+    fn contour_coordinates<'py>(
+        &self,
+        py: Python<'py>,
+        deformed: bool,
+        window: Option<(usize, usize)>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let red = ContourReduction { window, ..Default::default() };
+        let c = self.require_solved()?.contour_coordinates(deformed, &red).map_err(value_error)?;
+        Ok(c.into_pyarray_bound(py))
+    }
+
+    /// Delaunay triangles ``(M, 3)`` over the initial particle positions,
+    /// restricted to the field's region (full hull if ``region`` is None).
+    fn contour_triangles<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let t = self.require_solved()?.contour_triangles();
+        Ok(t.mapv(|i| i as i64).into_pyarray_bound(py))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Field(n_particles={}, inc_no={}, track={}, solved={})",
@@ -250,6 +309,12 @@ impl PyField {
             self.inner.solved(),
         )
     }
+}
+
+/// Contour-argument errors (bad quantity/window, missing stored array) are
+/// the caller's input, so they surface as ``ValueError``.
+fn value_error(e: geopyv_dev::Error) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
 
 impl PyField {

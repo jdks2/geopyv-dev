@@ -202,6 +202,46 @@ pub struct FieldSolution {
     /// Whether per-particle tracking (`Particle.track`) was enabled.
     #[serde(default)]
     pub track: bool,
+    /// The region the particles were placed in, in the same (reference)
+    /// space as `initial_coordinates` — used to drop contour triangles that
+    /// bridge exclusions or concave boundary sections. `None` only for
+    /// solutions predating this field (.pyv schema < 0x08).
+    #[serde(default)]
+    pub region: Option<FieldRegion>,
+}
+
+/// Boundary and exclusion polygons of a [`Field`], each `(N, 2)` `[x, y]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldRegion {
+    pub boundary: Array2<f64>,
+    pub exclusions: Vec<Array2<f64>>,
+}
+
+impl FieldRegion {
+    /// Inside the boundary and outside every exclusion.
+    pub fn contains(&self, p: [f64; 2]) -> bool {
+        point_in_polygon(p, self.boundary.view())
+            && !self.exclusions.iter().any(|ex| point_in_polygon(p, ex.view()))
+    }
+
+    /// The reference-mesh boundary/exclusion polygons of `mesh`.
+    fn from_mesh(mesh: &crate::mesh::MeshSolution) -> Self {
+        let poly = |idx: &[usize]| {
+            Array2::from_shape_fn((idx.len(), 2), |(i, j)| mesh.nodes[[idx[i], j]])
+        };
+        FieldRegion {
+            boundary: poly(&mesh.boundary),
+            exclusions: mesh.exclusions.iter().map(|e| poly(e)).collect(),
+        }
+    }
+
+    /// Map every polygon from image to object space.
+    fn i2o(&self, params: &CalibrationParams) -> Self {
+        FieldRegion {
+            boundary: params.i2o(self.boundary.view()),
+            exclusions: self.exclusions.iter().map(|e| params.i2o(e.view())).collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +259,9 @@ pub struct Field {
     pub volumes: Array1<f64>,
     pub track: bool,
     pub depth: f64,
+    /// Region the particles were placed in. Set by [`FieldDistribution::Grid`];
+    /// otherwise taken from the first mesh's boundary/exclusions at solve time.
+    pub region: Option<FieldRegion>,
     solution: Option<FieldSolution>,
 }
 
@@ -239,6 +282,7 @@ impl Field {
             ));
         }
 
+        let mut region = None;
         let (coordinates, volumes) = match distribution {
             FieldDistribution::Explicit { coordinates, volumes } => {
                 if coordinates.ncols() != 2 {
@@ -280,11 +324,12 @@ impl Field {
                         "grid distribution placed no particles: check boundary and spacing".to_string(),
                     ));
                 }
+                region = Some(FieldRegion { boundary: boundary_nodes, exclusions: exclusion_nodes });
                 (coordinates, volumes)
             }
         };
 
-        Ok(Field { source, coordinates, volumes, track, depth, solution: None })
+        Ok(Field { source, coordinates, volumes, track, depth, region, solution: None })
     }
 
     pub fn n_particles(&self) -> usize { self.coordinates.nrows() }
@@ -326,8 +371,9 @@ impl Field {
             if !p.volumes.is_empty() { volumes[i] = p.volumes[0]; }
         }
         let coordinates = sol.initial_coordinates.clone();
+        let region = sol.region.clone();
         Field { source: dummy_source, coordinates, volumes, track: true, depth: 1.0,
-                solution: Some(sol) }
+                region, solution: Some(sol) }
     }
 
     /// Solve strain paths for all particles.
@@ -368,8 +414,12 @@ impl Field {
         }
 
         // Phase 2: one mesh at a time — load, solve all particles, drop.
+        let mut region = self.region.clone();
         for m in 0..n_meshes {
             let mesh = source.load_mesh_at(m)?;
+            if m == 0 && region.is_none() {
+                region = Some(FieldRegion::from_mesh(&mesh));
+            }
             particles.par_iter_mut().for_each(|p| {
                 p.solve_increment(m, &mesh, &cfg, calibration);
             });
@@ -457,9 +507,265 @@ impl Field {
             calibrated,
             depth: self.depth,
             track: self.track,
+            region: region.map(|r| match calibration {
+                Some(params) => r.i2o(params),
+                None => r,
+            }),
         });
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Contour data — shared by the Python `Field.contour()` and the GUI
+// ---------------------------------------------------------------------------
+
+/// A per-particle scalar that [`FieldSolution::contour_values`] can plot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldQuantity {
+    U,
+    V,
+    R,
+    EpXx,
+    EpYy,
+    EpXy,
+    EpVol,
+    Ep1,
+    Ep2,
+    GammaMax,
+    ThetaP,
+    GammaMaxGrad,
+}
+
+impl FieldQuantity {
+    pub const ALL: [FieldQuantity; 12] = [
+        Self::U, Self::V, Self::R, Self::EpXx, Self::EpYy, Self::EpXy, Self::EpVol,
+        Self::Ep1, Self::Ep2, Self::GammaMax, Self::ThetaP, Self::GammaMaxGrad,
+    ];
+
+    /// The Python-facing quantity name (`"u"`, `"ep_xx"`, `"gamma_max_grad"`, ...).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::U => "u",
+            Self::V => "v",
+            Self::R => "R",
+            Self::EpXx => "ep_xx",
+            Self::EpYy => "ep_yy",
+            Self::EpXy => "ep_xy",
+            Self::EpVol => "ep_vol",
+            Self::Ep1 => "ep1",
+            Self::Ep2 => "ep2",
+            Self::GammaMax => "gamma_max",
+            Self::ThetaP => "theta_p",
+            Self::GammaMaxGrad => "gamma_max_grad",
+        }
+    }
+}
+
+impl std::str::FromStr for FieldQuantity {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Error> {
+        Self::ALL.into_iter().find(|q| q.name() == s).ok_or_else(|| {
+            let names: Vec<_> = Self::ALL.iter().map(|q| q.name()).collect();
+            Error::InvalidInput(format!("quantity must be one of {names:?}, got {s:?}"))
+        })
+    }
+}
+
+/// How a per-increment series is collapsed to one contour value.
+///
+/// `window` is a half-open increment range `[start, stop)`; `None` means the
+/// whole series. With `dt` unset the value is last-minus-first over the
+/// window (or the sum of |increment deltas| if `absolute`); with `dt` set it
+/// is the mean rate `(last - first) / (len * dt)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ContourReduction {
+    pub window: Option<(usize, usize)>,
+    pub dt: Option<f64>,
+    pub absolute: bool,
+}
+
+impl ContourReduction {
+    /// The concrete `[start, stop)` range for a series of `inc_no` values.
+    fn range(&self, inc_no: usize) -> Result<(usize, usize), Error> {
+        let (start, stop) = self.window.unwrap_or((0, inc_no));
+        if start >= stop || stop > inc_no {
+            return Err(Error::InvalidInput(format!(
+                "window [{start}, {stop}) is empty or exceeds the {inc_no} increments"
+            )));
+        }
+        Ok((start, stop))
+    }
+
+    fn reduce(&self, v: &[f64]) -> f64 {
+        let n = v.len();
+        match self.dt {
+            None if self.absolute => v.windows(2).map(|w| (w[1] - w[0]).abs()).sum(),
+            None if n > 1 => v[n - 1] - v[0],
+            None => v[n - 1],
+            Some(dt) if n > 1 => (v[n - 1] - v[0]) / (n as f64 * dt),
+            Some(_) => 0.0,
+        }
+    }
+}
+
+/// One per-increment series of a [`ParticleSolution`], as plotted by
+/// `history()` / `trace()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesQuantity {
+    /// Column of `warps`.
+    Warp(usize),
+    /// Column of `strains`.
+    Strain(usize),
+    VolStrain,
+}
+
+impl ParticleSolution {
+    /// The per-increment values of `q`, length `inc_no`.
+    pub fn series(&self, q: SeriesQuantity) -> Array1<f64> {
+        match q {
+            SeriesQuantity::Warp(c) => self.warps.column(c).to_owned(),
+            SeriesQuantity::Strain(c) => self.strains.column(c).to_owned(),
+            SeriesQuantity::VolStrain => self.vol_strains.clone(),
+        }
+    }
+}
+
+impl FieldSolution {
+    /// Number of increments (rows) in every particle's history.
+    pub fn inc_no(&self) -> usize {
+        self.particles.first().map_or(0, |p| p.coordinates.nrows())
+    }
+
+    /// One reduced value of `q` per particle — see [`ContourReduction`].
+    ///
+    /// `GammaMaxGrad` reduces each gradient component separately and returns
+    /// the magnitude of the result. Errors if `q` needs a stored array this
+    /// solution lacks (`principal_strains` on pre-v2 files, `gamma_max_grad`
+    /// unless solved meshless via `Field::solve`).
+    pub fn contour_values(&self, q: FieldQuantity, red: &ContourReduction) -> Result<Array1<f64>, Error> {
+        let (start, stop) = red.range(self.inc_no())?;
+        let mut out = Array1::<f64>::zeros(self.particles.len());
+        let mut buf = Vec::with_capacity(stop - start);
+        for (i, p) in self.particles.iter().enumerate() {
+            let col = |a: &Array2<f64>, c: usize, buf: &mut Vec<f64>| {
+                buf.clear();
+                buf.extend((start..stop).map(|m| a[[m, c]]));
+            };
+            match q {
+                FieldQuantity::U => col(&p.warps, 0, &mut buf),
+                FieldQuantity::V => col(&p.warps, 1, &mut buf),
+                FieldQuantity::R => {
+                    buf.clear();
+                    buf.extend((start..stop).map(|m| p.warps[[m, 0]].hypot(p.warps[[m, 1]])));
+                }
+                FieldQuantity::EpXx => col(&p.strains, 0, &mut buf),
+                FieldQuantity::EpYy => col(&p.strains, 1, &mut buf),
+                FieldQuantity::EpXy => col(&p.strains, 5, &mut buf),
+                FieldQuantity::EpVol => {
+                    buf.clear();
+                    buf.extend((start..stop).map(|m| p.vol_strains[m]));
+                }
+                FieldQuantity::Ep1 | FieldQuantity::Ep2 | FieldQuantity::GammaMax | FieldQuantity::ThetaP => {
+                    let ps = p.principal_strains.as_ref().ok_or_else(|| Error::InvalidInput(
+                        "principal_strains is not available on this solution (it predates \
+                         this field -- re-solve to populate it)".to_string(),
+                    ))?;
+                    let c = match q {
+                        FieldQuantity::Ep1 => 0,
+                        FieldQuantity::Ep2 => 1,
+                        FieldQuantity::GammaMax => 2,
+                        _ => 3,
+                    };
+                    col(ps, c, &mut buf);
+                }
+                FieldQuantity::GammaMaxGrad => {
+                    let g = p.gamma_max_grad.as_ref().ok_or_else(|| Error::InvalidInput(
+                        "gamma_max_grad is not available -- it requires solving via \
+                         Field.solve() with strain_method left as meshless (the default)"
+                            .to_string(),
+                    ))?;
+                    col(g, 0, &mut buf);
+                    let gx = red.reduce(&buf);
+                    col(g, 1, &mut buf);
+                    let gy = red.reduce(&buf);
+                    out[i] = gx.hypot(gy);
+                    continue;
+                }
+            }
+            out[i] = red.reduce(&buf);
+        }
+        Ok(out)
+    }
+
+    /// Particle positions to draw a contour at, `(N, 2)`: the initial
+    /// coordinates, or (`deformed`) the positions at the last increment of
+    /// `red`'s window.
+    pub fn contour_coordinates(&self, deformed: bool, red: &ContourReduction) -> Result<Array2<f64>, Error> {
+        if !deformed {
+            return Ok(self.initial_coordinates.clone());
+        }
+        let (_, stop) = red.range(self.inc_no())?;
+        let mut out = Array2::<f64>::zeros((self.particles.len(), 2));
+        for (i, p) in self.particles.iter().enumerate() {
+            out[[i, 0]] = p.coordinates[[stop - 1, 0]];
+            out[[i, 1]] = p.coordinates[[stop - 1, 1]];
+        }
+        Ok(out)
+    }
+
+    /// Delaunay triangulation of the initial coordinates, `(M, 3)` particle
+    /// indices, with every triangle that leaves the field's [`FieldRegion`]
+    /// removed (its centroid or any edge midpoint lies outside the boundary
+    /// or inside an exclusion). Without a stored region (pre-0x08 files) the
+    /// full convex hull is returned.
+    ///
+    /// Always built in the reference configuration, so the same triangles
+    /// stay valid when drawn at deformed positions.
+    pub fn contour_triangles(&self) -> Array2<usize> {
+        let tris = delaunay(self.initial_coordinates.view());
+        let Some(region) = &self.region else { return tris };
+        let c = &self.initial_coordinates;
+        let pt = |i: usize| [c[[i, 0]], c[[i, 1]]];
+        let mid = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        let kept: Vec<usize> = tris
+            .rows()
+            .into_iter()
+            .filter(|t| {
+                let (a, b, d) = (pt(t[0]), pt(t[1]), pt(t[2]));
+                let centroid = [(a[0] + b[0] + d[0]) / 3.0, (a[1] + b[1] + d[1]) / 3.0];
+                [centroid, mid(a, b), mid(b, d), mid(d, a)].iter().all(|&p| region.contains(p))
+            })
+            .flat_map(|t| [t[0], t[1], t[2]])
+            .collect();
+        Array2::from_shape_vec((kept.len() / 3, 3), kept).expect("3 indices pushed per triangle")
+    }
+}
+
+/// Unconstrained Delaunay triangulation of `points` `(N, 2)`, as `(M, 3)`
+/// indices into `points`. Duplicate points share the first one's index;
+/// non-finite points are skipped.
+pub fn delaunay(points: ArrayView2<f64>) -> Array2<usize> {
+    use spade::{DelaunayTriangulation, Point2, Triangulation};
+    let mut dt = DelaunayTriangulation::<Point2<f64>>::new();
+    // spade vertex index -> input row (duplicates are merged into one vertex).
+    let mut original = Vec::with_capacity(points.nrows());
+    for i in 0..points.nrows() {
+        let (x, y) = (points[[i, 0]], points[[i, 1]]);
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        if let Ok(h) = dt.insert(Point2::new(x, y)) {
+            if h.index() == original.len() {
+                original.push(i);
+            }
+        }
+    }
+    let idx: Vec<usize> = dt
+        .inner_faces()
+        .flat_map(|f| f.vertices().map(|v| original[v.fix().index()]))
+        .collect();
+    Array2::from_shape_vec((idx.len() / 3, 3), idx).expect("3 vertices per face")
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,5 +1453,206 @@ mod tests {
         assert_eq!(c4.nrows(), 15, "the (5, 5) centre is excluded");
         let (c5, _) = grid_particles(boundary.view(), &[], 0.0, 1.0);
         assert_eq!(c5.nrows(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Contour data
+    // -----------------------------------------------------------------------
+
+    /// One particle whose `warps[:, 0]`, `strains[:, 0]` and both
+    /// `gamma_max_grad` columns follow `series`, at fixed position `xy`
+    /// moving by `+1` in x per increment.
+    fn series_particle(series: &[f64], xy: [f64; 2]) -> Arc<ParticleSolution> {
+        let n = series.len();
+        let col = Array1::from_vec(series.to_vec());
+        let mut warps = Array2::<f64>::zeros((n, 6));
+        warps.column_mut(0).assign(&col);
+        warps.column_mut(1).assign(&col);
+        let mut strains = Array2::<f64>::zeros((n, 6));
+        strains.column_mut(0).assign(&col);
+        let mut grad = Array2::<f64>::zeros((n, 2));
+        grad.column_mut(0).assign(&col);
+        grad.column_mut(1).assign(&col);
+        let coordinates = Array2::from_shape_fn((n, 2), |(m, j)| xy[j] + if j == 0 { m as f64 } else { 0.0 });
+        Arc::new(ParticleSolution {
+            coordinates,
+            warps,
+            incs: Array2::zeros((n, 6)),
+            volumes: Array1::ones(n),
+            principal_strains: Some(crate::particle::principal_strains(&strains)),
+            strains,
+            strain_incs: Array2::zeros((n - 1, 6)),
+            vol_strains: col,
+            reference_update_register: vec![],
+            image_0_path: None,
+            calibrated: false,
+            config: None,
+            gamma_max_grad: Some(grad),
+        })
+    }
+
+    fn field_sol(particles: Vec<Arc<ParticleSolution>>, region: Option<FieldRegion>) -> FieldSolution {
+        let initial_coordinates = Array2::from_shape_fn((particles.len(), 2), |(i, j)| particles[i].coordinates[[0, j]]);
+        let inc_no = particles[0].coordinates.nrows();
+        FieldSolution {
+            particles,
+            initial_coordinates,
+            vol_totals: Array1::ones(inc_no),
+            reference_update_register: vec![],
+            image_0_path: None,
+            calibrated: false,
+            depth: 1.0,
+            track: true,
+            region,
+        }
+    }
+
+    fn red(window: Option<(usize, usize)>, dt: Option<f64>, absolute: bool) -> ContourReduction {
+        ContourReduction { window, dt, absolute }
+    }
+
+    #[test]
+    fn contour_reduction_matches_python_reduce_series() {
+        let sol = field_sol(vec![series_particle(&[0.0, 2.0, 1.0, 4.0], [0.0, 0.0])], None);
+        let v = |r: ContourReduction| sol.contour_values(FieldQuantity::U, &r).unwrap()[0];
+        assert_eq!(v(red(None, None, false)), 4.0, "last - first");
+        assert_eq!(v(red(None, None, true)), 2.0 + 1.0 + 3.0, "sum |diff|");
+        assert_eq!(v(red(Some((1, 3)), None, false)), -1.0, "window is half-open");
+        assert_eq!(v(red(Some((1, 2)), None, false)), 2.0, "single value -> value");
+        assert_eq!(v(red(Some((1, 2)), None, true)), 0.0, "single value, absolute -> 0");
+        assert!((v(red(None, Some(0.5), false)) - 4.0 / (4.0 * 0.5)).abs() < 1e-15, "mean rate");
+        assert!((v(red(None, Some(0.5), true)) - 2.0).abs() < 1e-15, "dt ignores absolute");
+        assert_eq!(v(red(Some((2, 3)), Some(0.5), false)), 0.0, "single value rate -> 0");
+        for bad in [(2, 2), (3, 1), (0, 5)] {
+            assert!(sol.contour_values(FieldQuantity::U, &red(Some(bad), None, false)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn contour_values_quantities() {
+        let sol = field_sol(vec![series_particle(&[0.0, 3.0], [0.0, 0.0])], None);
+        let all = red(None, None, false);
+        let v = |q| sol.contour_values(q, &all).unwrap()[0];
+        assert_eq!(v(FieldQuantity::U), 3.0);
+        assert_eq!(v(FieldQuantity::V), 3.0);
+        assert!((v(FieldQuantity::R) - 18f64.sqrt()).abs() < 1e-12);
+        assert_eq!(v(FieldQuantity::EpXx), 3.0);
+        assert_eq!(v(FieldQuantity::EpYy), 0.0);
+        assert_eq!(v(FieldQuantity::EpVol), 3.0);
+        // Uniaxial ep_xx = 3: ep1 = 3, ep2 = 0, gamma_max = 3.
+        assert!((v(FieldQuantity::Ep1) - 3.0).abs() < 1e-12);
+        assert!(v(FieldQuantity::Ep2).abs() < 1e-12);
+        assert!((v(FieldQuantity::GammaMax) - 3.0).abs() < 1e-12);
+        // Each gradient component reduces to 3 -> magnitude 3*sqrt(2).
+        assert!((v(FieldQuantity::GammaMaxGrad) - 3.0 * 2f64.sqrt()).abs() < 1e-12);
+        for q in FieldQuantity::ALL {
+            assert_eq!(q.name().parse::<FieldQuantity>().unwrap(), q);
+        }
+        assert!("bogus".parse::<FieldQuantity>().is_err());
+    }
+
+    #[test]
+    fn contour_values_missing_gradient_errors() {
+        let mut p = (*series_particle(&[0.0, 1.0], [0.0, 0.0])).clone();
+        p.gamma_max_grad = None;
+        let sol = field_sol(vec![Arc::new(p)], None);
+        assert!(sol.contour_values(FieldQuantity::GammaMaxGrad, &ContourReduction::default()).is_err());
+        assert!(sol.contour_values(FieldQuantity::U, &ContourReduction::default()).is_ok());
+    }
+
+    #[test]
+    fn contour_coordinates_reference_and_deformed() {
+        let sol = field_sol(vec![series_particle(&[0.0, 0.0, 0.0], [5.0, 7.0])], None);
+        let r = sol.contour_coordinates(false, &ContourReduction::default()).unwrap();
+        assert_eq!((r[[0, 0]], r[[0, 1]]), (5.0, 7.0));
+        let d = sol.contour_coordinates(true, &ContourReduction::default()).unwrap();
+        assert_eq!((d[[0, 0]], d[[0, 1]]), (7.0, 7.0), "last increment");
+        let d = sol.contour_coordinates(true, &red(Some((0, 2)), None, false)).unwrap();
+        assert_eq!((d[[0, 0]], d[[0, 1]]), (6.0, 7.0), "window end is exclusive");
+    }
+
+    /// Grid of particles at `x, y in {0.5, 1.5, ..., n-0.5}`.
+    fn grid_field(n: usize, region: Option<FieldRegion>) -> FieldSolution {
+        let particles = (0..n * n)
+            .map(|k| series_particle(&[0.0, 0.0], [(k / n) as f64 + 0.5, (k % n) as f64 + 0.5]))
+            .collect();
+        field_sol(particles, region)
+    }
+
+    fn square(lo: f64, hi: f64) -> Array2<f64> {
+        ndarray::array![[lo, lo], [hi, lo], [hi, hi], [lo, hi]]
+    }
+
+    fn tri_centroids(sol: &FieldSolution, tris: &Array2<usize>) -> Vec<[f64; 2]> {
+        let c = &sol.initial_coordinates;
+        tris.rows().into_iter().map(|t| {
+            [(0..3).map(|k| c[[t[k], 0]]).sum::<f64>() / 3.0, (0..3).map(|k| c[[t[k], 1]]).sum::<f64>() / 3.0]
+        }).collect()
+    }
+
+    #[test]
+    fn contour_triangles_without_region_cover_hull() {
+        let sol = grid_field(4, None);
+        assert_eq!(sol.contour_triangles().nrows(), 18, "3x3 cells, 2 triangles each");
+    }
+
+    #[test]
+    fn contour_triangles_drop_exclusion() {
+        let region = FieldRegion { boundary: square(0.0, 4.0), exclusions: vec![square(1.6, 2.4)] };
+        let sol = grid_field(4, Some(region));
+        let tris = sol.contour_triangles();
+        assert_eq!(tris.nrows(), 16, "the centre cell's 2 triangles are removed");
+        for c in tri_centroids(&sol, &tris) {
+            assert!(!(1.5 < c[0] && c[0] < 2.5 && 1.5 < c[1] && c[1] < 2.5), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn contour_triangles_drop_concave_notch() {
+        // L-shape: [0,4]^2 minus the top-right [2,4]x[2,4] quadrant; only the
+        // 12 grid points inside the L are particles, but their hull spans the notch.
+        let boundary = ndarray::array![[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [2.0, 2.0], [2.0, 4.0], [0.0, 4.0]];
+        let particles: Vec<_> = (0..16)
+            .map(|k| [(k / 4) as f64 + 0.5, (k % 4) as f64 + 0.5])
+            .filter(|p| !(p[0] > 2.0 && p[1] > 2.0))
+            .map(|p| series_particle(&[0.0, 0.0], p))
+            .collect();
+        let unmasked = field_sol(particles.clone(), None).contour_triangles().nrows();
+        let region = FieldRegion { boundary: boundary.clone(), exclusions: vec![] };
+        let sol = field_sol(particles, Some(region.clone()));
+        let tris = sol.contour_triangles();
+        assert!(tris.nrows() < unmasked, "hull triangles across the notch are removed");
+        assert_eq!(tris.nrows(), 10, "5 cells of the L, 2 triangles each");
+        for c in tri_centroids(&sol, &tris) {
+            assert!(region.contains(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn delaunay_merges_duplicates_and_skips_nan() {
+        let pts = ndarray::array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [f64::NAN, 0.0]];
+        let t = delaunay(pts.view());
+        assert_eq!(t.nrows(), 1);
+        let mut idx: Vec<_> = t.row(0).to_vec();
+        idx.sort();
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn solve_stores_region() {
+        let seq = single_mesh_seq(&Array2::<f64>::zeros((4, 2)));
+        let mut f = make_field_from_seq(Arc::clone(&seq), true);
+        f.solve(0.0, true, None, StrainMethod::Mesh).unwrap();
+        let r = f.solution().unwrap().region.as_ref().expect("taken from the first mesh");
+        assert_eq!(r.boundary.nrows(), 4);
+
+        let dist = FieldDistribution::Grid {
+            boundary_nodes: square(0.0, 1.0),
+            exclusion_nodes: vec![],
+            spacing: 0.5,
+        };
+        let mut g = Field::new(seq, dist, true, 1.0).unwrap();
+        g.solve(0.0, true, None, StrainMethod::Mesh).unwrap();
+        assert_eq!(g.solution().unwrap().region.as_ref().unwrap().boundary, square(0.0, 1.0));
     }
 }

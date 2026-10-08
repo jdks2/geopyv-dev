@@ -134,9 +134,9 @@ impl PySubset {
         subset_order: usize,
         global_mask: Option<Py<PyMask>>,
     ) -> PyResult<Self> {
-        if subset_order != 1 && subset_order != 2 {
+        if subset_order > 2 {
             return Err(PyValueError::new_err(format!(
-                "subset_order must be 1 or 2, got {subset_order}"
+                "subset_order must be 0, 1, or 2, got {subset_order}"
             )));
         }
 
@@ -358,9 +358,9 @@ impl PySubset {
     fn tolerance(&self) -> Option<f64> { self.result().map(|r| r.tolerance) }
 
     /// Gradient-weighted omitted-mode warp-adequacy score for the omitted
-    /// `u` (horizontal) displacement modes. `None` if unsolved or solved at
-    /// `subset_order == 2` (not yet implemented for order 2). See
-    /// `omitted_mode_diagnostic` in `src/subset.rs`.
+    /// `u` (horizontal) displacement modes. Available for `subset_order` 0,
+    /// 1, or 2; `None` if unsolved. See `omitted_mode_diagnostic` in
+    /// `src/subset.rs`.
     #[getter]
     fn eta_u(&self) -> Option<f64> { self.result().and_then(|r| r.eta_omitted).map(|(u, _)| u) }
 
