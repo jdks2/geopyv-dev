@@ -1110,15 +1110,9 @@ impl MainWindow {
         let n = sol.nodes.nrows();
         let mut rows: Vec<String> = Vec::with_capacity(n + 1);
         rows.push(
-            "node,x,y,u_x,u_y,u_mag,eps_xx,eps_yy,eps_xy,eps_vm,c_zncc,iterations,norms"
+            "node,x,y,u_x,u_y,u_mag,c_zncc,iterations,norms"
                 .to_string(),
         );
-
-        use crate::mesh_tab::{extract_nodal_values, MeshPlotType};
-        let exx = extract_nodal_values(sol, MeshPlotType::Exx);
-        let eyy = extract_nodal_values(sol, MeshPlotType::Eyy);
-        let exy = extract_nodal_values(sol, MeshPlotType::Exy);
-        let evm = extract_nodal_values(sol, MeshPlotType::EVM);
 
         for i in 0..n {
             let x   = sol.nodes[[i, 0]];
@@ -1130,8 +1124,7 @@ impl MainWindow {
             let itr = sol.iterations[i];
             let nrm = sol.norms[i];
             rows.push(format!(
-                "{i},{x:.6},{y:.6},{ux:.6},{uy:.6},{mag:.6},{:.6},{:.6},{:.6},{:.6},{czn:.6},{itr},{nrm:.6}",
-                exx[i], eyy[i], exy[i], evm[i]
+                "{i},{x:.6},{y:.6},{ux:.6},{uy:.6},{mag:.6},{czn:.6},{itr},{nrm:.6}"
             ));
         }
 

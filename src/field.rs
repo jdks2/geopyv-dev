@@ -5,6 +5,8 @@
 //!
 //! # Architecture
 //!
+//! - `grid_particles` — free function; regular-grid placement inside a
+//!   boundary polygon (also used by front-ends to preview it).
 //! - `distribute_particles` — free function; computes particle positions and
 //!   volumes from mesh element data (replicates `Field._distribute_particles`).
 //! - [`Field`] — stores initial particle positions, volumes and solve config.
@@ -27,12 +29,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView2};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     calibration::CalibrationParams,
+    geometry::utilities::point_in_polygon,
     particle::{
         meshless_scalar_gradient_batch, Particle, ParticleConfig, ParticleSource,
         ParticleSolution, StrainMethod,
@@ -40,6 +43,59 @@ use crate::{
     sequence::SequenceSolution,
     Error,
 };
+
+// ---------------------------------------------------------------------------
+// grid_particles — free function
+// ---------------------------------------------------------------------------
+
+/// Place particles on a regular square grid of pitch `spacing` inside
+/// `boundary` and outside every polygon in `exclusions`.
+///
+/// Grid points sit at cell centres, starting half a pitch in from the
+/// boundary's bounding-box minimum. Each particle represents one grid cell,
+/// so its volume is `spacing² × depth` (the same area-times-depth convention
+/// as [`distribute_particles`]). Front-ends call this directly to preview the
+/// placement [`FieldDistribution::Grid`] will produce.
+///
+/// # Returns
+/// `(coordinates, volumes)` — `(P, 2)` and `(P,)`. Empty when `boundary` has
+/// fewer than 3 vertices or `spacing` is not positive.
+pub fn grid_particles(
+    boundary: ArrayView2<f64>,
+    exclusions: &[ArrayView2<f64>],
+    spacing: f64,
+    depth: f64,
+) -> (Array2<f64>, Array1<f64>) {
+    let empty = || (Array2::zeros((0, 2)), Array1::zeros(0));
+    if boundary.nrows() < 3 || !(spacing > 0.0) {
+        return empty();
+    }
+    let fold = |col: usize, f: fn(f64, f64) -> f64, init: f64| {
+        boundary.column(col).iter().copied().fold(init, f)
+    };
+    let (min_x, max_x) = (fold(0, f64::min, f64::INFINITY), fold(0, f64::max, f64::NEG_INFINITY));
+    let (min_y, max_y) = (fold(1, f64::min, f64::INFINITY), fold(1, f64::max, f64::NEG_INFINITY));
+
+    let nx = ((max_x - min_x) / spacing).floor() as usize;
+    let ny = ((max_y - min_y) / spacing).floor() as usize;
+    let mut points: Vec<f64> = Vec::new();
+    for i in 0..=nx {
+        let x = min_x + spacing * (i as f64 + 0.5);
+        if x > max_x { break; }
+        for j in 0..=ny {
+            let y = min_y + spacing * (j as f64 + 0.5);
+            if y > max_y { break; }
+            if point_in_polygon([x, y], boundary)
+                && !exclusions.iter().any(|ex| point_in_polygon([x, y], *ex))
+            {
+                points.extend_from_slice(&[x, y]);
+            }
+        }
+    }
+    let n = points.len() / 2;
+    let coordinates = Array2::from_shape_vec((n, 2), points).expect("2 values pushed per point");
+    (coordinates, Array1::from_elem(n, spacing * spacing * depth))
+}
 
 // ---------------------------------------------------------------------------
 // distribute_particles — free function
@@ -110,6 +166,13 @@ pub enum FieldDistribution {
     /// Derive from the SequenceSolution: place particles at element centroids
     /// of the first mesh in the sequence.
     FromSequence,
+    /// Regular square grid of pitch `spacing` inside `boundary_nodes`,
+    /// outside every `exclusion_nodes` polygon — see [`grid_particles`].
+    Grid {
+        boundary_nodes: Array2<f64>,
+        exclusion_nodes: Vec<Array2<f64>>,
+        spacing: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +270,17 @@ impl Field {
                         format!("failed to load first mesh: {e}"),
                     ))?;
                 distribute_particles(&first.nodes, &first.elements, depth)
+            }
+            FieldDistribution::Grid { boundary_nodes, exclusion_nodes, spacing } => {
+                let views: Vec<_> = exclusion_nodes.iter().map(|e| e.view()).collect();
+                let (coordinates, volumes) =
+                    grid_particles(boundary_nodes.view(), &views, spacing, depth);
+                if coordinates.nrows() == 0 {
+                    return Err(Error::InvalidInput(
+                        "grid distribution placed no particles: check boundary and spacing".to_string(),
+                    ));
+                }
+                (coordinates, volumes)
             }
         };
 
@@ -1052,5 +1126,26 @@ mod tests {
             "expected at least one particle to see a non-trivial gamma_max gradient from a \
              spatially-varying field"
         );
+    }
+
+    #[test]
+    fn grid_particles_cell_centres_inside_boundary_outside_exclusions() {
+        let boundary = ndarray::array![[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]];
+        let hole = ndarray::array![[15.0, 15.0], [25.0, 15.0], [25.0, 25.0], [15.0, 25.0]];
+        let (c, v) = grid_particles(boundary.view(), &[], 10.0, 2.0);
+        assert_eq!(c.nrows(), 16);
+        assert_eq!((c[[0, 0]], c[[0, 1]]), (5.0, 5.0));
+        assert!(v.iter().all(|&x| x == 200.0));
+        // The 10x10 hole contains no cell centre (centres at 5, 15, 25, 35)
+        // except exactly on its edge — shrink it to remove one interior centre.
+        let (c2, _) = grid_particles(boundary.view(), &[hole.view()], 20.0, 1.0);
+        let (c3, _) = grid_particles(boundary.view(), &[], 20.0, 1.0);
+        assert_eq!(c3.nrows(), 4);
+        assert_eq!(c2.nrows(), 4, "20 px grid centres (10, 30) all lie outside the hole");
+        let small_hole = ndarray::array![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let (c4, _) = grid_particles(boundary.view(), &[small_hole.view()], 10.0, 1.0);
+        assert_eq!(c4.nrows(), 15, "the (5, 5) centre is excluded");
+        let (c5, _) = grid_particles(boundary.view(), &[], 0.0, 1.0);
+        assert_eq!(c5.nrows(), 0);
     }
 }

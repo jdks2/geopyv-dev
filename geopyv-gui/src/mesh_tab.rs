@@ -72,11 +72,6 @@ pub enum MeshPlotType {
     Ux,
     Uy,
     UMag,
-    // Strain
-    Exx,
-    Eyy,
-    Exy,
-    EVM,
     // Quality
     CZncc,
     Iterations,
@@ -89,10 +84,6 @@ impl MeshPlotType {
             MeshPlotType::Ux => "u_x",
             MeshPlotType::Uy => "u_y",
             MeshPlotType::UMag => "|u|",
-            MeshPlotType::Exx => "\u{03b5}_xx",
-            MeshPlotType::Eyy => "\u{03b5}_yy",
-            MeshPlotType::Exy => "\u{03b5}_xy",
-            MeshPlotType::EVM => "\u{03b5}_VM",
             MeshPlotType::CZncc => "C_ZNCC",
             MeshPlotType::Iterations => "Iterations",
             MeshPlotType::Norms => "Norms",
@@ -119,7 +110,6 @@ pub enum RangeMode {
 pub enum MeshViewPane {
     #[default]
     Displacements,
-    Strains,
     Quality,
 }
 
@@ -653,15 +643,6 @@ impl MeshTabState {
                     self.view.nodal_cache = None;
                 }
             }
-            if ui.add(egui::Button::new("Strains")
-                .selected(self.view.active_pane == MeshViewPane::Strains)).clicked()
-            {
-                self.view.active_pane = MeshViewPane::Strains;
-                if !matches!(self.view.plot_type, MeshPlotType::Exx | MeshPlotType::Eyy | MeshPlotType::Exy | MeshPlotType::EVM) {
-                    self.view.plot_type = MeshPlotType::Exx;
-                    self.view.nodal_cache = None;
-                }
-            }
             if ui.add(egui::Button::new("Quality")
                 .selected(self.view.active_pane == MeshViewPane::Quality)).clicked()
             {
@@ -681,14 +662,6 @@ impl MeshTabState {
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::Ux, "u_x");
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::Uy, "u_y");
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::UMag, "|u|");
-                });
-            }
-            MeshViewPane::Strains => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Exx, "\u{03b5}_xx");
-                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Eyy, "\u{03b5}_yy");
-                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::Exy, "\u{03b5}_xy");
-                    ui.radio_value(&mut self.view.plot_type, MeshPlotType::EVM, "\u{03b5}_VM");
                 });
             }
             MeshViewPane::Quality => {
@@ -901,6 +874,7 @@ impl MeshTabState {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut form.template_shape, MaskShape::Circle, "Circle");
                     ui.radio_value(&mut form.template_shape, MaskShape::Square, "Square");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Semicircle, "Semicircle");
                 });
                 ui.end_row();
 
@@ -1364,10 +1338,7 @@ fn run_solve(
     cancel: Arc<AtomicBool>,
 ) {
     set_progress(&state, 0.05, "Building local mask\u{2026}");
-    let local_mask = match params.template_shape {
-        MaskShape::Circle => LocalMask::circle(params.template_size as usize),
-        MaskShape::Square => LocalMask::square(params.template_size as usize),
-    };
+    let local_mask = LocalMask::new(params.template_shape.clone(), params.template_size as usize);
     let local_mask = match local_mask {
         Ok(t) => t,
         Err(e) => {
@@ -1382,7 +1353,7 @@ fn run_solve(
     }
 
     set_progress(&state, 0.15, "Loading reference image\u{2026}");
-    let ref_img = match Image::from_file(&params.ref_path, 20) {
+    let ref_img = match Image::from_file(&params.ref_path, geopyv_dev::image::DEFAULT_BORDER) {
         Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Reference image error: {e}"));
@@ -1396,7 +1367,7 @@ fn run_solve(
     }
 
     set_progress(&state, 0.35, "Loading target image\u{2026}");
-    let target_img = match Image::from_file(&params.target_path, 20) {
+    let target_img = match Image::from_file(&params.target_path, geopyv_dev::image::DEFAULT_BORDER) {
         Ok(img) => Arc::new(img),
         Err(e) => {
             set_error(&state, format!("Target image error: {e}"));
@@ -1459,24 +1430,28 @@ fn run_solve(
             SolveMethod::Fagn => LibSolveMethod::Fagn,
         },
         override_active: false,
-        detect_shear_band: false,
-        shear_band_theta_steps: 36,
         ..Default::default()
     };
     let seed_warp = vec![0.0f64; 6 * p_len];
     let seed_cfg = SeedConfig {
         coord: params.seed,
         warp: seed_warp,
-        tolerance: 0.9,
+        tolerance: SeedConfig::DEFAULT_TOLERANCE,
     };
 
-    match mesh.solve(&local_mask, &seed_cfg, &cfg, None) {
+    let progress = crate::progress::GuiProgress::new(|f, msg| set_progress(&state, f, msg), &cancel, 0.65, 1.0);
+    match mesh.solve(&local_mask, &seed_cfg, &cfg, Some(&progress)) {
         Ok(()) => {
             let solution = (**mesh.solution().expect("solve() succeeded, solution must be Some")).clone();
             if let Ok(mut s) = state.lock() {
                 s.result = Some(Ok(solution));
                 s.progress = 1.0;
                 s.message = "Done".to_string();
+                s.running = false;
+            }
+        }
+        Err(geopyv_dev::Error::Cancelled) => {
+            if let Ok(mut s) = state.lock() {
                 s.running = false;
             }
         }
@@ -1493,7 +1468,6 @@ fn run_solve(
 /// Compute per-node scalar values for the given plot type.
 pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType) -> Vec<f64> {
     let n = sol.nodes.nrows();
-    let m = sol.warps.nrows();
     match plot {
         MeshPlotType::Ux => (0..n).map(|i| sol.displacements[[i, 0]]).collect(),
         MeshPlotType::Uy => (0..n).map(|i| sol.displacements[[i, 1]]).collect(),
@@ -1504,58 +1478,10 @@ pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType) -> Vec<f64> 
                 (u * u + v * v).sqrt()
             })
             .collect(),
-        MeshPlotType::Exx => {
-            let elem: Vec<f64> = (0..m).map(|e| sol.warps[[e, 2]]).collect();
-            element_to_node_avg(n, &sol.elements, &elem)
-        }
-        MeshPlotType::Eyy => {
-            let elem: Vec<f64> = (0..m).map(|e| sol.warps[[e, 5]]).collect();
-            element_to_node_avg(n, &sol.elements, &elem)
-        }
-        MeshPlotType::Exy => {
-            // ε_xy = (du/dy + dv/dx) / 2  (tensor shear strain)
-            let elem: Vec<f64> = (0..m)
-                .map(|e| (sol.warps[[e, 4]] + sol.warps[[e, 3]]) * 0.5)
-                .collect();
-            element_to_node_avg(n, &sol.elements, &elem)
-        }
-        MeshPlotType::EVM => {
-            let elem: Vec<f64> = (0..m)
-                .map(|e| {
-                    let exx = sol.warps[[e, 2]];
-                    let eyy = sol.warps[[e, 5]];
-                    let exy = (sol.warps[[e, 4]] + sol.warps[[e, 3]]) * 0.5;
-                    (exx * exx + eyy * eyy - exx * eyy + 3.0 * exy * exy).sqrt()
-                })
-                .collect();
-            element_to_node_avg(n, &sol.elements, &elem)
-        }
         MeshPlotType::CZncc => sol.c_zncc.to_vec(),
         MeshPlotType::Iterations => sol.iterations.iter().map(|&v| v as f64).collect(),
         MeshPlotType::Norms => sol.norms.to_vec(),
     }
-}
-
-/// Average element-level scalar values to nodes (sum / count over connected elements).
-pub fn element_to_node_avg(
-    n_nodes: usize,
-    elements: &ndarray::Array2<usize>,
-    elem_vals: &[f64],
-) -> Vec<f64> {
-    let mut sum = vec![0.0f64; n_nodes];
-    let mut count = vec![0usize; n_nodes];
-    for (e, &val) in elem_vals.iter().enumerate() {
-        // Use only the first 3 columns (corner nodes) regardless of mesh order.
-        for c in 0..3 {
-            let ni = elements[[e, c]];
-            sum[ni] += val;
-            count[ni] += 1;
-        }
-    }
-    sum.iter()
-        .zip(count.iter())
-        .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
-        .collect()
 }
 
 /// Derive a coordinate transform for displaying the mesh without an image underlay.

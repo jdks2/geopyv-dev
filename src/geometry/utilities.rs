@@ -92,6 +92,27 @@ pub fn poly_area(pts: ArrayView2<f64>) -> f64 {
     (0.5 * (sum1 - sum2).abs()).abs()
 }
 
+/// Even-odd (ray-casting) point-in-polygon test. `poly` has shape `(N, 2)`
+/// with columns `[x, y]` and is treated as closed; fewer than 3 vertices
+/// contain nothing.
+pub fn point_in_polygon(p: [f64; 2], poly: ArrayView2<f64>) -> bool {
+    let n = poly.nrows();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (poly[[i, 0]], poly[[i, 1]]);
+        let (xj, yj) = (poly[[j, 0]], poly[[j, 1]]);
+        if (yi > p[1]) != (yj > p[1]) && p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Check whether point C is counter-clockwise from A→B.
 ///
 /// Replicates `geopyv.geometry.utilities.ccw`.
@@ -260,5 +281,17 @@ mod tests {
         let coords = array![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
         let c = polycentroid(coords.view());
         assert!((c[0] - 2.0).abs() < 1e-10, "x-centroid = {}", c[0]);
+    }
+
+    #[test]
+    fn point_in_polygon_square_and_concave() {
+        let sq = array![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]];
+        assert!(point_in_polygon([2.0, 2.0], sq.view()));
+        assert!(!point_in_polygon([5.0, 2.0], sq.view()));
+        // L-shape: the notch at (3, 3) is outside.
+        let l = array![[0.0, 0.0], [4.0, 0.0], [4.0, 2.0], [2.0, 2.0], [2.0, 4.0], [0.0, 4.0]];
+        assert!(point_in_polygon([1.0, 3.0], l.view()));
+        assert!(!point_in_polygon([3.0, 3.0], l.view()));
+        assert!(!point_in_polygon([0.5, 0.5], array![[0.0, 0.0], [1.0, 1.0]].view()));
     }
 }

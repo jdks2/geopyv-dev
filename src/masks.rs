@@ -69,6 +69,17 @@ pub struct LocalMask {
 }
 
 impl LocalMask {
+    /// Create a local mask of the given `shape` and `size` (radius for
+    /// `Circle`/`Semicircle`, half-side-length for `Square`). The single
+    /// entry point front-ends use, so a new `MaskShape` needs no change there.
+    pub fn new(shape: MaskShape, size: usize) -> Result<Self, Error> {
+        match shape {
+            MaskShape::Circle => Self::circle(size),
+            MaskShape::Square => Self::square(size),
+            MaskShape::Semicircle => Self::semicircle(size),
+        }
+    }
+
     /// Create a circular local mask of the given radius.
     ///
     /// Replicates `geopyv.templates.Circle.__init__`.
@@ -570,4 +581,14 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn new_dispatches_on_shape() {
+        for shape in [MaskShape::Circle, MaskShape::Square, MaskShape::Semicircle] {
+            let t = LocalMask::new(shape.clone(), 5).unwrap();
+            assert_eq!(t.shape, shape);
+            assert_eq!(t.size, 5);
+        }
+        assert!(LocalMask::new(MaskShape::Circle, 0).is_err());
+    }
 }

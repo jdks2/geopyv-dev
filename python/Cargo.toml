@@ -1,6 +1,6 @@
 [package]
 name = "geopyv-dev-python"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [lib]
@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 geopyv-dev = { path = ".." }
+geopyv-gui = { path = "../geopyv-gui" }
 pyo3 = { version = "0.22", features = ["extension-module", "multiple-pymethods"] }
 numpy = "0.22"
 ndarray = "0.16"

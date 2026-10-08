@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "geopyv_dev"
-version = "0.2.0"
+version = "0.2.1"
 description = "A PIV/DIC analysis package for geotechnics."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -21,6 +21,9 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
 ]
+
+[project.scripts]
+geopyv-gui = "geopyv_dev.gui:main"
 
 [project.optional-dependencies]
 docs = [

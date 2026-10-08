@@ -11,6 +11,7 @@ mod py_field;
 mod py_sequence;
 mod py_io;
 mod py_validation;
+mod py_gui;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -50,5 +51,6 @@ fn _geopyv_dev(m: &Bound<'_, PyModule>) -> PyResult<()> {
     py_io::register(m)?;
     py_validation::register(m)?;
     py_speckle::register(m)?;
+    py_gui::register(m)?;
     Ok(())
 }

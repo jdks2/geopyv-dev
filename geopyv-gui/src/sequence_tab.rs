@@ -6,12 +6,14 @@ use std::time::Instant;
 use eframe::egui;
 use ndarray::Array2;
 
-use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig};
+use geopyv_dev::mesh::{SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
-use geopyv_dev::sequence::{deformation_preconditioning, default_boundary_region, SequenceOptions as LibSequenceOptions, SequenceSolution};
+use geopyv_dev::geometry::region::{Region, RegionOption};
+use geopyv_dev::sequence::{Sequence, SequenceMeshConfig, SequenceOptions as LibSequenceOptions, SequenceSolution, SequenceSolveConfig};
 use geopyv_dev::masks::{LocalMask, MaskShape};
+
+use crate::progress::GuiProgress;
 
 use crate::colormap::ColormapType;
 use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
@@ -47,15 +49,18 @@ pub struct SequenceOptions {
     pub parse_error: Option<String>,
 }
 
+/// Defaults from the core's `SequenceOptions::default()` and image border.
 impl Default for SequenceOptions {
     fn default() -> Self {
+        let core = LibSequenceOptions::default();
+        let border = geopyv_dev::image::DEFAULT_BORDER;
         Self {
-            guide: true,
-            sequential: true,
-            sync: true,
-            override_: false,
-            border_text: "20".to_string(),
-            border: 20,
+            guide: core.guide,
+            sequential: core.sequential,
+            sync: core.sync,
+            override_: core.override_,
+            border_text: border.to_string(),
+            border,
             parse_error: None,
         }
     }
@@ -729,35 +734,6 @@ impl SequenceTabState {
 
         ui.add_space(3.0);
         ui.label(
-            egui::RichText::new("\u{2500}\u{2500} Strain \u{2500}\u{2500}")
-                .size(15.0)
-                .color(ui.visuals().weak_text_color()),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(
-                &mut self.view.plot_type,
-                MeshPlotType::Exx,
-                "\u{03b5}_xx",
-            );
-            ui.radio_value(
-                &mut self.view.plot_type,
-                MeshPlotType::Eyy,
-                "\u{03b5}_yy",
-            );
-            ui.radio_value(
-                &mut self.view.plot_type,
-                MeshPlotType::Exy,
-                "\u{03b5}_xy",
-            );
-            ui.radio_value(
-                &mut self.view.plot_type,
-                MeshPlotType::EVM,
-                "\u{03b5}_VM",
-            );
-        });
-
-        ui.add_space(3.0);
-        ui.label(
             egui::RichText::new("\u{2500}\u{2500} Quality \u{2500}\u{2500}")
                 .size(15.0)
                 .color(ui.visuals().weak_text_color()),
@@ -1004,6 +980,7 @@ impl SequenceTabState {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut form.template_shape, MaskShape::Circle, "Circle");
                     ui.radio_value(&mut form.template_shape, MaskShape::Square, "Square");
+                    ui.radio_value(&mut form.template_shape, MaskShape::Semicircle, "Semicircle");
                 });
                 ui.end_row();
 
@@ -1589,13 +1566,8 @@ fn run_solve(
     state: Arc<Mutex<SequenceSolveState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    // Build local mask.
-    set_progress(&state, 0.02, "Building local mask\u{2026}");
-    let local_mask = match params.template_shape {
-        MaskShape::Circle => LocalMask::circle(params.template_size as usize),
-        MaskShape::Square => LocalMask::square(params.template_size as usize),
-    };
-    let local_mask = match local_mask {
+    set_progress(&state, 0.02, "Setting up sequence\u{2026}");
+    let local_mask = match LocalMask::new(params.template_shape.clone(), params.template_size as usize) {
         Ok(t) => t,
         Err(e) => {
             set_error(&state, format!("Mask build error: {e}"));
@@ -1603,316 +1575,106 @@ fn run_solve(
         }
     };
 
-    if cancel.load(Ordering::Relaxed) {
-        if let Ok(mut s) = state.lock() {
-            s.running = false;
-        }
-        return;
-    }
-
-    // Build boundary / exclusion arrays (reused each pair).
-    set_progress(&state, 0.04, "Building mesh region\u{2026}");
-    let boundary_arr = Array2::from_shape_fn((params.boundary.len(), 2), |(i, j)| {
-        params.boundary[i][j]
-    });
-    let exclusion_arrs: Vec<Array2<f64>> = params
-        .exclusions
-        .iter()
-        .map(|ex| Array2::from_shape_fn((ex.len(), 2), |(i, j)| ex[i][j]))
-        .collect();
-    let exclusion_views: Vec<_> = exclusion_arrs.iter().map(|a| a.view()).collect();
-    let excl_hard = vec![false; exclusion_arrs.len()];
-
-    if cancel.load(Ordering::Relaxed) {
-        if let Ok(mut s) = state.lock() {
-            s.running = false;
-        }
-        return;
-    }
-
-    // Prepare solve config.
-    let subset_order_int = if matches!(params.subset_order, SubsetOrder::First) {
-        1usize
-    } else {
-        2
+    // Drawn polygons are passed as plain (static, untracked) regions —
+    // exactly what Python's `Sequence` builds from a raw array.
+    let region = |nodes: &[[f64; 2]], hard: bool| {
+        let arr = Array2::from_shape_fn((nodes.len(), 2), |(i, j)| nodes[i][j]);
+        Region::path(None, arr, RegionOption::S, hard, false, 0.0)
     };
-    let mesh_cfg = SolveConfig {
-        max_norm: params.max_norm,
-        max_iterations: params.max_iterations,
-        subset_order: subset_order_int,
-        tolerance: params.zncc_tol,
-        method: match params.method {
-            SolveMethod::Icgn => LibSolveMethod::Icgn,
-            SolveMethod::Fagn => LibSolveMethod::Fagn,
-        },
-        override_active: false,
-        detect_shear_band: false,
-        shear_band_theta_steps: 36,
-        ..Default::default()
-    };
-    let seed_coord_init = params.seed;
-    let mut seed_coord = seed_coord_init;
-    let mut seed_warp = vec![0.0f64; 12];
-
-    let n_images = params.image_paths.len();
-    let n_pairs = n_images - 1;
-
-    let mut mesh_solutions: Vec<Arc<MeshSolution>> = Vec::with_capacity(n_pairs);
-    let mut override_log: Vec<usize> = Vec::new();
-    let mut sync_sol: Option<Arc<MeshSolution>> = None;
-    let mut mesh_override = false;
-
-    let mut f_index = 0usize;
-    let mut g_index = 1usize;
-
-    // Spawn background I/O thread so frame writes don't block the solve loop.
-    let (io_tx, io_rx) = std::sync::mpsc::sync_channel::<(PathBuf, Arc<MeshSolution>)>(4);
-    let io_state = Arc::clone(&state);
-    let io_thread = std::thread::spawn(move || {
-        while let Ok((path, mesh_sol)) = io_rx.recv() {
-            if let Err(e) = geopyv_dev::io::save(&path, &GeopyvObject::Mesh((*mesh_sol).clone())) {
-                set_error(&io_state, format!("Frame save error: {e}"));
-                break;
-            }
-        }
-    });
-
-    // Load initial reference image.
-    let mut f_img = match Image::from_file(&params.image_paths[f_index], params.border) {
-        Ok(img) => Arc::new(img),
+    let boundary = match region(&params.boundary, true) {
+        Ok(r) => r,
         Err(e) => {
-            set_error(&state, format!("Reference image error: {e}"));
+            set_error(&state, format!("Boundary error: {e}"));
+            return;
+        }
+    };
+    let exclusions = match params.exclusions.iter().map(|ex| region(ex, false)).collect::<Result<Vec<_>, _>>() {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(&state, format!("Exclusion error: {e}"));
+            return;
+        }
+    };
+    let mut sequence = match Sequence::new(
+        params.image_paths.clone(),
+        SequenceMeshConfig {
+            boundary,
+            exclusions,
+            size: (params.size_lower, params.size_upper),
+            target_nodes: params.target_nodes,
+            mesh_order: params.mesh_order,
+        },
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(&state, format!("Sequence setup error: {e}"));
             return;
         }
     };
 
-    let base_progress = 0.08f32;
-    let pair_budget = 1.0f32 - base_progress;
+    let subset_order = if matches!(params.subset_order, SubsetOrder::First) { 1 } else { 2 };
+    let cfg = SequenceSolveConfig {
+        mesh_cfg: SolveConfig {
+            max_norm: params.max_norm,
+            max_iterations: params.max_iterations,
+            subset_order,
+            tolerance: params.zncc_tol,
+            method: match params.method {
+                SolveMethod::Icgn => LibSolveMethod::Icgn,
+                SolveMethod::Fagn => LibSolveMethod::Fagn,
+            },
+            ..Default::default()
+        },
+        local_mask,
+        seed: SeedConfig {
+            coord: params.seed,
+            warp: vec![0.0; 6 * subset_order],
+            tolerance: SeedConfig::DEFAULT_TOLERANCE,
+        },
+        options: LibSequenceOptions {
+            guide: params.guide,
+            sequential: params.sequential,
+            sync: params.sync,
+            override_: params.override_,
+        },
+        border: params.border,
+        save: None,
+    };
 
-    'outer: loop {
-        let pair_num = g_index;
-        let progress =
-            base_progress + pair_budget * (mesh_solutions.len() as f32 / n_pairs as f32);
-        set_progress(
-            &state,
-            progress,
-            &format!("Frame {pair_num}/{n_pairs}\u{2026}"),
-        );
-
-        if cancel.load(Ordering::Relaxed) {
+    let progress = GuiProgress::new(|f, msg| set_progress(&state, f, msg), &cancel, 0.05, 0.95);
+    match sequence.solve(&cfg, Some(&progress)) {
+        Ok(()) => {}
+        Err(geopyv_dev::Error::Cancelled) => {
             if let Ok(mut s) = state.lock() {
                 s.running = false;
             }
             return;
         }
-
-        // Load target image (needed before mesh construction).
-        let g_img = match Image::from_file(&params.image_paths[g_index], params.border) {
-            Ok(img) => Arc::new(img),
-            Err(e) => {
-                set_error(&state, format!("Target image {g_index} error: {e}"));
-                return;
-            }
-        };
-
-        // Build / reuse mesh.
-        let mut mesh = match (params.sync, &sync_sol) {
-            (true, Some(prev)) => Mesh::from_solution(Arc::clone(prev), Arc::clone(&f_img), Arc::clone(&g_img)),
-            _ => match Mesh::new(
-                boundary_arr.view(),
-                true,
-                &exclusion_views,
-                &excl_hard,
-                (params.size_lower, params.size_upper),
-                params.target_nodes,
-                params.mesh_order,
-                Arc::clone(&f_img),
-                Arc::clone(&g_img),
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    set_error(&state, format!("Mesh generation error: {e}"));
-                    return;
-                }
-            },
-        };
-
-        // Solve config (possibly override).
-        let pair_cfg = if mesh_override {
-            SolveConfig { tolerance: 0.0, override_active: true, ..mesh_cfg.clone() }
-        } else {
-            mesh_cfg.clone()
-        };
-
-        let pair_seed = SeedConfig {
-            coord: seed_coord,
-            warp: seed_warp.clone(),
-            tolerance: 0.9,
-        };
-
-        // Solve this pair.
-        let pair_result = mesh.solve(&local_mask, &pair_seed, &pair_cfg, None);
-
-        let mesh_sol = match pair_result {
-            Ok(()) => mesh.solution().expect("solve() succeeded, solution must be Some").clone(),
-            Err(_) => {
-                if f_index + 1 < g_index {
-                    f_index = g_index - 1;
-                    f_img =
-                        match Image::from_file(&params.image_paths[f_index], params.border) {
-                            Ok(img) => Arc::new(img),
-                            Err(e) => {
-                                set_error(&state, format!("Image {f_index} error: {e}"));
-                                return;
-                            }
-                        };
-                    if params.sync {
-                        sync_sol = None;
-                    }
-                    if params.override_ {
-                        mesh_override = true;
-                    }
-                    continue 'outer;
-                } else {
-                    drop(io_tx);
-                    let _ = io_thread.join();
-                    let sol = SequenceSolution {
-                        reference_updates: vec![false; mesh_solutions.len()],
-                        mesh_order: params.mesh_order,
-                        first_f_img_path: params.image_paths.first().cloned(),
-                        mesh_solutions,
-                        mesh_paths: vec![],
-                        all_converged: false,
-                        unsolvable: true,
-                        override_log,
-                        boundary_region: default_boundary_region(),
-                        exclusion_regions: Vec::new(),
-                        options: Some(LibSequenceOptions {
-                            guide: params.guide,
-                            sequential: params.sequential,
-                            sync: params.sync,
-                            override_: params.override_,
-                        }),
-                        border: params.border,
-                    };
-                    save_frames_and_sequence(&sol, &params, &state);
-                    return;
-                }
-            }
-        };
-
-        if mesh_override {
-            if mesh_sol.c_zncc.iter().any(|&c| c < mesh_cfg.tolerance) {
-                override_log.push(g_index);
-            }
-            mesh_override = false;
-        }
-
-        // Queue frame for background I/O.
-        let frame_path = params
-            .mesh_subdir
-            .join(format!("frame_{:03}.pyv", mesh_solutions.len()));
-        if io_tx.send((frame_path, mesh_sol.clone())).is_err() {
+        Err(e) => {
+            set_error(&state, format!("Sequence solve error: {e}"));
             return;
         }
+    }
+    let sol = sequence.solution().expect("solve() succeeded, solution must be Some").clone();
 
-        if params.sync {
-            sync_sol = Some(mesh_sol.clone());
-        }
-        mesh_solutions.push(mesh_sol.clone());
-
-        g_index += 1;
-        if g_index >= n_images {
-            break 'outer;
-        }
-
-        if params.guide {
-            let (disp, new_warp) = deformation_preconditioning(
-                &mesh_sol,
-                seed_coord,
-                params.mesh_order,
-                subset_order_int as u8,
-            );
-            seed_coord[0] += disp[0];
-            seed_coord[1] += disp[1];
-            let n_copy = (6 * params.mesh_order as usize)
-                .min(6 * subset_order_int)
-                .min(new_warp.len())
-                .min(12);
-            for i in 0..n_copy {
-                seed_warp[i] = new_warp[i];
-            }
-            for i in n_copy..12 {
-                seed_warp[i] = 0.0;
-            }
-        }
-
-        if params.sequential {
-            f_index = g_index - 1;
-            f_img =
-                match Image::from_file(&params.image_paths[f_index], params.border) {
-                    Ok(img) => Arc::new(img),
-                    Err(e) => {
-                        set_error(&state, format!("Image {f_index} error: {e}"));
-                        return;
-                    }
-                };
-            if params.sync {
-                sync_sol = None;
-            }
+    // Per-frame meshes into /Meshes/<name>/, then the sequence itself.
+    set_progress(&state, 0.96, "Saving\u{2026}");
+    for (i, mesh_sol) in sol.mesh_solutions.iter().enumerate() {
+        let frame_path = params.mesh_subdir.join(format!("mesh_{i:04}.pyv"));
+        if let Err(e) = geopyv_dev::io::save(&frame_path, &GeopyvObject::Mesh((**mesh_sol).clone())) {
+            set_error(&state, format!("Frame save error: {e}"));
+            return;
         }
     }
-
-    let sol = SequenceSolution {
-        reference_updates: vec![false; mesh_solutions.len()],
-        mesh_order: params.mesh_order,
-        first_f_img_path: params.image_paths.first().cloned(),
-        mesh_solutions,
-        mesh_paths: vec![],
-        all_converged: true,
-        unsolvable: false,
-        override_log,
-        boundary_region: default_boundary_region(),
-        exclusion_regions: Vec::new(),
-        options: Some(LibSequenceOptions {
-            guide: params.guide,
-            sequential: params.sequential,
-            sync: params.sync,
-            override_: params.override_,
-        }),
-        border: params.border,
-    };
-
-    // Wait for all queued frame writes to complete before saving the sequence.
-    drop(io_tx);
-    let _ = io_thread.join();
-
     let seq_path = params.sequences_dir.join(format!("{}.pyv", params.name));
     if let Err(e) = geopyv_dev::io::save(&seq_path, &GeopyvObject::Sequence(sol.clone())) {
         set_error(&state, format!("Sequence save error: {e}"));
         return;
     }
 
-    set_progress(&state, 1.0, "Done");
+    set_progress(&state, 1.0, if sol.unsolvable { "Curtailed (unsolvable pair)" } else { "Done" });
     if let Ok(mut s) = state.lock() {
         s.result = Some(Ok(sol));
-        s.running = false;
-    }
-}
-
-fn save_frames_and_sequence(
-    sol: &SequenceSolution,
-    params: &SequenceSpawnParams,
-    state: &Arc<Mutex<SequenceSolveState>>,
-) {
-    let seq_path = params.sequences_dir.join(format!("{}.pyv", params.name));
-    if let Err(e) = geopyv_dev::io::save(&seq_path, &GeopyvObject::Sequence(sol.clone())) {
-        set_error(state, format!("Sequence save error: {e}"));
-        return;
-    }
-    set_progress(state, 1.0, "Curtailed (unsolvable pair)");
-    if let Ok(mut s) = state.lock() {
-        s.result = Some(Ok(sol.clone()));
         s.running = false;
     }
 }

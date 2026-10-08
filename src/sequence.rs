@@ -44,6 +44,7 @@ use crate::{
     mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig},
     particle::{Particle, ParticleSource},
     masks::LocalMask,
+    progress::{SolveProgress, TerminalProgress},
     subset::Subset,
     Error,
 };
@@ -356,8 +357,24 @@ impl Sequence {
     /// Replicates `Sequence.solve` (minus alive_bar, GUI, geomat sections).
     /// When `cfg.save` is `Some(dir)`, each solved mesh is written to
     /// `{dir}/mesh_{i:04}.pyv` and not held in memory.
-    pub fn solve(&mut self, cfg: &SequenceSolveConfig) -> Result<(), Error> {
+    ///
+    /// `progress` observes pairs and subsets and can cancel
+    /// ([`Error::Cancelled`], no solution stored); `None` shows terminal
+    /// progress bars.
+    pub fn solve(
+        &mut self,
+        cfg: &SequenceSolveConfig,
+        progress: Option<&dyn SolveProgress>,
+    ) -> Result<(), Error> {
         let n_images = self.image_paths.len();
+        let terminal;
+        let progress: &dyn SolveProgress = match progress {
+            Some(p) => p,
+            None => {
+                terminal = TerminalProgress::sequence(n_images - 1);
+                &terminal
+            }
+        };
         let mut mesh_solutions: Vec<Arc<MeshSolution>> = Vec::with_capacity(n_images - 1);
         let mut mesh_paths: Vec<PathBuf> = Vec::new();
         let mut override_log: Vec<usize> = Vec::new();
@@ -402,25 +419,6 @@ impl Sequence {
         // Load initial images as Arc to enable zero-cost sharing across pairs.
         let mut f_img: Arc<Image> = Arc::new(Image::from_file(&self.image_paths[f_index], cfg.border)?);
         let mut g_img: Arc<Image> = Arc::new(Image::from_file(&self.image_paths[g_index], cfg.border)?);
-
-        // Progress: outer bar for image pairs, inner bar for subsets.
-        let mp = indicatif::MultiProgress::new();
-        let pb_seq = mp.add(indicatif::ProgressBar::new((n_images - 1) as u64));
-        pb_seq.set_style(
-            indicatif::ProgressStyle::with_template(
-                "Solving sequence: [{bar:40.green}] {pos}/{len} pairs  ({msg})"
-            )
-            .unwrap()
-            .progress_chars("█░"),
-        );
-        let pb_mesh = mp.add(indicatif::ProgressBar::new(0));
-        pb_mesh.set_style(
-            indicatif::ProgressStyle::with_template(
-                "  Solving mesh:  [{bar:40.cyan}] {pos}/{len} subsets  eta {eta}"
-            )
-            .unwrap()
-            .progress_chars("█░"),
-        );
 
         let all_solved;
 
@@ -486,16 +484,21 @@ impl Sequence {
             let tar_name = self.image_paths[g_index].file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| g_index.to_string());
-            pb_seq.set_message(format!("{}→{}", ref_name, tar_name));
-            pb_mesh.set_length(mesh.nodes().nrows() as u64);
-            pb_mesh.set_position(0);
+            let pair_idx = mesh_solutions.len() + mesh_paths.len();
+            progress.pair_start(pair_idx, n_pairs, &format!("{}→{}", ref_name, tar_name));
+            if progress.cancelled() {
+                return Err(Error::Cancelled);
+            }
 
-            let pair_result = mesh.solve(&cfg.local_mask, &pair_seed, &pair_cfg, Some(&pb_mesh));
+            let pair_result = mesh.solve(&cfg.local_mask, &pair_seed, &pair_cfg, Some(progress));
 
             let mesh_sol: Arc<MeshSolution> = match pair_result {
                 Ok(()) => mesh.solution()
                     .expect("solve() succeeded, solution must be Some")
                     .clone(),
+                // A cancelled solve stops the whole sequence; it is not a
+                // failed pair to fall back from.
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(_) => {
                     // Attempt to fall back to an updated reference.
                     if f_index + 1 < g_index {
@@ -579,8 +582,6 @@ impl Sequence {
                 mesh_solutions.push(Arc::clone(&mesh_sol));
             }
 
-            pb_seq.inc(1);
-
             // --- Advance target image. ------------------------------------
             // Captured before `g_img` is reassigned below: sequential mode
             // needs the *previous* target as its new reference, not the
@@ -627,9 +628,6 @@ impl Sequence {
                 }
             }
         }
-
-        pb_seq.finish_and_clear();
-        pb_mesh.finish_and_clear();
 
         self.solution = Some(SequenceSolution {
             mesh_solutions,
@@ -1193,4 +1191,94 @@ mod tests {
         let _ = std::fs::remove_file(tmp);
     }
 
+
+    // -----------------------------------------------------------------------
+    // Sequence::solve progress / cancellation
+    // -----------------------------------------------------------------------
+
+    /// Writes `n` 8-bit PNG frames of a smooth texture shifted 0.5 px right
+    /// per frame into a fresh temp dir; returns the paths.
+    fn write_shifted_frames(tag: &str, n: usize) -> Vec<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("geopyv_seq_progress_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = 120u32;
+        (0..n)
+            .map(|k| {
+                let u = 0.5 * k as f64;
+                let img = image::GrayImage::from_fn(size, size, |x, y| {
+                    let (xf, yf) = (x as f64 - u, y as f64);
+                    let v = (0.7 * xf).sin() * (0.5 * yf).cos()
+                        + (0.31 * xf + 0.2 * yf).sin()
+                        + (0.13 * xf - 0.42 * yf).cos();
+                    image::Luma([(128.0 + 40.0 * v).round() as u8])
+                });
+                let path = dir.join(format!("frame_{k}.png"));
+                img.save(&path).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn progress_test_sequence(tag: &str) -> (Sequence, SequenceSolveConfig) {
+        let paths = write_shifted_frames(tag, 3);
+        let boundary = Region::path(
+            None,
+            ndarray::array![[30.0, 30.0], [90.0, 30.0], [90.0, 90.0], [30.0, 90.0]],
+            RegionOption::S, true, false, 0.0,
+        ).unwrap();
+        let seq = Sequence::new(paths, SequenceMeshConfig {
+            boundary, exclusions: vec![], size: (10.0, 20.0), target_nodes: 30, mesh_order: 1,
+        }).unwrap();
+        let cfg = SequenceSolveConfig {
+            mesh_cfg: SolveConfig { subset_order: 1, override_active: true, ..SolveConfig::default() },
+            local_mask: LocalMask::circle(8).unwrap(),
+            seed: SeedConfig { coord: [60.0, 60.0], warp: vec![], tolerance: 0.0 },
+            options: SequenceOptions::default(),
+            border: 20,
+            save: None,
+        };
+        (seq, cfg)
+    }
+
+    #[derive(Default)]
+    struct PairCounter {
+        pairs: std::sync::Mutex<Vec<(usize, usize)>>,
+        nodes: std::sync::atomic::AtomicUsize,
+        cancel_at_pair: Option<usize>,
+    }
+    impl SolveProgress for PairCounter {
+        fn node_done(&self) {
+            self.nodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn pair_start(&self, pair: usize, n_pairs: usize, _label: &str) {
+            self.pairs.lock().unwrap().push((pair, n_pairs));
+        }
+        fn cancelled(&self) -> bool {
+            let started = self.pairs.lock().unwrap().len();
+            self.cancel_at_pair.is_some_and(|c| started > c)
+        }
+    }
+
+    #[test]
+    fn sequence_solve_reports_pairs_and_cancels() {
+        let (mut seq, cfg) = progress_test_sequence("full");
+        let p = PairCounter::default();
+        seq.solve(&cfg, Some(&p)).unwrap();
+        assert_eq!(*p.pairs.lock().unwrap(), vec![(0, 2), (1, 2)]);
+        assert!(p.nodes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(seq.solution().unwrap().n_meshes(), 2);
+
+        // Cancelled as pair 1 starts: Error::Cancelled (not the
+        // failed-pair fallback), no solution stored.
+        let (mut seq, cfg) = progress_test_sequence("cancel");
+        let p = PairCounter { cancel_at_pair: Some(1), ..Default::default() };
+        assert!(matches!(seq.solve(&cfg, Some(&p)), Err(Error::Cancelled)));
+        assert_eq!(p.pairs.lock().unwrap().len(), 2);
+        assert!(seq.solution().is_none());
+
+        for tag in ["full", "cancel"] {
+            let dir = std::env::temp_dir().join(format!("geopyv_seq_progress_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
