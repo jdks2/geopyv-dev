@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
 use numpy::IntoPyArray;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use geopyv_dev::{
     image::Image,
-    mesh::{SeedConfig, SolveConfig, SolveMethod},
+    mesh::{Preconditioning, SeedConfig, SolveConfig, SolveMethod},
     sequence::{self, Sequence, SequenceMeshConfig, SequenceOptions, SequenceSolveConfig},
     masks::LocalMask,
 };
@@ -27,6 +27,7 @@ use crate::{
     py_image::PyImage,
     py_mesh::PyMesh,
     py_mask::PyMask,
+    py_particle::PyMeshlessParams,
     Error,
 };
 
@@ -175,16 +176,42 @@ impl PySequence {
     ///     Temporal coupling strategy. Default ``SequenceOptions()``.
     /// border : int, optional
     ///     Image border (pixels) for B-spline precomputation. Default 20.
-    #[pyo3(signature = (local_mask, seed_coord, seed_warp=None,
+    /// preconditioning : str, optional
+    ///     Intra-mesh RG frontier traversal strategy, forwarded to every
+    ///     pair's `Mesh.solve` unchanged -- ``"RG"`` (default) or
+    ///     ``"layer-RG"`` (layer-parallel; see
+    ///     `geopyv_dev_fresh/layer_rg_plan.md`).
+    /// masking : str, optional
+    ///     The ``masking`` axis, forwarded to every pair's `Mesh.solve`
+    ///     unchanged -- ``"uniform"`` (default) or ``"zonal"``. See
+    ///     `Mesh.solve`'s own docstring and
+    ///     `geopyv_dev_fresh/solver_options_restructure.md` §4's Stage B.
+    ///     `Sequence::solve`'s per-pair loop needed no structural change to
+    ///     support this -- it already calls `mesh.solve` once per pair.
+    /// zonal_k, zonal_smoothing_sigma, zonal_meshless_params, zonal_iterations
+    ///     : optional. Same meaning as on `Mesh.solve`; ``masking="zonal"``
+    ///     only (``ValueError`` with ``masking="uniform"``). There is no
+    ///     ``zonal_zone_map`` here: one caller-supplied map has no sensible
+    ///     meaning across a sequence of increments.
+    #[pyo3(signature = (local_mask=None, seed_coord=None, seed_warp=None,
                          max_norm=1e-5, max_iterations=50, subset_order=2,
                          tolerance=0.75, seed_tolerance=0.9, method="icgn",
-                         options=None, border=20, save=None))]
+                         options=None, border=20, save=None,
+                         preconditioning="RG",
+                         masking="uniform",
+                         zonal_k=None,
+                         zonal_smoothing_sigma=None,
+                         zonal_meshless_params=None,
+                         zonal_iterations=None,
+                         layer_rg_batch_factor=4,
+                         layer_rg_root_rel_eps=0.02,
+                         layer_rg_max_workers=None))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
         py: Python<'_>,
-        local_mask: &Bound<'_, PyAny>,
-        seed_coord: [f64; 2],
+        local_mask: Option<&Bound<'_, PyAny>>,
+        seed_coord: Option<[f64; 2]>,
         seed_warp: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
@@ -195,12 +222,53 @@ impl PySequence {
         options: Option<PyRef<'_, PySequenceOptions>>,
         border: usize,
         save: Option<&str>,
+        preconditioning: &str,
+        masking: &str,
+        zonal_k: Option<f64>,
+        zonal_smoothing_sigma: Option<f64>,
+        zonal_meshless_params: Option<PyRef<'_, PyMeshlessParams>>,
+        zonal_iterations: Option<usize>,
+        layer_rg_batch_factor: usize,
+        layer_rg_root_rel_eps: f64,
+        layer_rg_max_workers: Option<usize>,
     ) -> PyResult<()> {
+        let local_mask = local_mask.ok_or_else(|| {
+            PyTypeError::new_err("local_mask is required")
+        })?;
+        let seed_coord = seed_coord.ok_or_else(|| {
+            PyTypeError::new_err("seed_coord is required")
+        })?;
+
         let solve_method = if method == "fagn" {
             SolveMethod::Fagn
         } else {
             SolveMethod::Icgn
         };
+        let preconditioning = match preconditioning {
+            "RG" => Preconditioning::Rg,
+            "layer-RG" => Preconditioning::LayerRg,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "preconditioning must be 'RG' or 'layer-RG', got {other:?}"
+                )))
+            }
+        };
+        if layer_rg_batch_factor == 0 {
+            return Err(PyValueError::new_err("layer_rg_batch_factor must be >= 1"));
+        }
+        let layer_rg = geopyv_dev::mesh::LayerRgConfig {
+            batch_factor: layer_rg_batch_factor,
+            root_rel_eps: layer_rg_root_rel_eps,
+            max_workers: layer_rg_max_workers,
+        };
+        let masking = crate::py_mesh::masking_from_py(
+            masking,
+            zonal_k,
+            zonal_smoothing_sigma,
+            zonal_meshless_params.map(|p| p.inner.clone()),
+            zonal_iterations,
+            None,
+        )?;
         let tmpl = local_mask
             .extract::<PyRef<'_, PyMask>>()
             .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
@@ -221,6 +289,10 @@ impl PySequence {
                 tolerance,
                 method: solve_method,
                 override_active: false,
+                preconditioning,
+                layer_rg,
+                masking,
+                ..Default::default()
             },
             local_mask,
             seed: SeedConfig {

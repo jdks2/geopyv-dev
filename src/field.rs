@@ -33,7 +33,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     calibration::CalibrationParams,
-    particle::{Particle, ParticleConfig, ParticleSource, ParticleSolution},
+    particle::{
+        meshless_scalar_gradient_batch, Particle, ParticleConfig, ParticleSource,
+        ParticleSolution, StrainMethod,
+    },
     sequence::SequenceSolution,
     Error,
 };
@@ -259,10 +262,10 @@ impl Field {
     /// saved-by-reference sequences each mesh file is read exactly once; all
     /// particles advance their increment in parallel (rayon), then the mesh is
     /// dropped before the next file is opened.
-    pub fn solve(&mut self, factor: f64, true_incs: bool, calibration: Option<&CalibrationParams>) -> Result<(), Error> {
+    pub fn solve(&mut self, factor: f64, true_incs: bool, calibration: Option<&CalibrationParams>, strain_method: StrainMethod) -> Result<(), Error> {
         let n = self.n_particles();
         let n_meshes = self.source.n_meshes();
-        let cfg = ParticleConfig { factor, true_incs };
+        let cfg = ParticleConfig { factor, true_incs, strain_method };
         let mesh_order = self.source.mesh_order;
         let initial_warp = vec![0.0f64; 6 * mesh_order as usize];
         let source = Arc::clone(&self.source);
@@ -294,19 +297,67 @@ impl Field {
         for m in 0..n_meshes {
             let mesh = source.load_mesh_at(m)?;
             particles.par_iter_mut().for_each(|p| {
-                p.solve_increment(m, &mesh, calibration);
+                p.solve_increment(m, &mesh, &cfg, calibration);
             });
         }
 
         // Phase 3: finalize strain paths.
         let calibrated = calibration.is_some();
-        let particle_solutions: Vec<Arc<ParticleSolution>> = particles.iter()
+        let mut solutions: Vec<ParticleSolution> = particles.iter()
             .map(|p| {
                 let mut sol = p.finalize(&cfg);
                 sol.calibrated = calibrated;
-                Arc::new(sol)
+                sol
             })
             .collect();
+
+        // Phase 3b: cross-particle meshless spatial gradient of gamma_max,
+        // one full pass per increment across every particle's already-
+        // finalized principal_strains history -- see ParticleSolution::
+        // gamma_max_grad's doc comment for why this only runs under
+        // StrainMethod::Meshless (no independent fallback radius). Done
+        // here, after every particle's full strain history is already
+        // finalized, rather than interleaved into Phase 2's per-increment
+        // loop above -- strain_def/principal_strains are both whole-history
+        // functions (operate on the full accumulated `warps` array in one
+        // shot), not incremental, so there is no per-increment gamma_max
+        // available until finalize() has already run for every particle.
+        if let StrainMethod::Meshless(params) = &cfg.strain_method {
+            if let Some(inc_no) = solutions.first().map(|s| s.coordinates.nrows()) {
+                let n_particles = solutions.len();
+                let mut grads: Vec<Array2<f64>> = (0..n_particles)
+                    .map(|_| Array2::<f64>::from_elem((inc_no, 2), f64::NAN))
+                    .collect();
+
+                for m in 0..inc_no {
+                    let mut coords = Array2::<f64>::zeros((n_particles, 2));
+                    let mut values = Array1::<f64>::zeros(n_particles);
+                    for (i, sol) in solutions.iter().enumerate() {
+                        coords[[i, 0]] = sol.coordinates[[m, 0]];
+                        coords[[i, 1]] = sol.coordinates[[m, 1]];
+                        values[i] = sol
+                            .principal_strains
+                            .as_ref()
+                            .map(|p| p[[m, 2]])
+                            .unwrap_or(f64::NAN);
+                    }
+                    let grad = meshless_scalar_gradient_batch(
+                        coords.view(), coords.view(), values.view(), params,
+                    );
+                    for i in 0..n_particles {
+                        grads[i][[m, 0]] = grad[[i, 0]];
+                        grads[i][[m, 1]] = grad[[i, 1]];
+                    }
+                }
+
+                for (sol, g) in solutions.iter_mut().zip(grads.into_iter()) {
+                    sol.gamma_max_grad = Some(g);
+                }
+            }
+        }
+
+        let particle_solutions: Vec<Arc<ParticleSolution>> =
+            solutions.into_iter().map(Arc::new).collect();
 
         let mut vol_totals = Array1::<f64>::zeros(n_meshes + 1);
         for sol in &particle_solutions {
@@ -344,7 +395,9 @@ impl Field {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{mesh::compute_centroids, sequence::SequenceSolution};
+    use crate::{
+        mesh::compute_centroids, particle::MeshlessParams, sequence::SequenceSolution,
+    };
     use ndarray::array;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -384,6 +437,9 @@ mod tests {
             g_img_path: PathBuf::new(),
             solve_config: None,
             seed: None,
+            template_shape: None,
+            template_sizes: None,
+            zonal_masking: None,
         }
     }
 
@@ -537,7 +593,7 @@ mod tests {
     fn test_field_solve_pure_translation_no_strain() {
         let disps = pure_translation_disps(0.3, 0.1);
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         let sol = field.solution().unwrap();
         assert_eq!(sol.particles.len(), 2);
         for p in &sol.particles {
@@ -557,7 +613,7 @@ mod tests {
         let seq = single_mesh_seq(&disps);
         let dist = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
         let mut field = Field::new(Arc::clone(&seq), dist, true, 1.0).unwrap();
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         let sol = field.solution().unwrap();
         for (pi, p) in sol.particles.iter().enumerate() {
             assert!(
@@ -576,7 +632,7 @@ mod tests {
         let seq = single_mesh_seq(&disps);
         let dist = FieldDistribution::Explicit { coordinates: coords, volumes: vols };
         let mut field = Field::new(seq, dist, false, 1.0).unwrap();
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         let sol = field.solution().unwrap();
         for (pi, p) in sol.particles.iter().enumerate() {
             assert!(
@@ -590,7 +646,7 @@ mod tests {
     fn test_field_solve_vol_totals_shape() {
         let disps = Array2::<f64>::zeros((4, 2));
         let mut field = make_field_from_seq(two_mesh_seq(&disps, vec![false, false]), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         assert_eq!(field.solution().unwrap().vol_totals.len(), 3);
     }
 
@@ -601,7 +657,7 @@ mod tests {
         let (_, vols) = distribute_particles(&nodes, &elems, 1.0);
         let total_initial = vols.sum();
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         let sol = field.solution().unwrap();
         assert!((sol.vol_totals[0] - total_initial).abs() < 1e-10, "vt[0]={}", sol.vol_totals[0]);
         assert!((sol.vol_totals[1] - total_initial).abs() < 1e-10, "vt[1]={}", sol.vol_totals[1]);
@@ -612,7 +668,7 @@ mod tests {
         let disps = Array2::<f64>::zeros((4, 2));
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
         assert!(!field.solved());
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         assert!(field.solved());
     }
 
@@ -620,7 +676,7 @@ mod tests {
     fn test_field_solve_ref_update_register() {
         let disps = Array2::<f64>::zeros((4, 2));
         let mut field = make_field_from_seq(two_mesh_seq(&disps, vec![false, true]), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         assert_eq!(field.solution().unwrap().reference_update_register, vec![1]);
     }
 
@@ -628,7 +684,7 @@ mod tests {
     fn test_field_solve_particle_count() {
         let disps = Array2::<f64>::zeros((4, 2));
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         assert_eq!(field.solution().unwrap().particles.len(), 2);
     }
 
@@ -639,7 +695,7 @@ mod tests {
         let disps = array![[0.0, 0.0_f64], [0.1, 0.0], [0.0, 0.0], [0.1, 0.0]];
         let seq = make_seq(vec![make_mesh_sol(&nodes, &elems, &disps)], vec![false]);
         let mut field = make_field_from_seq(seq, true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         let sol = field.solution().unwrap();
         for p in &sol.particles {
             assert!((p.incs[[1, 2]] - 0.1).abs() < 1e-8, "incs[1,2]={}", p.incs[[1, 2]]);
@@ -650,7 +706,7 @@ mod tests {
     fn test_field_solve_two_increments() {
         let disps = pure_translation_disps(0.1, 0.0);
         let mut field = make_field_from_seq(two_mesh_seq(&disps, vec![false, false]), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         let sol = field.solution().unwrap();
         for p in &sol.particles {
             assert_eq!(p.coordinates.nrows(), 3);
@@ -662,7 +718,7 @@ mod tests {
         let disps = Array2::<f64>::zeros((4, 2));
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
         let initial = field.coordinates.clone();
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
         assert_eq!(field.solution().unwrap().initial_coordinates, initial);
     }
 
@@ -740,7 +796,7 @@ mod tests {
         let (seq, paths) = make_saved_by_ref_field_seq("pt_sbr", vec![ms], vec![false]);
 
         let mut field = make_field_from_seq(Arc::clone(&seq), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
 
         let sol = field.solution().unwrap();
         assert_eq!(sol.particles.len(), 2);
@@ -763,7 +819,7 @@ mod tests {
             make_saved_by_ref_field_seq("two_incr", vec![ms0, ms1], vec![false, false]);
 
         let mut field = make_field_from_seq(Arc::clone(&seq), true);
-        field.solve(1.0, true, None).unwrap();
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
 
         let sol = field.solution().unwrap();
         for p in &sol.particles {
@@ -783,14 +839,14 @@ mod tests {
         // In-memory solve
         let seq_mem = make_seq(vec![ms.clone()], vec![false]);
         let mut field_mem = make_field_from_seq(seq_mem, true);
-        field_mem.solve(0.0, true, None).unwrap();
+        field_mem.solve(0.0, true, None, StrainMethod::Mesh).unwrap();
         let sol_mem = field_mem.solution().unwrap();
 
         // Saved-by-reference solve
         let (seq_sbr, paths) =
             make_saved_by_ref_field_seq("match_sbr", vec![ms], vec![false]);
         let mut field_sbr = make_field_from_seq(Arc::clone(&seq_sbr), true);
-        field_sbr.solve(0.0, true, None).unwrap();
+        field_sbr.solve(0.0, true, None, StrainMethod::Mesh).unwrap();
         let sol_sbr = field_sbr.solution().unwrap();
 
         for (pm, ps) in sol_mem.particles.iter().zip(sol_sbr.particles.iter()) {
@@ -833,7 +889,7 @@ mod tests {
         let disps = pure_translation_disps(0.5, 0.1);
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
         let cal = identity_calibration();
-        field.solve(0.0, true, Some(&cal)).unwrap();
+        field.solve(0.0, true, Some(&cal), StrainMethod::Mesh).unwrap();
         assert!(field.solution().unwrap().calibrated);
     }
 
@@ -841,7 +897,7 @@ mod tests {
     fn test_field_calibrated_flag_false() {
         let disps = pure_translation_disps(0.5, 0.1);
         let mut field = make_field_from_seq(single_mesh_seq(&disps), true);
-        field.solve(0.0, true, None).unwrap();
+        field.solve(0.0, true, None, StrainMethod::Mesh).unwrap();
         assert!(!field.solution().unwrap().calibrated);
     }
 
@@ -853,12 +909,12 @@ mod tests {
         let disps = pure_translation_disps(0.5, 0.1);
 
         let mut field_uncal = make_field_from_seq(single_mesh_seq(&disps), true);
-        field_uncal.solve(0.0, true, None).unwrap();
+        field_uncal.solve(0.0, true, None, StrainMethod::Mesh).unwrap();
         let sol_uncal = field_uncal.solution().unwrap();
 
         let cal = half_scale_calibration();
         let mut field_cal = make_field_from_seq(single_mesh_seq(&disps), true);
-        field_cal.solve(0.0, true, Some(&cal)).unwrap();
+        field_cal.solve(0.0, true, Some(&cal), StrainMethod::Mesh).unwrap();
         let sol_cal = field_cal.solution().unwrap();
 
         for (p_uncal, p_cal) in sol_uncal.particles.iter().zip(sol_cal.particles.iter()) {
@@ -869,5 +925,132 @@ mod tests {
                 "{} vs {}", cal_disp_x, 0.5 * uncal_disp_x
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // principal_strains / gamma_max_grad -- stored at solve time, not
+    // recomputed at plot time.
+    // -----------------------------------------------------------------------
+
+    /// 4 triangles meeting at a centre node, corners of a 2x2 square -- same
+    /// "cross" topology as tests/python/field/test_field.py's own
+    /// NODES_GRID/ELEMS_GRID fixture. Gives 4 non-collinear particle
+    /// centroids, the minimum needed for a well-conditioned 2D affine fit
+    /// (unlike unit_square_mesh's 2 particles, which can only determine a
+    /// 1D directional derivative).
+    fn cross_mesh() -> (Array2<f64>, Array2<usize>) {
+        let nodes = array![[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0], [1.0, 1.0]];
+        let elems = array![[0usize, 1, 4], [1, 3, 4], [3, 2, 4], [2, 0, 4]];
+        (nodes, elems)
+    }
+
+    #[test]
+    fn test_field_solve_principal_strains_matches_direct_call() {
+        let (nodes, elems) = unit_square_mesh();
+        let disps = array![[0.0, 0.0_f64], [0.1, 0.0], [0.0, 0.05], [0.1, 0.05]];
+        let seq = make_seq(vec![make_mesh_sol(&nodes, &elems, &disps)], vec![false]);
+        let mut field = make_field_from_seq(seq, true);
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
+        let sol = field.solution().unwrap();
+        for p in &sol.particles {
+            let expected = crate::particle::principal_strains(&p.strains);
+            let got = p.principal_strains.as_ref().expect("principal_strains should be populated");
+            assert_eq!(got.shape(), expected.shape());
+            for i in 0..expected.nrows() {
+                for j in 0..4 {
+                    assert!(
+                        (got[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                        "row {i} col {j}: got {} expected {}", got[[i, j]], expected[[i, j]]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_field_solve_gamma_max_grad_none_when_mesh() {
+        let (nodes, elems) = cross_mesh();
+        let n = nodes.nrows();
+        let disps = Array2::<f64>::zeros((n, 2));
+        let seq = make_seq(vec![make_mesh_sol(&nodes, &elems, &disps)], vec![false]);
+        let mut field = make_field_from_seq(seq, true);
+        field.solve(1.0, true, None, StrainMethod::Mesh).unwrap();
+        let sol = field.solution().unwrap();
+        assert!(!sol.particles.is_empty());
+        for p in &sol.particles {
+            assert!(
+                p.gamma_max_grad.is_none(),
+                "gamma_max_grad must stay None under StrainMethod::Mesh -- no independent \
+                 fallback radius to drive it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_field_solve_gamma_max_grad_populated_and_nontrivial_when_meshless() {
+        let (nodes, elems) = cross_mesh();
+        let centroids = compute_centroids(&nodes, &elems);
+        let n = nodes.nrows();
+        // v = 0.01 * x^2 at each node: NOT affine, so a robust *local*
+        // affine fit (StrainMethod::Meshless) picks up a position-dependent
+        // dv/dx (steeper toward +x), hence a position-dependent gamma_max,
+        // hence a genuinely non-zero spatial gradient to recover. A
+        // globally-affine field would give every local fit the same slope
+        // and the gradient would be exactly zero everywhere -- not a useful
+        // wiring check.
+        let mut p = Array2::<f64>::zeros((n, 6));
+        for i in 0..n {
+            let x = nodes[[i, 0]];
+            p[[i, 1]] = 0.01 * x * x;
+        }
+        let mesh_sol = crate::mesh::MeshSolution {
+            nodes: nodes.clone(),
+            elements: elems.clone(),
+            boundary: (0..n).collect(),
+            exclusions: vec![],
+            centroids,
+            areas: Array1::from_vec(vec![0.5; elems.nrows()]),
+            warps: Array2::zeros((elems.nrows(), 12)),
+            displacements: Array2::zeros((n, 2)),
+            c_zncc: Array1::ones(n),
+            p,
+            seed_node: 0,
+            mesh_order: 1,
+            subset_order: 1,
+            iterations: Array1::zeros(n),
+            norms: Array1::zeros(n),
+            f_img_path: PathBuf::new(),
+            g_img_path: PathBuf::new(),
+            solve_config: None,
+            seed: None,
+            template_shape: None,
+            template_sizes: None,
+            zonal_masking: None,
+        };
+        let seq = make_seq(vec![mesh_sol], vec![false]);
+        let mut field = make_field_from_seq(seq, true);
+        let params = MeshlessParams {
+            radius: 10.0, quality_gate: None, min_neighbours: 3, max_iterations: 5, tukey_c: 4.685,
+            zone_aware: false,
+        };
+        field.solve(0.0, true, None, StrainMethod::Meshless(params)).unwrap();
+        let sol = field.solution().unwrap();
+        assert_eq!(sol.particles.len(), 4);
+
+        let mut any_nonzero = false;
+        for p in &sol.particles {
+            let g = p.gamma_max_grad.as_ref()
+                .expect("gamma_max_grad should be populated under StrainMethod::Meshless");
+            assert_eq!(g.nrows(), p.coordinates.nrows());
+            assert_eq!(g.ncols(), 2);
+            if g[[1, 0]].abs() > 1e-8 || g[[1, 1]].abs() > 1e-8 {
+                any_nonzero = true;
+            }
+        }
+        assert!(
+            any_nonzero,
+            "expected at least one particle to see a non-trivial gamma_max gradient from a \
+             spatially-varying field"
+        );
     }
 }

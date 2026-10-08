@@ -54,16 +54,36 @@ impl PySpeckle {
     ///     ``image_dir`` (str), ``name`` (str), ``image_size`` ((int,int), default (1001,1001)),
     ///     ``file_format`` (str, default ".jpg").
     /// speckle_cfg : dict
-    ///     ``speckle_size`` (float, px blob radius), ``speckle_number`` (int).
+    ///     ``speckle_size`` (float, px blob radius), ``speckle_number`` (int),
+    ///     ``speckle_limit`` (bool, optional, default False) -- when True, each
+    ///     speckle's Gaussian is rendered only within ``ceil(1.5 * speckle_size)``
+    ///     px of its centre instead of the default fixed ±100px window; safe (not
+    ///     lossy) at typical speckle sizes, and substantially faster to render.
     /// progression : str
     ///     ``"deformation"`` — warp progresses; noise constant at final values.
     ///     ``"noise"``       — noise progresses; deformation constant at full comp.
     /// deformation_cfg : dict
     ///     ``comp`` (list[float], 12 elements) — final warp vector (applied at mult=1).
     ///     ``origin`` ((float,float), optional) — warp reference origin; defaults to image centre.
-    ///     ``mode`` (str, optional) — ``None`` / ``"SB"`` for shear-band.
-    ///     ``option`` (str, optional) — ``"sin"`` / ``"lin"`` / ``"quad"`` when mode="SB".
+    ///     ``mode`` (str, optional) — ``None`` / ``"rotation"`` / ``"SB"`` / ``"circular"``.
+    ///     ``option`` (str, optional) — ``"sin"`` / ``"lin"`` / ``"quad"`` / ``"smooth"`` when mode="SB".
     ///     ``width`` (float, optional) — shear-band full width in px (default 100.0).
+    ///     ``tau`` (float, required when option="smooth") — corner transition length in px;
+    ///         a box (``"lin"``-shaped) band whose corners are rounded by a logistic
+    ///         transition of length ``tau``. ``tau`` comparable to ``width/2`` erodes the
+    ///         flat plateau at ``du/dy = strain`` into a smoothed triangular bump.
+    ///     ``angle`` (float, required when mode="rotation" or mode="circular") — rotation
+    ///         angle in radians at multiplier 1.
+    ///     ``r1``, ``r2`` (float, required when mode="circular") — inner (rigid core) and
+    ///         outer (stationary far field) radii in px of the circular shear band around
+    ///         ``origin``; a disc of radius ``r1`` rotates rigidly by ``angle``, an annulus
+    ///         from ``r1`` to ``r2`` linearly tapers that rotation to zero, and the field is
+    ///         exactly stationary beyond ``r2``.
+    ///     ``tau`` (float, optional, only when mode="circular") — corner transition
+    ///         length in px, rounding the annulus's two corners (at ``r1`` and ``r2``)
+    ///         the same way ``option="smooth"`` rounds a shear band's corners; ``r1``
+    ///         (core rotation ``angle``) and ``r2`` (stationary far field) stay exact.
+    ///         Requires ``0 < tau <= (r2-r1)/2``. Omit for the hard-edged annulus.
     /// noise_cfg : (float, float)
     ///     ``(noise_pos, noise_int)`` — final Gaussian noise std-devs.
     /// scale_cfg : dict
@@ -96,6 +116,7 @@ impl PySpeckle {
         // speckle_cfg
         let speckle_size: f64 = req(speckle_cfg, "speckle_size")?;
         let speckle_number: usize = req(speckle_cfg, "speckle_number")?;
+        let speckle_limit: bool = opt(speckle_cfg, "speckle_limit")?.unwrap_or(false);
 
         // progression
         let prog = match progression {
@@ -134,15 +155,29 @@ impl PySpeckle {
                     "sin" => ShearBandOption::Sin,
                     "lin" => ShearBandOption::Lin,
                     "quad" => ShearBandOption::Quad,
+                    "smooth" => {
+                        let tau: f64 = req(deformation_cfg, "tau")?;
+                        ShearBandOption::Smooth { tau }
+                    }
                     other => return Err(PyValueError::new_err(format!(
-                        "option must be 'sin', 'lin', or 'quad', got '{other}'"
+                        "option must be 'sin', 'lin', 'quad', or 'smooth', got '{other}'"
                     ))),
                 };
                 let width: f64 = opt(deformation_cfg, "width")?.unwrap_or(100.0);
                 WarpMode::ShearBand { option: sb_opt, width }
             }
+            Some(s) if s.eq_ignore_ascii_case("circular") => {
+                // Same convention as "rotation": angle in comp[0], other
+                // comp entries unused. origin doubles as the band centre.
+                let angle: f64 = req(deformation_cfg, "angle")?;
+                comp[0] = angle;
+                let r1: f64 = req(deformation_cfg, "r1")?;
+                let r2: f64 = req(deformation_cfg, "r2")?;
+                let tau: Option<f64> = opt(deformation_cfg, "tau")?;
+                WarpMode::CircularShear { r1, r2, tau }
+            }
             Some(other) => return Err(PyValueError::new_err(format!(
-                "mode must be None, 'rotation', or 'SB', got '{other}'"
+                "mode must be None, 'rotation', 'SB', or 'circular', got '{other}'"
             ))),
         };
 
@@ -170,6 +205,7 @@ impl PySpeckle {
             image_size,
             speckle_size,
             speckle_number,
+            speckle_limit,
             prog,
             comp,
             origin,

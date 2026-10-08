@@ -50,6 +50,7 @@ impl PySubset {
         let local_mask = match sol.mask.shape {
             MaskShape::Circle => LocalMask::circle(sol.mask.size),
             MaskShape::Square => LocalMask::square(sol.mask.size),
+            MaskShape::Semicircle => LocalMask::semicircle(sol.mask.size),
         }.map_err(Error::from)?;
         let py_mask: Py<PyMask> = Py::new(py, PyMask::from_local(local_mask.clone()))?;
 
@@ -226,6 +227,24 @@ impl PySubset {
     }
 
     // -----------------------------------------------------------------------
+    // Warp-adequacy diagnostic
+    // -----------------------------------------------------------------------
+
+    /// Recompute the converged per-pixel zero-normalised image residual for
+    /// this subset's stored solution -- not persisted anywhere (only the
+    /// scalar `eta_u`/`eta_v` are), recomputed on demand from the subset's
+    /// own already-held reference data plus the converged `p`. Backs
+    /// `Subset.inspect(residual=True)`.
+    ///
+    /// Raises if the subset hasn't been solved, or if its images are
+    /// unavailable (e.g. loaded from a `.pyv` whose original image files are
+    /// no longer found on disk).
+    fn residual_map<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let residual = self.inner.residual_map().map_err(Error::from)?;
+        Ok(residual.into_pyarray_bound(py))
+    }
+
+    // -----------------------------------------------------------------------
     // Always-available getters
     // -----------------------------------------------------------------------
 
@@ -249,6 +268,7 @@ impl PySubset {
         match &self.inner.mask.shape {
             MaskShape::Circle => "circle".to_string(),
             MaskShape::Square => "square".to_string(),
+            MaskShape::Semicircle => "semicircle".to_string(),
         }
     }
 
@@ -341,6 +361,18 @@ impl PySubset {
     #[getter]
     fn tolerance(&self) -> Option<f64> { self.result().map(|r| r.tolerance) }
 
+    /// Gradient-weighted omitted-mode warp-adequacy score for the omitted
+    /// `u` (horizontal) displacement modes. `None` if unsolved or solved at
+    /// `subset_order == 2` (not yet implemented for order 2). See
+    /// `omitted_mode_diagnostic` in `src/subset.rs`.
+    #[getter]
+    fn eta_u(&self) -> Option<f64> { self.result().and_then(|r| r.eta_omitted).map(|(u, _)| u) }
+
+    /// Companion to [`Self::eta_u`] for the omitted `v` (vertical)
+    /// displacement modes.
+    #[getter]
+    fn eta_v(&self) -> Option<f64> { self.result().and_then(|r| r.eta_omitted).map(|(_, v)| v) }
+
     // -----------------------------------------------------------------------
     // __repr__
     // -----------------------------------------------------------------------
@@ -349,6 +381,7 @@ impl PySubset {
         let shape_str = match &self.inner.mask.shape {
             MaskShape::Circle => "circle",
             MaskShape::Square => "square",
+            MaskShape::Semicircle => "semicircle",
         };
         let tmpl_str = format!("{}({})", shape_str, self.inner.mask.size);
         if let Some(r) = self.result() {

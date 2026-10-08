@@ -337,3 +337,194 @@ def test_sequence_boundary_tracks_displacement_across_reference_update(tmp_path)
     b_idx1 = seq.boundary(1)
     nodes1 = seq.nodes(1)
     np.testing.assert_allclose(nodes1[b_idx1], boundary.current_nodes, atol=1e-6)
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_masking_zonal_composes_with_reference_update(tmp_path):
+    """Proof point for Stage B's actual payoff: masking="zonal" combined
+    with a reference-update pair-boundary-rebuild -- the same 3-image
+    sequential=True fixture as
+    test_sequence_boundary_tracks_displacement_across_reference_update
+    above (a real, already-proven reference-update code path in
+    Sequence::solve's loop), now with masking active on every pair. This
+    confirms masking correctly reaches a pair whose mesh/seed was rebuilt
+    mid-sequence by the reference-update machinery, not just a pair solved
+    directly from the sequence's own first mesh.
+
+    NOTE: this exercises the `sequential=True` deliberate-reference-advance
+    path, not the *failure-triggered* curtailment/retry path
+    (`src/sequence.rs`'s "attempt to fall back to an updated reference" on
+    an `Err` from `mesh.solve`) -- reliably engineering a genuine pair
+    failure with only the two fixed `ref.jpg`/`tar.jpg` test images
+    available wasn't achievable in this pass. Both paths share the same
+    `mesh.solve(&cfg.local_mask, &pair_seed, &pair_cfg, ...)` call site
+    Stage B relies on needing zero changes, so this is still real evidence
+    for that claim, just not the specific failure-triggered variant."""
+    shutil.copy(REF_IMG, tmp_path / "frame_000.jpg")
+    shutil.copy(TAR_IMG, tmp_path / "frame_001.jpg")
+    shutil.copy(TAR_IMG, tmp_path / "frame_002.jpg")
+
+    cx, cy = 500.0, 500.0
+    half = 100.0
+    boundary_pts = np.array(
+        [
+            [cx - half, cy - half],
+            [cx + half, cy - half],
+            [cx + half, cy + half],
+            [cx - half, cy + half],
+        ],
+        dtype=np.float64,
+    )
+
+    seq = Sequence(
+        image_dir=str(tmp_path),
+        boundary=boundary_pts,
+        target_nodes=15,
+        size=(10.0, 100.0),
+        mesh_order=1,
+    )
+
+    template = Mask(mask_type="local", shape="circle", size=10)
+    seq.solve(
+        local_mask=template,
+        seed_coord=[cx, cy],
+        max_norm=1e-3,
+        max_iterations=100,
+        subset_order=1,
+        tolerance=0.0,
+        options=SequenceOptions(guide=False, sync=False, sequential=True),
+        border=20,
+        solver_options={"masking": "zonal", "zonal": {"k": 1.0}},
+    )
+
+    assert seq.n_pairs == 2
+    assert seq.solved
+
+
+# ===========================================================================
+# solver= / solver_options= surface — solver_options_restructure.md.
+# Mesh-level coverage lives in tests/python/plots/test_plots.py's
+# TestSolverOptionsSurface; this is the Sequence-specific half that needs a
+# real on-disk image directory (see that file's own closing comment).
+# ===========================================================================
+
+
+def _small_sequence(**kwargs):
+    cx, cy = 500.0, 500.0
+    half = 100.0
+    boundary = np.array(
+        [
+            [cx - half, cy - half],
+            [cx + half, cy - half],
+            [cx + half, cy + half],
+            [cx - half, cy + half],
+        ],
+        dtype=np.float64,
+    )
+    seq = Sequence(
+        image_dir=IMAGE_DIR,
+        boundary=boundary,
+        target_nodes=15,
+        size=(10.0, 100.0),
+        mesh_order=1,
+    )
+    return seq, boundary, (cx, cy)
+
+
+def _solve_kwargs(cx, cy):
+    return dict(
+        local_mask=Mask(mask_type="local", shape="circle", size=10),
+        seed_coord=[cx, cy],
+        max_norm=1e-3,
+        max_iterations=200,
+        subset_order=1,
+        tolerance=0.0,
+        options=SequenceOptions(guide=False, sync=False),
+        border=20,
+    )
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_solver_icgn_no_warning():
+    import warnings
+    seq, _, (cx, cy) = _small_sequence()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning -> test failure
+        seq.solve(solver="icgn", **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_method_kernel_sense_deprecated():
+    seq, _, (cx, cy) = _small_sequence()
+    with pytest.warns(DeprecationWarning, match="method"):
+        seq.solve(method="icgn", **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_preconditioning_rg_still_works():
+    seq, _, (cx, cy) = _small_sequence()
+    seq.solve(solver_options={"preconditioning": "RG"}, **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_masking_zonal_runs_end_to_end():
+    """Stage B (solver_options_restructure.md §4): masking="zonal" is now a
+    real SolveConfig axis Mesh::solve reads directly, so Sequence::solve's
+    existing per-pair Rust loop (mesh.solve(...) called unchanged) picks it
+    up with no orchestration change -- confirmed here, not assumed."""
+    seq, _, (cx, cy) = _small_sequence()
+    seq.solve(solver_options={"masking": "zonal", "zonal": {"k": 1.0}},
+              **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_method_adaptive_deprecated_and_works():
+    seq, _, (cx, cy) = _small_sequence()
+    with pytest.warns(DeprecationWarning, match="adaptive"):
+        seq.solve(method="adaptive", **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_topology_adaptive_not_implemented():
+    seq, _, (cx, cy) = _small_sequence()
+    with pytest.raises(NotImplementedError, match="topology"):
+        seq.solve(solver_options={"topology": "adaptive"}, **_solve_kwargs(cx, cy))
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_preconditioning_layer_rg_works():
+    # layer-RG landed (src/mesh.rs::expand_parallel) and Sequence picks it
+    # up through its unchanged per-pair Mesh::solve loop.
+    seq, _, (cx, cy) = _small_sequence()
+    seq.solve(solver_options={"preconditioning": "layer-RG",
+                              "layer_rg": {"batch_factor": 4}},
+              **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+@pytest.mark.skipif(not IMAGES_AVAILABLE, reason="test images not found")
+def test_sequence_unknown_solver_options_key_raises():
+    seq, _, (cx, cy) = _small_sequence()
+    with pytest.raises(ValueError, match="unknown"):
+        seq.solve(solver_options={"bogus_axis": "x"}, **_solve_kwargs(cx, cy))
+
+
+def test_sequence_unknown_solver_warns_and_falls_back_to_icgn():
+    seq, _, (cx, cy) = _small_sequence()
+    with pytest.warns(UserWarning, match="Unknown solver 'fgan'"):
+        seq.solve(solver="fgan", **_solve_kwargs(cx, cy))
+    assert seq.solved
+
+
+def test_sequence_zonal_zone_map_rejected():
+    # zone_map is Mesh.solve-only: one map has no meaning across increments.
+    seq, _, (cx, cy) = _small_sequence()
+    with pytest.raises(ValueError, match="zone_map"):
+        seq.solve(solver_options={"masking": "zonal",
+                                  "zonal": {"zone_map": np.zeros((4, 4), dtype=np.uint8)}},
+                  **_solve_kwargs(cx, cy))

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use nalgebra::SMatrix;
-use ndarray::{s, Array2, ArrayView2};
+use ndarray::{s, Array2, Array3, ArrayView2};
 use rayon::prelude::*;
 use rustfft::{num_complex::Complex, FftPlanner};
 
@@ -31,9 +31,14 @@ type Mat6 = SMatrix<f64, 6, 6>;
 pub struct Image {
     /// Grayscale pixel intensities (height × width), values 0.0–255.0.
     pub image_gs: Array2<f64>,
-    /// Pre-computed Q·C_block·Qᵀ for every pixel; shape (rows×6, cols×6).
-    /// Access the block for pixel (i, j) as `qcqt.slice(s![i*6..i*6+6, j*6..j*6+6])`.
-    pub qcqt: Array2<f64>,
+    /// Pre-computed Q·C_block·Qᵀ for every pixel, **block-contiguous**:
+    /// shape `(rows, cols, 36)`, the block for pixel `(i, j)` is the
+    /// contiguous slice `qcqt.slice(s![i, j, ..])` laid out row-major
+    /// (`[r*6 + c]`). This is the `layer_rg_plan.md` §11.5 layout — the
+    /// old `(rows*6, cols*6)` array scattered a block's 6 rows `cols*6*8`
+    /// bytes apart, hostile to the `bspline_eval` gather that runs
+    /// `n_px * iters * nodes` times.
+    pub qcqt: Array3<f64>,
     /// Border used for padding during B-spline coefficient computation. Must be ≥ 3.
     pub border: usize,
     /// File path used to load the image; `None` when constructed from an array.
@@ -75,10 +80,16 @@ impl Image {
 
 /// Compute the bi-quintic B-spline coefficient array C via FFT deconvolution.
 ///
-/// Replicates `Image._get_C` from `image.py`:
+/// Follows `Image._get_C` from `image.py`:
 /// - Pad with `border` replicated pixels on all sides.
 /// - Deconvolve row-by-row, then column-by-column, using the quintic kernel
 ///   `k = [1/120, 13/60, 11/20, 13/60, 1/120, 0]`.
+///
+/// DEVIATION FROM `geopyv`: the deconvolution kernel is laid out zero-phase
+/// (see `build_kernel`), not with `geopyv`'s one-sample offset. `geopyv`'s
+/// layout shifts every interpolated intensity by (1, 1) px; this does not.
+/// Consequently `get_c` / `get_qcqt` golden values do not match the Python
+/// package.
 ///
 /// Returns an array of shape `(rows + 2·border, cols + 2·border)`.
 ///
@@ -99,7 +110,8 @@ pub(crate) fn get_c(image_gs: &Array2<f64>, border: usize) -> Array2<f64> {
     let mut planner = FftPlanner::<f64>::new();
 
     // --- Row-by-row deconvolution ---
-    // kernel_x layout (matches Python): positions [0:3] = k[3:], [-3:] = k[0:3].
+    // kernel_x: the symmetric 5-tap quintic sampling kernel laid out
+    // zero-phase (centre tap at index 0) -- see build_kernel.
     let mut kernel_x = build_kernel(&k, pad_cols);
     let fft_cols = planner.plan_fft_forward(pad_cols);
     let ifft_cols = planner.plan_fft_inverse(pad_cols);
@@ -164,39 +176,38 @@ pub(crate) fn get_c(image_gs: &Array2<f64>, border: usize) -> Array2<f64> {
 /// Replicates `Image._get_QCQT` + `_image.cpp:_QCQT`, replacing OpenMP with Rayon.
 /// For pixel (i, j): C_block = C[i+border-2 .. i+border+4, j+border-2 .. j+border+4].
 ///
-/// Returns an array of shape `(rows*6, cols*6)`.
+/// Returns a **block-contiguous** `(rows, cols, 36)` array — the 36 values
+/// of block `(i, j)` are one contiguous run, laid out `[dr*6 + dc]`
+/// (`layer_rg_plan.md` §11.5).
 ///
 /// Tolerance tier A: atol = 1e-12.
-pub(crate) fn get_qcqt(image_gs: &Array2<f64>, c: &Array2<f64>, border: usize) -> Array2<f64> {
+pub(crate) fn get_qcqt(image_gs: &Array2<f64>, c: &Array2<f64>, border: usize) -> Array3<f64> {
     let (rows, cols) = image_gs.dim();
     let q = q_matrix();
     let qt = q.transpose();
 
-    // Pre-allocate the full output buffer and write each row-band directly in
-    // parallel. Eliminates the intermediate Vec<Vec<f64>> and the serial copy.
-    // q and qt are SMatrix (Copy), captured by value into each thread's stack frame.
-    // c is &Array2 (Sync), shared immutably across threads.
-    let out_cols = cols * 6;
-    let mut flat = vec![0.0f64; rows * 6 * out_cols];
-
-    flat.par_chunks_exact_mut(6 * out_cols)
+    // One row-band (all 36-blocks for one image row) per rayon task,
+    // written contiguously.
+    let mut flat = vec![0.0f64; rows * cols * 36];
+    flat.par_chunks_exact_mut(cols * 36)
         .enumerate()
-        .for_each(|(i, chunk)| {
+        .for_each(|(i, band)| {
             for j in 0..cols {
                 let ir = i + border - 2;
                 let ic = j + border - 2;
                 let c_view = c.slice(s![ir..ir + 6, ic..ic + 6]);
-                let c_mat  = view_to_mat6(c_view);
+                let c_mat = view_to_mat6(c_view);
                 let result = q * c_mat * qt;
+                let block = &mut band[j * 36..j * 36 + 36];
                 for dr in 0..6_usize {
                     for dc in 0..6_usize {
-                        chunk[dr * out_cols + j * 6 + dc] = result[(dr, dc)];
+                        block[dr * 6 + dc] = result[(dr, dc)];
                     }
                 }
             }
         });
 
-    Array2::from_shape_vec((rows * 6, out_cols), flat).expect("shape mismatch in get_qcqt")
+    Array3::from_shape_vec((rows, cols, 36), flat).expect("shape mismatch in get_qcqt")
 }
 
 // ---------------------------------------------------------------------------
@@ -232,21 +243,34 @@ fn view_to_mat6(v: ArrayView2<f64>) -> Mat6 {
     Mat6::from_row_slice(&data)
 }
 
-/// Build the cyclic-shifted B-spline kernel vector of length `n`.
+/// Build the zero-phase B-spline prefilter kernel vector of length `n`.
 ///
-/// Matches the Python setup:
-/// ```python
-/// kernel[0:3] = k[3:]   # [k[3], k[4], k[5]]
-/// kernel[-3:] = k[0:3]  # [k[0], k[1], k[2]]
+/// `k = [β(-2), β(-1), β(0), β(1), β(2), 0]` is the symmetric 5-tap quintic
+/// sampling kernel (the trailing `0` is not a real tap). For an FFT
+/// deconvolution to invert the sampling convolution *without* introducing a
+/// spatial shift, the kernel must be centred on index 0:
+/// ```text
+/// kernel[0]   = β(0)  = k[2]
+/// kernel[1]   = β(1)  = k[3]
+/// kernel[2]   = β(2)  = k[4]
+/// kernel[n-2] = β(-2) = k[0]
+/// kernel[n-1] = β(-1) = k[1]
 /// ```
+///
+/// NOTE: this deliberately differs from `geopyv`'s `image.py::_get_C`
+/// (`kernel[0:3] = k[3:]`, `kernel[-3:] = k[0:3]`), which places the centre
+/// tap `β(0)` at index `n-1` -- a one-sample phase error that shifts every
+/// interpolated intensity by exactly (1, 1) px. That bias is invisible for
+/// rigid motion (both frames shift equally) but corrupts any strain-gradient
+/// region by `∇u · (1, 1)` px. geopyv_dev corrects it here; interpolation
+/// golden values consequently do not match the Python package.
 fn build_kernel(k: &[f64; 6], n: usize) -> Vec<Complex<f64>> {
     let mut kernel = vec![Complex::new(0.0, 0.0); n];
-    kernel[0] = Complex::new(k[3], 0.0);
-    kernel[1] = Complex::new(k[4], 0.0);
-    kernel[2] = Complex::new(k[5], 0.0);
-    kernel[n - 3] = Complex::new(k[0], 0.0);
-    kernel[n - 2] = Complex::new(k[1], 0.0);
-    kernel[n - 1] = Complex::new(k[2], 0.0);
+    kernel[0] = Complex::new(k[2], 0.0);
+    kernel[1] = Complex::new(k[3], 0.0);
+    kernel[2] = Complex::new(k[4], 0.0);
+    kernel[n - 2] = Complex::new(k[0], 0.0);
+    kernel[n - 1] = Complex::new(k[1], 0.0);
     kernel
 }
 
@@ -375,15 +399,11 @@ mod tests {
         let img = Array2::from_elem((20, 25), val);
         let c = get_c(&img, border);
         let qcqt = get_qcqt(&img, &c, border);
-        // Interior pixel (5, 5).
-        let block = qcqt.slice(s![5 * 6..5 * 6 + 6, 5 * 6..5 * 6 + 6]);
-        assert!((block[[0, 0]] - val).abs() < 1e-10, "block[0,0] = {}", block[[0, 0]]);
-        for r in 0..6 {
-            for cc in 0..6 {
-                if r != 0 || cc != 0 {
-                    assert!(block[[r, cc]].abs() < 1e-10, "block[{r},{cc}] = {}", block[[r, cc]]);
-                }
-            }
+        assert_eq!(qcqt.dim(), (20, 25, 36));
+        // Interior pixel (5, 5): 36-element block, [dr*6 + dc].
+        assert!((qcqt[[5, 5, 0]] - val).abs() < 1e-10, "block[0] = {}", qcqt[[5, 5, 0]]);
+        for k in 1..36 {
+            assert!(qcqt[[5, 5, k]].abs() < 1e-10, "block[{k}] = {}", qcqt[[5, 5, k]]);
         }
     }
 

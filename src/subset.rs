@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -161,6 +161,12 @@ pub struct SolveResult {
     /// Which solver produced this result.
     #[serde(default = "default_solve_method")]
     pub method: SolveMethod,
+    /// Gradient-weighted omitted-mode warp-adequacy score `(eta_u, eta_v)`
+    /// -- see [`omitted_mode_diagnostic`]. `Some` for `subset_order` 1 or 2;
+    /// `None` for any other order, and for results loaded from a
+    /// pre-existing `.pyv` saved before this field existed.
+    #[serde(default)]
+    pub eta_omitted: Option<(f64, f64)>,
 }
 
 fn default_solve_method() -> SolveMethod {
@@ -173,11 +179,13 @@ fn default_solve_method() -> SolveMethod {
 
 /// Extract the 6×6 QCQT block for pixel (row = `yf`, col = `xf`).
 ///
-/// QCQT is stored as `qcqt[yf*6 : yf*6+6, xf*6 : xf*6+6]` — matching the
-/// storage layout produced by [`crate::image::Image`].
+/// QCQT is stored block-contiguous `(rows, cols, 36)` — the block is one
+/// contiguous 36-run, `[r*6 + c]` (see [`crate::image::Image::qcqt`]).
 #[inline]
-fn qcqt_block(qcqt: &ArrayView2<f64>, yf: usize, xf: usize) -> QcqtBlock {
-    QcqtBlock::from_fn(|r, c| qcqt[[yf * 6 + r, xf * 6 + c]])
+fn qcqt_block(qcqt: &ArrayView3<f64>, yf: usize, xf: usize) -> QcqtBlock {
+    let b = qcqt.index_axis(Axis(0), yf);
+    let b = b.index_axis(Axis(0), xf); // contiguous 36-run for pixel (yf, xf)
+    QcqtBlock::from_fn(|r, c| b[r * 6 + c])
 }
 
 /// Evaluate the bi-quintic B-spline at sub-pixel coordinate `(x, y)`.
@@ -189,13 +197,22 @@ fn qcqt_block(qcqt: &ArrayView2<f64>, yf: usize, xf: usize) -> QcqtBlock {
 /// where `dx_vec = [1, dx, dx², dx³, dx⁴, dx⁵]` and similarly for `dy_vec`.
 ///
 /// Matches `_intensity` in `_subset.cpp` exactly, including the clamp to avoid
-/// out-of-bounds access.
+/// out-of-bounds access. `(x, y)` are clamped into the valid domain *before*
+/// `xf`/`dx` are derived (not just `xf` on its own) — clamping only `xf`
+/// while leaving `dx = x - xf` unbounded lets a far-out-of-range query
+/// produce a `dx` of thousands or millions, and `dx⁵` in the quintic basis
+/// then explodes instead of saturating. Clamping `x`/`y` first keeps
+/// `dx`/`dy` in `[0, 1)` always, so in-bounds queries are completely
+/// unaffected and out-of-bounds ones saturate to the boundary pixel's edge
+/// value instead of blowing up.
 #[inline]
-fn bspline_eval(x: f64, y: f64, qcqt: &ArrayView2<f64>) -> f64 {
-    let qcols = qcqt.ncols() / 6;
-    let qrows = qcqt.nrows() / 6;
-    let xf = (x.floor() as i64).clamp(0, qcols as i64 - 1) as usize;
-    let yf = (y.floor() as i64).clamp(0, qrows as i64 - 1) as usize;
+fn bspline_eval(x: f64, y: f64, qcqt: &ArrayView3<f64>) -> f64 {
+    let qrows = qcqt.shape()[0];
+    let qcols = qcqt.shape()[1];
+    let x = x.clamp(0.0, qcols as f64 - 1e-9);
+    let y = y.clamp(0.0, qrows as f64 - 1e-9);
+    let xf = x.floor() as usize;
+    let yf = y.floor() as usize;
     let dx = x - xf as f64;
     let dy = y - yf as f64;
 
@@ -213,13 +230,16 @@ fn bspline_eval(x: f64, y: f64, qcqt: &ArrayView2<f64>) -> f64 {
 /// - `grad_y`: derivative in the `y` (row) direction.
 ///   `dx_vec = [1, dx, dx², ...]`, `dy_vec = [0, 1, 0, 0, 0, 0]`.
 ///
-/// Matches `_grad` in `_subset.cpp` exactly.
+/// Matches `_grad` in `_subset.cpp` exactly. Clamps `(x, y)` before deriving
+/// `xf`/`dx` for the same reason as `bspline_eval` — see its doc comment.
 #[inline]
-fn bspline_grad(x: f64, y: f64, qcqt: &ArrayView2<f64>) -> [f64; 2] {
-    let qcols = qcqt.ncols() / 6;
-    let qrows = qcqt.nrows() / 6;
-    let xf = (x.floor() as i64).clamp(0, qcols as i64 - 1) as usize;
-    let yf = (y.floor() as i64).clamp(0, qrows as i64 - 1) as usize;
+fn bspline_grad(x: f64, y: f64, qcqt: &ArrayView3<f64>) -> [f64; 2] {
+    let qrows = qcqt.shape()[0];
+    let qcols = qcqt.shape()[1];
+    let x = x.clamp(0.0, qcols as f64 - 1e-9);
+    let y = y.clamp(0.0, qrows as f64 - 1e-9);
+    let xf = x.floor() as usize;
+    let yf = y.floor() as usize;
     let dx = x - xf as f64;
     let dy = y - yf as f64;
     let block = qcqt_block(qcqt, yf, xf);
@@ -235,6 +255,38 @@ fn bspline_grad(x: f64, y: f64, qcqt: &ArrayView2<f64>) -> [f64; 2] {
     let grad_y = dy_deriv.dot(&(block * dx_std));
 
     [grad_x, grad_y]
+}
+
+/// Fused [`bspline_eval`] + [`bspline_grad`] — one clamp, one block gather,
+/// one pair of basis vectors (`geopyv_dev_fresh/layer_rg_plan.md` §11.3).
+///
+/// Bit-identical to calling both separately: `value` uses the exact
+/// expression `bspline_eval` does; `grad_x` / `grad_y` use the exact
+/// expressions `bspline_grad` does (`block · dx_v` and `block · deriv` are
+/// each formed once and reused across the three dot products).
+#[inline]
+fn bspline_eval_grad(x: f64, y: f64, qcqt: &ArrayView3<f64>) -> (f64, [f64; 2]) {
+    let qrows = qcqt.shape()[0];
+    let qcols = qcqt.shape()[1];
+    let x = x.clamp(0.0, qcols as f64 - 1e-9);
+    let y = y.clamp(0.0, qrows as f64 - 1e-9);
+    let xf = x.floor() as usize;
+    let yf = y.floor() as usize;
+    let dx = x - xf as f64;
+    let dy = y - yf as f64;
+    let block = qcqt_block(qcqt, yf, xf);
+
+    let dx_v = poly_vec(dx);
+    let dy_v = poly_vec(dy);
+    let deriv = SplineVec::new(0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+
+    let bx = block * dx_v; // block · [1, dx, …, dx⁵]
+    let bd = block * deriv; // block · [0, 1, 0, 0, 0, 0]
+
+    let value = dy_v.dot(&bx);
+    let grad_x = dy_v.dot(&bd);
+    let grad_y = deriv.dot(&bx);
+    (value, [grad_x, grad_y])
 }
 
 /// Build the B-spline polynomial basis vector `[1, t, t², t³, t⁴, t⁵]`.
@@ -258,8 +310,17 @@ fn poly_vec(t: f64) -> SplineVec {
 ///
 /// Matches `_g_coords` in `_subset.cpp`.
 fn apply_warp(coord: [f64; 2], p: &[f64], f_coords: &Array2<f64>) -> Array2<f64> {
+    let mut gc = Array2::zeros((f_coords.nrows(), 2));
+    apply_warp_into(&mut gc, coord, p, f_coords);
+    gc
+}
+
+/// [`apply_warp`] writing into a caller-owned `(n, 2)` buffer — lets the
+/// ICGN loop reuse one allocation across iterations
+/// (`geopyv_dev_fresh/layer_rg_plan.md` §11.4). Every element of `gc` is
+/// overwritten, so its prior contents are irrelevant.
+fn apply_warp_into(gc: &mut Array2<f64>, coord: [f64; 2], p: &[f64], f_coords: &Array2<f64>) {
     let n = f_coords.nrows();
-    let mut gc = Array2::zeros((n, 2));
     let xc = coord[0];
     let yc = coord[1];
 
@@ -289,7 +350,6 @@ fn apply_warp(coord: [f64; 2], p: &[f64], f_coords: &Array2<f64>) -> Array2<f64>
                 + 0.5 * vxx * dx * dx + vxy * dx * dy + 0.5 * vyy * dy * dy;
         }
     }
-    gc
 }
 
 // ---------------------------------------------------------------------------
@@ -352,13 +412,18 @@ fn compute_hessian(sdi: &Array2<f64>) -> DMatrix<f64> {
     h
 }
 
+
 // ---------------------------------------------------------------------------
 // Parameter update vectors
 // ---------------------------------------------------------------------------
 
 /// ICGN parameter increment: `Δp = −H⁻¹ · ∇(ZNSSD)`.
 ///
-/// Matches `_Delta_p_ICGN` in `_subset.cpp`.
+/// Matches `_Delta_p_ICGN` in `_subset.cpp`. Kept as the reference
+/// implementation the fused [`delta_p_and_znssd_icgn`] is checked against
+/// (see `delta_p_and_znssd_icgn_matches_split`); the ICGN loop itself uses
+/// the fused version.
+#[cfg(test)]
 fn delta_p_icgn(
     hessian: &DMatrix<f64>,
     f: &Array1<f64>,
@@ -381,6 +446,54 @@ fn delta_p_icgn(
     let inv_h = hessian.clone().try_inverse().expect("ICGN Hessian singular");
     -(inv_h * grad_z)
 }
+
+/// Fused ICGN update + ZNSSD for one iteration — see
+/// `geopyv_dev_fresh/layer_rg_plan.md` §11.1/§11.2.
+///
+/// Bit-identical to `-(inv_h * grad_z)` from [`delta_p_icgn`] paired with a
+/// separate [`znssd`] call, but:
+///
+/// - takes a pre-inverted `inv_h` (ICGN's Hessian is loop-invariant, so the
+///   caller inverts once instead of once per iteration — §11.1);
+/// - runs a single `i`-outer sweep, reusing `f_i − f_m` / `g_i − g_m` for
+///   both the `grad_z` bracket and the ZNSSD term instead of two sweeps
+///   (§11.2). `i` is the outer loop so each `grad_z[j]` still accumulates
+///   in `i`-ascending order (identical to `delta_p_icgn`'s `for j { for i }`)
+///   and `znssd_acc` accumulates in the same order as `znssd`'s `.sum()`.
+///   The two per-pixel residual forms are kept *separate* (division for the
+///   ZNSSD term, `delta_f/delta_g` factor for the bracket) so neither sum's
+///   rounding changes; `delta_f / delta_g` is hoisted (was recomputed
+///   `n·m` times).
+fn delta_p_and_znssd_icgn(
+    inv_h: &DMatrix<f64>,
+    f: &Array1<f64>,
+    g: &Array1<f64>,
+    f_m: f64,
+    g_m: f64,
+    delta_f: f64,
+    delta_g: f64,
+    sdi: &Array2<f64>,
+) -> (DVector<f64>, f64) {
+    let m = sdi.ncols();
+    let n = f.len();
+    let ratio = delta_f / delta_g;
+    let mut grad_z = DVector::zeros(m);
+    let mut znssd_acc = 0.0_f64;
+    for i in 0..n {
+        let a = f[i] - f_m;
+        let b = g[i] - g_m;
+        // ZNSSD per-pixel term — identical grouping to `znssd()`.
+        let z = a / delta_f - b / delta_g;
+        znssd_acc += z * z;
+        // grad_z bracket — identical grouping to `delta_p_icgn()`.
+        let bracket = a - ratio * b;
+        for j in 0..m {
+            grad_z[j] += sdi[[i, j]] * bracket;
+        }
+    }
+    (-(inv_h * grad_z), znssd_acc)
+}
+
 
 /// FAGN parameter increment: `Δp = H⁻¹ · ∇(ZNSSD)`.
 ///
@@ -590,6 +703,142 @@ pub fn znssd(
 }
 
 // ---------------------------------------------------------------------------
+// Warp-adequacy diagnostic (order-1 and order-2)
+// ---------------------------------------------------------------------------
+//
+// Gradient-weighted omitted-mode score: Sam Stanier, "Detecting
+// Warp-Function Under-Fitting in Local Digital Image Correlation" (2026-09-22,
+// `Warp_Function_Underfitting_Report.pdf`). For a converged subset, a high
+// ZNCC does not by itself prove the warp is a kinematically adequate model
+// of the true displacement field -- a localised or higher-order field can be
+// averaged into a smooth, well-correlating fit while leaving a large
+// displacement/shear error behind. This projects the converged residual onto
+// the modes the fitted warp order cannot represent (quadratic for order-1,
+// cubic for order-2 -- the report's own vertical-only benchmark only covers
+// the order-1 case; the order-2/cubic extension follows the same
+// first-order-Taylor argument one degree further out, per the report's own
+// §8: "other deformation mechanisms would require corresponding omitted
+// modes", but is not itself validated by the report), weighted by local
+// image gradient, to score how much of that residual "wants" to be
+// explained by a mode the model wasn't allowed to use.
+// Manufactured-benchmark AUC ~0.77 for adequate/under-fit classification in
+// the report (order-1 only) -- a real but moderate signal, not a calibrated
+// test.
+
+/// Zero-normalise a slice: subtract the mean, divide by the population
+/// standard deviation. Falls back to an all-zero result (instead of
+/// dividing by ~0) when the input has negligible variance (`1e-18`
+/// variance floor).
+fn zn_slice(x: &[f64]) -> Vec<f64> {
+    let n = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let var = x.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n;
+    let std = var.max(1e-18).sqrt();
+    x.iter().map(|&v| (v - mean) / std).collect()
+}
+
+/// One component (`u` or `v`) of [`omitted_mode_diagnostic`]: gradient-weight
+/// the `K` omitted modes (3 quadratic modes `[ξ², ξζ, ζ²]` for order-1, 4
+/// cubic modes `[ξ³, ξ²ζ, ξζ², ζ³]` for order-2), standardise each of the
+/// `K` resulting columns over the subset (report eq. 8), project the
+/// mean-centred residual onto them and divide by `N`, then take the L2 norm
+/// (report eq. 9, `η = ‖ Sᵀ(e − ē) / N ‖₂`). Generic over `K` so order-1 and
+/// order-2 share this one implementation rather than two near-duplicates.
+fn eta_component<const K: usize>(modes: &[[f64; K]], grad_zn: &[f64], e_centered: &[f64]) -> f64 {
+    let n = modes.len();
+    let raw_cols: [Vec<f64>; K] =
+        std::array::from_fn(|k| (0..n).map(|i| grad_zn[i] * modes[i][k]).collect());
+    let s_cols: [Vec<f64>; K] = std::array::from_fn(|k| zn_slice(&raw_cols[k]));
+    let proj: [f64; K] = std::array::from_fn(|k| {
+        s_cols[k]
+            .iter()
+            .zip(e_centered.iter())
+            .map(|(&s, &e)| s * e)
+            .sum::<f64>()
+            / n as f64
+    });
+    proj.iter().map(|&p| p * p).sum::<f64>().sqrt()
+}
+
+/// Gradient-weighted omitted-mode warp-adequacy score, generalised from the
+/// report's vertical-only, order-1-only manufactured case to both
+/// displacement components and both warp orders geopyv-dev supports:
+/// `eta_u` uses the reference horizontal gradient `I_x` (omitted `u`
+/// modes), `eta_v` uses the reference vertical gradient `I_y` (omitted `v`
+/// modes). The omitted-mode basis is the *next* polynomial degree up from
+/// `subset_order` -- quadratic for order-1, cubic for order-2 (see the
+/// section doc comment above for the order-2 caveat). Returns `None` for
+/// any other order (there is no order-3 solver to be "one below").
+///
+/// Uses the reference-frame gradient `grad_f` (not a per-iteration target
+/// gradient) because inverse-compositional ICGN holds the reference frame,
+/// and thus its own linearisation, fixed -- and because `grad_f` is the one
+/// gradient always available on `Subset` regardless of which solver
+/// (ICGN or FAGN) produced the converged `p`.
+///
+/// Returns `Some((eta_u, eta_v))`, or `None` if `subset_order` isn't 1 or 2.
+fn omitted_mode_diagnostic(
+    coord: [f64; 2],
+    subset_order: usize,
+    f_coords: &Array2<f64>,
+    grad_f: &Array2<f64>,
+    f: &Array1<f64>,
+    f_m: f64,
+    delta_f: f64,
+    g: &Array1<f64>,
+    g_m: f64,
+    delta_g: f64,
+) -> Option<(f64, f64)> {
+    let n = f_coords.nrows();
+
+    // Per-pixel zero-normalised image residual, mean-centred.
+    let e: Vec<f64> = (0..n)
+        .map(|i| (f[i] - f_m) / delta_f - (g[i] - g_m) / delta_g)
+        .collect();
+    let e_bar = e.iter().sum::<f64>() / n as f64;
+    let e_centered: Vec<f64> = e.iter().map(|&ei| ei - e_bar).collect();
+
+    let zn_ix = zn_slice(&(0..n).map(|i| grad_f[[i, 0]]).collect::<Vec<f64>>());
+    let zn_iy = zn_slice(&(0..n).map(|i| grad_f[[i, 1]]).collect::<Vec<f64>>());
+
+    let local_coords = |i: usize| {
+        let xi = f_coords[[i, 0]] - coord[0];
+        let zeta = f_coords[[i, 1]] - coord[1];
+        (xi, zeta)
+    };
+
+    match subset_order {
+        1 => {
+            // Omitted (order-2) modes: [ξ², ξζ, ζ²].
+            let modes: Vec<[f64; 3]> = (0..n)
+                .map(|i| {
+                    let (xi, zeta) = local_coords(i);
+                    [xi * xi, xi * zeta, zeta * zeta]
+                })
+                .collect();
+            Some((
+                eta_component(&modes, &zn_ix, &e_centered),
+                eta_component(&modes, &zn_iy, &e_centered),
+            ))
+        }
+        2 => {
+            // Omitted (order-3) modes: [ξ³, ξ²ζ, ξζ², ζ³].
+            let modes: Vec<[f64; 4]> = (0..n)
+                .map(|i| {
+                    let (xi, zeta) = local_coords(i);
+                    [xi * xi * xi, xi * xi * zeta, xi * zeta * zeta, zeta * zeta * zeta]
+                })
+                .collect();
+            Some((
+                eta_component(&modes, &zn_ix, &e_centered),
+                eta_component(&modes, &zn_iy, &e_centered),
+            ))
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Subset
 // ---------------------------------------------------------------------------
 
@@ -640,10 +889,18 @@ impl Subset {
             f_coords[[i, 1]] = coords[[i, 1]] + coord[1];
         }
 
-        // Reference intensities (Tier B)
-        let f: Array1<f64> = (0..n)
-            .map(|i| bspline_eval(f_coords[[i, 0]], f_coords[[i, 1]], &qv))
-            .collect();
+        // Reference intensities + gradients (Tier B) -- one fused B-spline
+        // pass (layer_rg_plan.md §11.3). grad_f is now computed before the
+        // delta_f == 0 check rather than after; that path is a rare fatal
+        // error return, so the extra work there is immaterial.
+        let mut f = Array1::<f64>::zeros(n);
+        let mut grad_f = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let (fi, [gx, gy]) = bspline_eval_grad(f_coords[[i, 0]], f_coords[[i, 1]], &qv);
+            f[i] = fi;
+            grad_f[[i, 0]] = gx;
+            grad_f[[i, 1]] = gy;
+        }
         let f_m = f.sum() / n as f64;
         let delta_f = f.iter().map(|&fi| (fi - f_m).powi(2)).sum::<f64>().sqrt();
 
@@ -651,14 +908,6 @@ impl Subset {
             return Err(Error::InvalidInput(
                 "reference subset is featureless (delta_f = 0)".to_string(),
             ));
-        }
-
-        // Reference gradients (Tier B)
-        let mut grad_f = Array2::zeros((n, 2));
-        for i in 0..n {
-            let [gx, gy] = bspline_grad(f_coords[[i, 0]], f_coords[[i, 1]], &qv);
-            grad_f[[i, 0]] = gx;
-            grad_f[[i, 1]] = gy;
         }
 
         // Quality metrics
@@ -837,29 +1086,35 @@ impl Subset {
         p.resize(expected, 0.0);
         let gv = g_img.qcqt.view();
 
-        // Precompute SDI and Hessian (constant in ICGN)
+        // Precompute SDI and Hessian (constant in ICGN); invert once --
+        // ICGN's Hessian is loop-invariant (layer_rg_plan.md §11.1).
         let sdi_ref = steepest_descent(self.coord, f_coords, grad_f, self.subset_order);
         let hessian = compute_hessian(&sdi_ref);
+        let inv_h = hessian.try_inverse().expect("ICGN Hessian singular");
 
         let mut history = Vec::with_capacity(max_iterations);
         let mut converged = false;
 
+        // Buffers reused across iterations (layer_rg_plan.md §11.4).
+        let mut gc = Array2::<f64>::zeros((n, 2));
+        let mut g = Array1::<f64>::zeros(n);
+
         for iteration in 1..=max_iterations {
-            let gc = apply_warp(self.coord, &p, f_coords);
-            let g: Array1<f64> = (0..n)
-                .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
-                .collect();
+            apply_warp_into(&mut gc, self.coord, &p, f_coords);
+            for i in 0..n {
+                g[i] = bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv);
+            }
             let g_m = g.sum() / n as f64;
             let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
 
-            let dp_vec = delta_p_icgn(
-                &hessian, f, &g, f_m, g_m, self.delta_f, delta_g, &sdi_ref,
+            // Fused update + ZNSSD, one i-outer sweep (layer_rg_plan.md §11.2).
+            let (dp_vec, c_znssd) = delta_p_and_znssd_icgn(
+                &inv_h, f, &g, f_m, g_m, self.delta_f, delta_g, &sdi_ref,
             );
             let dp: Vec<f64> = dp_vec.iter().copied().collect();
             p = compose_icgn(&p, &dp);
 
             let norm = convergence_norm(&dp, size);
-            let c_znssd = znssd(f, &g, f_m, g_m, self.delta_f, delta_g);
             let c_zncc = 1.0 - c_znssd / 2.0;
             history.push((iteration, norm, c_zncc, c_znssd));
 
@@ -875,10 +1130,23 @@ impl Subset {
             .unwrap_or((0.0, 4.0));
 
         let quality_ok = converged && c_zncc >= tolerance;
+
+        // Warp-adequacy diagnostic -- `g` still holds the
+        // final iteration's buffer after the loop exits (reused, not
+        // reallocated per-iteration); g_m/delta_g are cheap to recompute
+        // from it rather than threading them out of the hot loop above.
+        let g_m_final = g.sum() / n as f64;
+        let delta_g_final = g.iter().map(|&gi| (gi - g_m_final).powi(2)).sum::<f64>().sqrt();
+        let eta_omitted = omitted_mode_diagnostic(
+            self.coord, self.subset_order, f_coords, grad_f, f, f_m, self.delta_f,
+            &g, g_m_final, delta_g_final,
+        );
+
         Ok(SolveResult {
             p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history,
             max_norm, tolerance,
             subset_order: self.subset_order, max_iterations, method: SolveMethod::Icgn,
+            eta_omitted,
         })
     }
 
@@ -900,6 +1168,7 @@ impl Subset {
         let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
         let f       = self.f.as_ref().ok_or_else(unavail)?;
         let f_m     = self.f_m.ok_or_else(unavail)?;
+        let grad_f  = self.grad_f.as_ref().ok_or_else(unavail)?;
         let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
 
         let n = f_coords.nrows();
@@ -911,12 +1180,16 @@ impl Subset {
 
         let mut history = Vec::with_capacity(max_iterations);
         let mut converged = false;
+        // Lifted out of the loop (rather than shadowed each iteration) so
+        // the final iteration's target intensities survive past `for` --
+        // the warp-adequacy diagnostic below needs them.
+        let mut g = Array1::<f64>::zeros(n);
 
         for iteration in 1..=max_iterations {
             let g_center = [self.coord[0] + p[0], self.coord[1] + p[1]];
 
             let gc = apply_warp(self.coord, &p, f_coords);
-            let g: Array1<f64> = (0..n)
+            g = (0..n)
                 .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
                 .collect();
             let g_m = g.sum() / n as f64;
@@ -959,12 +1232,62 @@ impl Subset {
             .unwrap_or((0.0, 4.0));
 
         let quality_ok = converged && c_zncc >= tolerance;
+
+        // Warp-adequacy diagnostic -- see solve_icgn_result.
+        let g_m_final = g.sum() / n as f64;
+        let delta_g_final = g.iter().map(|&gi| (gi - g_m_final).powi(2)).sum::<f64>().sqrt();
+        let eta_omitted = omitted_mode_diagnostic(
+            self.coord, self.subset_order, f_coords, grad_f, f, f_m, self.delta_f,
+            &g, g_m_final, delta_g_final,
+        );
+
         Ok(SolveResult {
             p, c_zncc, c_znssd, iterations: history.len(), converged, quality_ok, history,
             max_norm, tolerance,
             subset_order: self.subset_order, max_iterations, method: SolveMethod::Fagn,
+            eta_omitted,
         })
     }
+
+    /// Recompute the converged per-pixel zero-normalised image residual
+    /// `e_i = zn(f_i) - zn(g_i)` for this subset's stored solution.
+    ///
+    /// Deliberately **not** persisted anywhere (`SolveResult` stores only the
+    /// scalar [`SolveResult::eta_omitted`]) -- a full per-pixel map is
+    /// recomputed on demand from data the subset already needs to hold for
+    /// solving in the first place (`f`, `f_m`, `delta_f`, `f_coords`,
+    /// `g_img`, and the converged `p`), so it costs nothing to store and one
+    /// cheap B-spline pass to regenerate. Backs `Subset.inspect(residual=True)`.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidInput`] if any image-dependent field is `None`
+    /// (e.g. a `Subset` reloaded from a `.pyv` whose original images are no
+    /// longer found on disk) or if the subset has not been solved.
+    pub fn residual_map(&self) -> Result<Array1<f64>, Error> {
+        let unavail = || Error::InvalidInput("residual_map: images unavailable".to_string());
+        let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
+        let f       = self.f.as_ref().ok_or_else(unavail)?;
+        let f_m     = self.f_m.ok_or_else(unavail)?;
+        let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
+        let sol = self.solution.as_ref().ok_or_else(|| {
+            Error::InvalidInput("residual_map: subset has not been solved".to_string())
+        })?;
+        let p = &sol.result.p;
+
+        let n = f_coords.nrows();
+        let gv = g_img.qcqt.view();
+        let gc = apply_warp(self.coord, p, f_coords);
+        let g: Array1<f64> = (0..n)
+            .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
+            .collect();
+        let g_m = g.sum() / n as f64;
+        let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
+
+        Ok((0..n)
+            .map(|i| (f[i] - f_m) / self.delta_f - (g[i] - g_m) / delta_g)
+            .collect())
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1326,141 @@ mod tests {
         assert!((convergence_norm(&dp, size) - expected).abs() < 1e-12);
     }
 
+    // ---- Warp-adequacy diagnostic (Tier A: pure computation, atol = 1e-12) ----
+
+    #[test]
+    fn test_zn_slice_standardises() {
+        let x = [1.0, 2.0, 3.0];
+        let zn = zn_slice(&x);
+        let std = (2.0_f64 / 3.0).sqrt();
+        assert!((zn[0] - (-1.0 / std)).abs() < 1e-12, "zn[0] = {}", zn[0]);
+        assert!(zn[1].abs() < 1e-12, "zn[1] = {}", zn[1]);
+        assert!((zn[2] - (1.0 / std)).abs() < 1e-12, "zn[2] = {}", zn[2]);
+        // Standardised: mean 0, population std 1.
+        let mean: f64 = zn.iter().sum::<f64>() / 3.0;
+        let var: f64 = zn.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / 3.0;
+        assert!(mean.abs() < 1e-12, "mean = {mean}");
+        assert!((var - 1.0).abs() < 1e-10, "var = {var}");
+    }
+
+    /// Zero-variance input (e.g. a purely horizontal texture gradient's `I_y`
+    /// column) must not produce NaN/inf -- the `1e-18` variance floor should
+    /// collapse it to all-zero instead.
+    #[test]
+    fn test_zn_slice_zero_variance_floor() {
+        let x = [5.0, 5.0, 5.0, 5.0];
+        let zn = zn_slice(&x);
+        for &v in &zn {
+            assert!(v.abs() < 1e-6, "expected ~0, got {v}");
+            assert!(v.is_finite());
+        }
+    }
+
+    /// `eta_component` against a hand-computed projection. Four pixels at
+    /// local coordinates forming a symmetric cross `(±1, 0), (0, ±1)`, so the
+    /// omitted-mode columns `[ξ², ξζ, ζ²]` reduce to a clean closed form:
+    /// `ξ²` column = `[1,1,0,0]`, `ζ²` column = `[0,0,1,1]`, `ξζ` column all
+    /// zero. With `grad_zn = [1,-1,1,-1]` the gradient-weighted `ξ²` column
+    /// is `[1,-1,0,0]` (population std `sqrt(0.5)`, so standardised it's
+    /// `[√2,-√2,0,0]`); projecting onto `e_centered = [1,0,0,0]` and dividing
+    /// by `N=4` gives `proj[0] = √2/4`, `proj[1] = proj[2] = 0`, so
+    /// `eta = √2/4` exactly.
+    #[test]
+    fn test_eta_component_hand_computed() {
+        let modes = [
+            [1.0, 0.0, 0.0], // (ξ,ζ) = (1, 0)
+            [1.0, 0.0, 0.0], // (ξ,ζ) = (-1, 0)  -- ξ² still 1
+            [0.0, 0.0, 1.0], // (ξ,ζ) = (0, 1)
+            [0.0, 0.0, 1.0], // (ξ,ζ) = (0, -1)  -- ζ² still 1
+        ];
+        let grad_zn = [1.0, -1.0, 1.0, -1.0];
+        let e_centered = [1.0, 0.0, 0.0, 0.0];
+        let eta = eta_component(&modes, &grad_zn, &e_centered);
+        let expected = std::f64::consts::SQRT_2 / 4.0;
+        assert!((eta - expected).abs() < 1e-12, "eta = {eta}, expected {expected}");
+    }
+
+    /// `eta_component` is non-negative (it's an L2 norm) regardless of sign
+    /// patterns in the inputs.
+    #[test]
+    fn test_eta_component_non_negative() {
+        let modes = [[1.0, 0.5, 0.2], [-0.3, 0.1, -0.7], [0.4, -0.4, 0.9]];
+        let grad_zn = [0.5, -1.2, 0.8];
+        let e_centered = [-0.6, 1.1, 0.2];
+        assert!(eta_component(&modes, &grad_zn, &e_centered) >= 0.0);
+    }
+
+    /// `eta_component` at `K=4` (the order-2/cubic-omitted-mode case) against
+    /// a hand-computed projection -- same symmetric-cross pixel layout as
+    /// [`test_eta_component_hand_computed`], but with cubic modes `[ξ³, ξ²ζ,
+    /// ξζ², ζ³]`: only the `ξ³` and `ζ³` columns are non-degenerate on this
+    /// layout (`[1,1,0,0]` and `[0,0,1,1]` after gradient weighting), giving
+    /// standardised columns `±[1,1,-1,-1]`. Projecting onto
+    /// `e_centered = [1,0,0,0]` and dividing by `N=4` gives
+    /// `proj = [0.25, 0, 0, -0.25]`, so `eta = sqrt(0.25² + 0.25²) = √2/4`.
+    #[test]
+    fn test_eta_component_hand_computed_order2_cubic() {
+        let modes = [
+            [1.0, 0.0, 0.0, 0.0],  // (ξ,ζ) = (1, 0)
+            [-1.0, 0.0, 0.0, 0.0], // (ξ,ζ) = (-1, 0)
+            [0.0, 0.0, 0.0, 1.0],  // (ξ,ζ) = (0, 1)
+            [0.0, 0.0, 0.0, -1.0], // (ξ,ζ) = (0, -1)
+        ];
+        let grad_zn = [1.0, -1.0, 1.0, -1.0];
+        let e_centered = [1.0, 0.0, 0.0, 0.0];
+        let eta = eta_component(&modes, &grad_zn, &e_centered);
+        let expected = std::f64::consts::SQRT_2 / 4.0;
+        assert!((eta - expected).abs() < 1e-12, "eta = {eta}, expected {expected}");
+    }
+
+    /// End-to-end sanity check on [`omitted_mode_diagnostic`]: when the
+    /// target subset is pixel-for-pixel identical to the reference, the
+    /// zero-normalised residual is exactly zero everywhere regardless of the
+    /// omitted-mode/gradient weighting, so both components must be ~0 --
+    /// checked at both order-1 (quadratic omitted modes) and order-2 (cubic).
+    #[test]
+    fn test_omitted_mode_diagnostic_zero_for_identical_images() {
+        let coord = [0.0, 0.0];
+        let f_coords = Array2::from_shape_vec(
+            (4, 2),
+            vec![1.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, -1.0],
+        )
+        .unwrap();
+        let grad_f = Array2::from_shape_vec(
+            (4, 2),
+            vec![1.0, 0.5, -1.0, 0.3, 0.2, 1.0, -0.2, -1.0],
+        )
+        .unwrap();
+        let f = Array1::from(vec![10.0, 12.0, 9.0, 11.0]);
+        let f_m = f.mean().unwrap();
+        let delta_f = f.iter().map(|&fi: &f64| (fi - f_m).powi(2)).sum::<f64>().sqrt();
+
+        for order in [1, 2] {
+            let (eta_u, eta_v) = omitted_mode_diagnostic(
+                coord, order, &f_coords, &grad_f, &f, f_m, delta_f, &f, f_m, delta_f,
+            )
+            .unwrap_or_else(|| panic!("expected Some for order {order}"));
+            assert!(eta_u.abs() < 1e-10, "order {order}: eta_u = {eta_u}");
+            assert!(eta_v.abs() < 1e-10, "order {order}: eta_v = {eta_v}");
+        }
+    }
+
+    /// `omitted_mode_diagnostic` returns `None` for any order other than 1
+    /// or 2 (there is no order-3 solver to be "one below").
+    #[test]
+    fn test_omitted_mode_diagnostic_none_for_unsupported_order() {
+        let coord = [0.0, 0.0];
+        let f_coords = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, -1.0, 0.0]).unwrap();
+        let grad_f = Array2::from_shape_vec((2, 2), vec![1.0, 0.5, -1.0, 0.3]).unwrap();
+        let f = Array1::from(vec![10.0, 12.0]);
+        let f_m = f.mean().unwrap();
+        let delta_f = f.iter().map(|&fi: &f64| (fi - f_m).powi(2)).sum::<f64>().sqrt();
+        assert!(omitted_mode_diagnostic(
+            coord, 3, &f_coords, &grad_f, &f, f_m, delta_f, &f, f_m, delta_f,
+        )
+        .is_none());
+    }
+
     /// ZNSSD = 0 for identical subsets.
     #[test]
     fn test_znssd_identical() {
@@ -1024,6 +1482,66 @@ mod tests {
         let dg = g.iter().map(|&gi: &f64| (gi - g_m).powi(2)).sum::<f64>().sqrt();
         let z = znssd(&f, &g, f_m, g_m, df, dg);
         assert!(z >= 0.0 && z <= 4.0, "znssd out of [0, 4]: {z}");
+    }
+
+    /// §11.2: the fused update+ZNSSD is *byte*-identical to the split
+    /// `delta_p_icgn` + `znssd` (a pre-inverted Hessian, not the raw one).
+    #[test]
+    fn delta_p_and_znssd_icgn_matches_split() {
+        // Deterministic pseudo-random-ish inputs, order 1 (m = 6).
+        let n = 37usize;
+        let m = 6usize;
+        let f: Array1<f64> = (0..n).map(|i| 40.0 + (i as f64 * 0.7).sin() * 30.0).collect();
+        let g: Array1<f64> = (0..n).map(|i| 42.0 + (i as f64 * 0.61 + 0.3).sin() * 28.0).collect();
+        let f_m = f.mean().unwrap();
+        let g_m = g.mean().unwrap();
+        let delta_f = f.iter().map(|&x: &f64| (x - f_m).powi(2)).sum::<f64>().sqrt();
+        let delta_g = g.iter().map(|&x: &f64| (x - g_m).powi(2)).sum::<f64>().sqrt();
+        let mut sdi = Array2::<f64>::zeros((n, m));
+        for i in 0..n {
+            for j in 0..m {
+                sdi[[i, j]] = ((i * 7 + j * 3) as f64 * 0.13).cos() * (1.0 + j as f64 * 0.1);
+            }
+        }
+        let hessian = compute_hessian(&sdi);
+        let inv_h = hessian.clone().try_inverse().unwrap();
+
+        let dp_ref = delta_p_icgn(&hessian, &f, &g, f_m, g_m, delta_f, delta_g, &sdi);
+        let z_ref = znssd(&f, &g, f_m, g_m, delta_f, delta_g);
+        let (dp_fused, z_fused) =
+            delta_p_and_znssd_icgn(&inv_h, &f, &g, f_m, g_m, delta_f, delta_g, &sdi);
+
+        assert_eq!(z_ref.to_bits(), z_fused.to_bits(), "ZNSSD not byte-identical");
+        for k in 0..m {
+            assert_eq!(
+                dp_ref[k].to_bits(), dp_fused[k].to_bits(),
+                "Δp[{k}] not byte-identical: {} vs {}", dp_ref[k], dp_fused[k]
+            );
+        }
+    }
+
+    /// §11.3: fused value+gradient is byte-identical to the two separate calls.
+    #[test]
+    fn bspline_eval_grad_matches_separate() {
+        // A small non-degenerate QCQT: build one from a real Image.
+        let img = crate::image::Image::from_array(
+            Array2::from_shape_fn((24, 28), |(y, x)| {
+                60.0 + ((x as f64) * 0.9).sin() * 20.0 + ((y as f64) * 0.7).cos() * 15.0
+            }),
+            6,
+        );
+        let qv = img.qcqt.view();
+        for &(x, y) in &[
+            (3.25, 4.75), (10.0, 12.0), (0.0, 0.0), (15.999, 9.001),
+            (7.5, 0.5), (-3.0, 40.0), (1e6, -1e6),
+        ] {
+            let v_ref = bspline_eval(x, y, &qv);
+            let g_ref = bspline_grad(x, y, &qv);
+            let (v, g) = bspline_eval_grad(x, y, &qv);
+            assert_eq!(v_ref.to_bits(), v.to_bits(), "value at ({x},{y})");
+            assert_eq!(g_ref[0].to_bits(), g[0].to_bits(), "grad_x at ({x},{y})");
+            assert_eq!(g_ref[1].to_bits(), g[1].to_bits(), "grad_y at ({x},{y})");
+        }
     }
 
     /// compose_icgn: zero delta → p unchanged (within floating-point precision).
@@ -1099,17 +1617,72 @@ mod tests {
         // (because Q row-0 = [1/120, 13/60, 11/20, 13/60, 1/120, 0] sums to 1,
         //  and at dx=dy=0 only the constant term contributes).
         let val = 42.0_f64;
-        let mut qcqt = Array2::zeros((12, 12)); // 2×2 pixels
-        // At each pixel: block[0, 0] = val, rest 0
-        qcqt[[0, 0]] = val;
-        qcqt[[0, 6]] = val;
-        qcqt[[6, 0]] = val;
-        qcqt[[6, 6]] = val;
+        let mut qcqt = ndarray::Array3::zeros((2, 2, 36)); // 2×2 pixels
+        // At each pixel: block[0] (== old block[0,0]) = val, rest 0
+        qcqt[[0, 0, 0]] = val;
+        qcqt[[0, 1, 0]] = val;
+        qcqt[[1, 0, 0]] = val;
+        qcqt[[1, 1, 0]] = val;
 
         let result = bspline_eval(0.0, 0.0, &qcqt.view());
         assert!(
             (result - val).abs() < 1e-12,
             "expected {val}, got {result}"
+        );
+    }
+
+    /// A far out-of-range query must saturate to the boundary pixel's edge
+    /// value, not explode.
+    ///
+    /// Before the clamp fix, only `xf` was clamped into range while
+    /// `dx = x - xf` was left unbounded, so a query far outside the QCQT
+    /// domain (e.g. `x = 1_000_000`) produced a `dx` of the same enormous
+    /// magnitude, and `dx⁵` in the quintic basis exploded instead of
+    /// saturating (originally found via TV-DIC's `warp_image`, which could
+    /// sample far outside the image once a displacement estimate diverged —
+    /// see `mds/TV_DIC_abandoned.md`).
+    #[test]
+    fn test_bspline_eval_clamps_far_out_of_range_query() {
+        // 1×1-pixel QCQT block: constant term 100, plus a nonzero dx⁵
+        // coefficient so an unbounded dx would actually blow the result up
+        // (a purely constant image wouldn't distinguish the two behaviours).
+        let mut qcqt = ndarray::Array3::zeros((1, 1, 36));
+        qcqt[[0, 0, 0]] = 100.0; // constant term
+        qcqt[[0, 0, 5]] = 1.0; // dx⁵ coefficient
+
+        let far_out = bspline_eval(1_000_000.0, 0.0, &qcqt.view());
+        assert!(far_out.is_finite(), "far out-of-range query exploded: {far_out}");
+        assert!(
+            far_out.abs() < 200.0,
+            "expected the query to saturate near the boundary pixel value \
+             (~101), got {far_out} -- clamp is not bounding dx"
+        );
+
+        // Should saturate to (essentially) the same value as querying right
+        // at the boundary edge.
+        let at_edge = bspline_eval(0.999_999, 0.0, &qcqt.view());
+        assert!(
+            (far_out - at_edge).abs() < 1e-3,
+            "far out-of-range query should match the boundary edge value: \
+             at_edge={at_edge}, far_out={far_out}"
+        );
+    }
+
+    /// Same guarantee as `test_bspline_eval_clamps_far_out_of_range_query`,
+    /// for `bspline_grad` — a far out-of-range gradient query must stay
+    /// bounded rather than exploding via the same unclamped-`dx` mechanism.
+    #[test]
+    fn test_bspline_grad_clamps_far_out_of_range_query() {
+        let mut qcqt = ndarray::Array3::zeros((1, 1, 36));
+        qcqt[[0, 0, 0]] = 100.0;
+        qcqt[[0, 0, 5]] = 1.0;
+        qcqt[[0, 0, 30]] = 1.0; // dy⁵ coefficient ([5*6+0]), for the y-direction half
+
+        let [gx, gy] = bspline_grad(1_000_000.0, -1_000_000.0, &qcqt.view());
+        assert!(gx.is_finite() && gy.is_finite(), "grad exploded: [{gx}, {gy}]");
+        assert!(
+            gx.abs() < 200.0 && gy.abs() < 200.0,
+            "expected a bounded gradient near the boundary pixel, got [{gx}, {gy}]"
         );
     }
 
@@ -1124,10 +1697,12 @@ mod tests {
 
     /// Tier C: ICGN order-1 converges on the real DIC test pair.
     ///
-    /// Golden values (x-first coordinate convention):
+    /// Golden values (x-first coordinate convention) — computed from
+    /// geopyv_dev, which differs from `geopyv` by the one-pixel B-spline
+    /// prefilter fix in `image.rs::build_kernel` (see its doc comment):
     ///   iterations = 3
-    ///   ZNCC ≈ 0.999987  (Tier C: rtol = 1e-5)
-    ///   p ≈ [0.03420, 0.03583, 1.2e-4, -7.5e-5, 2.6e-5, -7.3e-5]
+    ///   ZNCC ≈ 0.9999869  (Tier C: rtol = 1e-5)
+    ///   p ≈ [0.03404, 0.03570, 1.2e-4, -3.1e-5, 4.0e-5, -4.9e-5]
     #[test]
     fn test_solve_icgn_order1_golden() {
         let ref_path = test_image_path("ref.jpg");
@@ -1152,44 +1727,46 @@ mod tests {
         // Verify reference quantities match golden values (x-first coordinate convention)
         assert_eq!(subset.n_px(), 1961, "n_px mismatch");
         assert!(
-            (subset.f_m.unwrap() - 70.8561329162).abs() < 1e-4,
+            (subset.f_m.unwrap() - 72.4611033781).abs() < 1e-4,
             "f_m = {:?}", subset.f_m
         );
         assert!(
-            (subset.delta_f - 3179.4465451209).abs() < 0.01,
+            (subset.delta_f - 3166.8112575921).abs() < 0.01,
             "delta_f = {}", subset.delta_f
         );
         assert!(
-            (subset.sssig - 420066.064).abs() < 1.0,
+            (subset.sssig - 430204.0240975655).abs() < 1.0,
             "sssig = {}", subset.sssig
         );
 
         // Solve
         let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
 
-        // Tier C: ZNCC ≈ 0.999987, rtol = 1e-5
+        // Tier C: ZNCC ≈ 0.9999869, rtol = 1e-5
         assert!(result.converged, "ICGN did not converge");
         assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
         assert!(
-            (result.c_zncc - 0.999987).abs() < 1e-4,
-            "ZNCC = {} (expected ~0.999987)", result.c_zncc
+            (result.c_zncc - 0.9999869).abs() < 1e-4,
+            "ZNCC = {} (expected ~0.9999869)", result.c_zncc
         );
-        // Displacement: p[0] ≈ 0.034201, p[1] ≈ 0.035834
+        // Displacement: p[0] ≈ 0.034043, p[1] ≈ 0.035697
         assert!(
-            (result.p[0] - 0.034201).abs() < 1e-4,
-            "p[0] = {} (expected ~0.034201)", result.p[0]
+            (result.p[0] - 0.034043).abs() < 1e-4,
+            "p[0] = {} (expected ~0.034043)", result.p[0]
         );
         assert!(
-            (result.p[1] - 0.035834).abs() < 1e-4,
-            "p[1] = {} (expected ~0.035834)", result.p[1]
+            (result.p[1] - 0.035697).abs() < 1e-4,
+            "p[1] = {} (expected ~0.035697)", result.p[1]
         );
     }
 
     /// Tier C: FAGN order-1 converges on the real DIC test pair.
     ///
-    /// Golden values (x-first coordinate convention):
-    ///   iterations = 3, ZNCC ≈ 0.999987
-    ///   p ≈ [0.033741, 0.035105, 1.2e-4, -7.1e-5, 2.3e-5, -6.6e-5]
+    /// Golden values (x-first coordinate convention) — computed from
+    /// geopyv_dev with the one-pixel B-spline prefilter fix (see
+    /// `image.rs::build_kernel`):
+    ///   iterations = 3, ZNCC ≈ 0.9999869
+    ///   p ≈ [0.033595, 0.035016, 1.2e-4, -2.9e-5, 3.9e-5, -4.1e-5]
     #[test]
     fn test_solve_fagn_order1_golden() {
         let ref_path = test_image_path("ref.jpg");
@@ -1216,16 +1793,16 @@ mod tests {
         assert!(result.converged, "FAGN did not converge");
         assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
         assert!(
-            (result.c_zncc - 0.999987).abs() < 1e-4,
-            "ZNCC = {} (expected ~0.999987)", result.c_zncc
+            (result.c_zncc - 0.9999869).abs() < 1e-4,
+            "ZNCC = {} (expected ~0.9999869)", result.c_zncc
         );
         assert!(
-            (result.p[0] - 0.033741).abs() < 1e-4,
-            "p[0] = {} (expected ~0.033741)", result.p[0]
+            (result.p[0] - 0.033595).abs() < 1e-4,
+            "p[0] = {} (expected ~0.033595)", result.p[0]
         );
         assert!(
-            (result.p[1] - 0.035105).abs() < 1e-4,
-            "p[1] = {} (expected ~0.035105)", result.p[1]
+            (result.p[1] - 0.035016).abs() < 1e-4,
+            "p[1] = {} (expected ~0.035016)", result.p[1]
         );
     }
 
@@ -1391,8 +1968,9 @@ mod tests {
         let sol = subset.solution().expect("solution must be Some after solve_icgn");
         assert_eq!(sol.coord, coord);
         assert!(
-            (sol.result.c_zncc - 0.999987).abs() < 1e-4,
-            "ZNCC = {} (expected ~0.999987)", sol.result.c_zncc
+            (sol.result.c_zncc - 0.9999869).abs() < 1e-4,
+            "ZNCC = {} (expected ~0.9999869)", sol.result.c_zncc
         );
     }
+
 }

@@ -1646,6 +1646,9 @@ fn run_solve(
             SolveMethod::Fagn => LibSolveMethod::Fagn,
         },
         override_active: false,
+        detect_shear_band: false,
+        shear_band_theta_steps: 36,
+        ..Default::default()
     };
     let seed_coord_init = params.seed;
     let mut seed_coord = seed_coord_init;

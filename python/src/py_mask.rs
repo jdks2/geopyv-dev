@@ -34,9 +34,14 @@ pub(crate) enum MaskInner {
 ///
 /// For ``mask_type="local"``:
 ///     shape : str
-///         ``"circle"`` or ``"square"``.
+///         ``"circle"``, ``"square"``, or ``"semicircle"`` (half of a
+///         circle, keeping only the bottom half -- ``y_offset >= 0`` --
+///         relative to each subset's own centre; a fixed-template
+///         demonstration that changing the template shape alone can improve
+///         performance at a discontinuity).
 ///     size : int, optional
-///         Radius (circle) or half-side-length (square) in pixels. Default 25.
+///         Radius (circle/semicircle) or half-side-length (square) in
+///         pixels. Default 25.
 ///
 /// For ``mask_type="global"``:
 ///     f_img : Image
@@ -100,9 +105,10 @@ impl PyMask {
                 let lm = match shape_str {
                     "circle" => LocalMask::circle(size).map_err(Error::from)?,
                     "square" => LocalMask::square(size).map_err(Error::from)?,
+                    "semicircle" => LocalMask::semicircle(size).map_err(Error::from)?,
                     other => {
                         return Err(PyValueError::new_err(format!(
-                            "unknown shape '{}': expected 'circle' or 'square'",
+                            "unknown shape '{}': expected 'circle', 'square', or 'semicircle'",
                             other
                         )))
                     }
@@ -159,13 +165,14 @@ impl PyMask {
     // Local-mask getters (None for global masks)
     // -----------------------------------------------------------------------
 
-    /// ``"circle"`` or ``"square"`` for local masks; ``None`` for global.
+    /// ``"circle"``, ``"square"``, or ``"semicircle"`` for local masks; ``None`` for global.
     #[getter]
     fn shape(&self) -> Option<&str> {
         match &self.inner {
             MaskInner::Local(lm) => match lm.shape {
                 MaskShape::Circle => Some("circle"),
                 MaskShape::Square => Some("square"),
+                MaskShape::Semicircle => Some("semicircle"),
             },
             MaskInner::Global { .. } => None,
         }
@@ -268,6 +275,7 @@ impl PyMask {
                 let shape = match lm.shape {
                     MaskShape::Circle => "circle",
                     MaskShape::Square => "square",
+                    MaskShape::Semicircle => "semicircle",
                 };
                 format!("Mask(mask_type='local', shape='{}', size={})", shape, lm.size)
             }

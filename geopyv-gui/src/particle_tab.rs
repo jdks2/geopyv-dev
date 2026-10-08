@@ -830,6 +830,7 @@ fn run_solve(
     let cfg = ParticleConfig {
         factor: params.factor,
         true_incs: params.true_incs,
+        strain_method: geopyv_dev::particle::StrainMethod::Mesh,
     };
 
     let source = ParticleSource::Sequence(Arc::new(seq_sol));
