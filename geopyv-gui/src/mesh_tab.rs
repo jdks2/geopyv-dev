@@ -128,6 +128,7 @@ pub struct NewMeshForm {
     pub gen_cfg: MeshGenConfig,
     pub solver: SolverConfig,
     pub draw: crate::draw::DrawState,
+    pub time: crate::time_input::TimeInputForm,
     pub form_error: Option<String>,
 }
 
@@ -144,6 +145,7 @@ impl Default for NewMeshForm {
             gen_cfg: MeshGenConfig::default(),
             solver: SolverConfig::default(),
             draw: crate::draw::DrawState::new(),
+            time: Default::default(),
             form_error: None,
         }
     }
@@ -168,6 +170,7 @@ impl NewMeshForm {
             && self.draw.seed_ok()
             && self.gen_cfg.is_valid()
             && self.solver.is_valid()
+            && self.time.is_valid()
     }
 }
 
@@ -189,7 +192,9 @@ pub struct MeshViewState {
     pub range_max: f64,
     pub show_wireframe: bool,
     pub show_node_indices: bool,
-    // Cached per-node scalar values (invalidated when plot_type changes).
+    /// Plot displacements as velocities (÷ the pair's Δt).
+    pub rate: bool,
+    // Cached per-node scalar values (invalidated when plot_type or rate changes).
     pub nodal_cache: Option<(MeshPlotType, Vec<f64>)>,
 }
 
@@ -209,6 +214,7 @@ impl MeshViewState {
             range_max: 1.0,
             show_wireframe: false,
             show_node_indices: false,
+            rate: false,
             nodal_cache: None,
         }
     }
@@ -261,6 +267,7 @@ pub struct MeshSpawnParams {
     pub max_norm: f64,
     pub max_iterations: usize,
     pub zncc_tol: f64,
+    pub time: Option<geopyv_dev::timing::TimeInput>,
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +469,7 @@ impl MeshTabState {
 
             // Ensure cache is up to date.
             if self.view.nodal_cache.as_ref().map(|(t, _)| *t) != Some(plot_type) {
-                let vals = extract_nodal_values(sol, plot_type);
+                let vals = extract_nodal_values(sol, plot_type, self.view.rate);
                 self.view.nodal_cache = Some((plot_type, vals));
             }
 
@@ -496,7 +503,7 @@ impl MeshTabState {
                     &coord,
                 );
 
-                render_colorbar(&painter, viewer_rect, vmin, vmax, colormap, plot_type.label());
+                render_colorbar(&painter, viewer_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate));
             }
         }
 
@@ -663,6 +670,16 @@ impl MeshTabState {
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::Uy, "u_y");
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::UMag, "|u|");
                 });
+                let dt = sol.dt();
+                let r = ui
+                    .add_enabled(dt.is_some(), egui::Checkbox::new(&mut self.view.rate, "Rate (velocity, px/s)"))
+                    .on_disabled_hover_text("No image times: set Δt or use timestamped file names, then re-solve");
+                if r.changed() {
+                    self.view.nodal_cache = None;
+                }
+                if let Some(dt) = dt {
+                    ui.label(egui::RichText::new(format!("Δt = {} s", format_sci(dt))).size(14.0).color(ui.visuals().weak_text_color()));
+                }
             }
             MeshViewPane::Quality => {
                 ui.horizontal_wrapped(|ui| {
@@ -743,7 +760,7 @@ impl MeshTabState {
         } else {
             let (mn, mx) = {
                 if self.view.nodal_cache.as_ref().map(|(t, _)| *t) != Some(self.view.plot_type) {
-                    let vals = extract_nodal_values(sol, self.view.plot_type);
+                    let vals = extract_nodal_values(sol, self.view.plot_type, self.view.rate);
                     self.view.nodal_cache = Some((self.view.plot_type, vals));
                 }
                 self.view
@@ -917,6 +934,21 @@ impl MeshTabState {
                     .size(15.0)
                     .color(ui.visuals().error_fg_color),
             );
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Timing section.
+        section_header(ui, "Timing");
+        ui.add_space(4.0);
+        {
+            let pair: Vec<PathBuf> = [form.ref_idx, form.target_idx]
+                .iter()
+                .filter_map(|i| i.and_then(|i| images.get(i)).cloned())
+                .collect();
+            form.time.show(ui, "mesh_time_grid", &pair);
         }
 
         ui.add_space(6.0);
@@ -1253,6 +1285,7 @@ impl MeshTabState {
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
+                    time: form.time.input().ok().flatten(),
                 });
                 form.form_error = None;
             }
@@ -1410,6 +1443,10 @@ fn run_solve(
             return;
         }
     };
+    if let Err(e) = mesh.set_time(params.time.as_ref()) {
+        set_error(&state, format!("Time error: {e}"));
+        return;
+    }
 
     let n_nodes = mesh.nodes().nrows();
 
@@ -1465,22 +1502,41 @@ fn run_solve(
 // Colormap overlay rendering
 // ---------------------------------------------------------------------------
 
-/// Compute per-node scalar values for the given plot type.
-pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType) -> Vec<f64> {
-    let n = sol.nodes.nrows();
+/// Compute per-node scalar values for the given plot type; with `rate`,
+/// displacements become velocities (÷ the pair's Δt; NaN without times).
+pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType, rate: bool) -> Vec<f64> {
     match plot {
-        MeshPlotType::Ux => (0..n).map(|i| sol.displacements[[i, 0]]).collect(),
-        MeshPlotType::Uy => (0..n).map(|i| sol.displacements[[i, 1]]).collect(),
-        MeshPlotType::UMag => (0..n)
-            .map(|i| {
-                let u = sol.displacements[[i, 0]];
-                let v = sol.displacements[[i, 1]];
-                (u * u + v * v).sqrt()
-            })
-            .collect(),
         MeshPlotType::CZncc => sol.c_zncc.to_vec(),
         MeshPlotType::Iterations => sol.iterations.iter().map(|&v| v as f64).collect(),
         MeshPlotType::Norms => sol.norms.to_vec(),
+        _ => displacement_values(&sol.displacements, plot, rate.then(|| sol.dt().unwrap_or(f64::NAN))),
+    }
+}
+
+/// Per-node `u_x` / `u_y` / `|u|` of a displacement field `(N, 2)`, divided
+/// by `dt` when given.
+pub fn displacement_values(disp: &ndarray::Array2<f64>, plot: MeshPlotType, dt: Option<f64>) -> Vec<f64> {
+    let scale = dt.map_or(1.0, |dt| if dt == 0.0 { f64::NAN } else { 1.0 / dt });
+    disp.rows()
+        .into_iter()
+        .map(|r| {
+            let v = match plot {
+                MeshPlotType::Uy => r[1],
+                MeshPlotType::UMag => r[0].hypot(r[1]),
+                _ => r[0],
+            };
+            v * scale
+        })
+        .collect()
+}
+
+/// Colorbar label: velocities gain `(px/s)`.
+pub fn plot_label(plot: MeshPlotType, rate: bool) -> String {
+    let is_disp = matches!(plot, MeshPlotType::Ux | MeshPlotType::Uy | MeshPlotType::UMag);
+    if rate && is_disp {
+        format!("{} (px/s)", plot.label())
+    } else {
+        plot.label().to_string()
     }
 }
 

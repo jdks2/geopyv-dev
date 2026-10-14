@@ -14,8 +14,7 @@ use crate::Error;
 
 /// Observer for a running solve. All methods have no-op defaults.
 pub trait SolveProgress: Sync {
-    /// A mesh solve over `n_nodes` subsets is starting (called again for
-    /// each pass of a multi-pass solve, e.g. zonal masking).
+    /// A mesh solve over `n_nodes` subsets is starting.
     fn mesh_start(&self, _n_nodes: usize) {}
     /// One more subset has been solved and stored.
     fn node_done(&self) {}

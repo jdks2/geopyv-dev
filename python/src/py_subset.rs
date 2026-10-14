@@ -81,6 +81,7 @@ impl PySubset {
         } else {
             Subset::from_subset_solution(&sol, &local_mask)
         };
+        inner.time = sol.time;
         inner.set_solution(sol);
 
         Ok(PySubset {
@@ -124,7 +125,7 @@ impl PySubset {
 #[pymethods]
 impl PySubset {
     #[new]
-    #[pyo3(signature = (coord, local_mask, f_img, g_img, subset_order = 1, global_mask = None))]
+    #[pyo3(signature = (coord, local_mask, f_img, g_img, subset_order = 1, global_mask = None, time = None))]
     fn new(
         py: Python<'_>,
         coord: [f64; 2],
@@ -133,7 +134,9 @@ impl PySubset {
         g_img: &Bound<'_, PyImage>,
         subset_order: usize,
         global_mask: Option<Py<PyMask>>,
+        time: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let time = crate::utils::extract_time_input(time)?;
         if subset_order > 2 {
             return Err(PyValueError::new_err(format!(
                 "subset_order must be 0, 1, or 2, got {subset_order}"
@@ -144,7 +147,7 @@ impl PySubset {
             .downcast::<PyMask>()
             .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
 
-        let inner = {
+        let mut inner = {
             let lm_ref = lm_bound.borrow();
             let lm = lm_ref.local_mask_ref()?;
             let gm_guard = global_mask.as_ref().map(|gm| gm.bind(py).borrow());
@@ -160,6 +163,7 @@ impl PySubset {
                 subset_order,
             ).map_err(Error::from)?
         };
+        inner.set_time(time.as_ref()).map_err(Error::from)?;
 
         let lm_py: Py<PyMask> = lm_bound.clone().unbind();
         let f_img_py: Py<PyImage> = f_img.clone().unbind();
@@ -255,6 +259,14 @@ impl PySubset {
 
     #[getter]
     fn sssig(&self) -> f64 { self.inner.sssig }
+
+    /// ``(f_time, g_time)`` of the image pair in seconds, or ``None``.
+    #[getter]
+    fn time(&self) -> Option<(f64, f64)> { self.inner.time }
+
+    /// Where ``time`` came from: ``"given"``, ``"filename (<format>)"`` or ``"none"``.
+    #[getter]
+    fn time_source(&self) -> String { self.inner.time_source.describe() }
 
     #[getter]
     fn solved(&self) -> bool { self.inner.solved() }

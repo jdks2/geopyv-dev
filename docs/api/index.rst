@@ -93,6 +93,74 @@ See :doc:`../tutorials/07_validation`, :doc:`../tutorials/08_calibration`.
 .. autoclass:: geopyv_dev.CalibrationParams
    :members:
 
+Image timing and rates
+----------------------
+
+Every ``Subset``, ``Mesh`` and ``Sequence`` takes a ``time`` argument (see the class
+docstrings above and :doc:`../tutorials/04_sequence`): a time step in seconds, one
+time per image, or ``None`` to read timestamps from the image file names. The
+results then carry these attributes and methods (they live on the compiled objects,
+so they are listed here rather than under each class):
+
+.. py:attribute:: Subset.time
+                  Mesh.time
+                  MeshSolution.time
+   :noindex:
+
+   ``(f_time, g_time)`` — the times of the pair's reference and target images, in
+   seconds, or ``None``.
+
+.. py:attribute:: Mesh.dt
+                  MeshSolution.dt
+   :noindex:
+
+   ``g_time - f_time``, or ``None``.
+
+.. py:attribute:: Sequence.time
+                  Field.time
+                  Particle.time
+   :noindex:
+
+   The time of each image (``Sequence``) or row (``Field``/``Particle`` — row *k*
+   is image *k*), in seconds, as a 1-D array; or ``None``.
+
+.. py:attribute:: Subset.time_source
+                  Mesh.time_source
+                  Sequence.time_source
+   :noindex:
+
+   Where ``time`` came from: ``"given"``, ``"filename (<format>)"`` or ``"none"``.
+
+.. py:method:: Sequence.increment_displacements(mesh_index, mode="leapfrog")
+   :noindex:
+
+   Pair ``mesh_index``'s nodal displacement increment ``(N, 2)`` and its time step
+   in seconds (``None`` without times). ``mode="leapfrog"`` measures it from the
+   pair's reference image; ``mode="sequential"`` from the previous target image.
+
+.. py:method:: Field.contour_values(quantity, window=None, increment=None, mode="leapfrog", rate=False, absolute=False)
+   :noindex:
+
+   The per-particle values ``contour_field`` plots, as an ``(N,)`` array — see
+   :func:`geopyv_dev.contour_field` for the meaning of each argument.
+
+.. py:method:: Field.contour_range(window=None, increment=None, mode="leapfrog")
+   :noindex:
+
+   The half-open ``(start, stop)`` rows those arguments select.
+
+.. py:method:: Particle.series_increments(quantity="warps", component=0, mode="leapfrog", rate=False)
+   :noindex:
+
+   The change of ``quantity`` (``"warps"``, ``"strains"`` or ``"vol_strains"``;
+   column ``component``) into each row ``k = 1 … inc_no − 1``: from that row's
+   reference image (``"leapfrog"``) or the previous image (``"sequential"``); with
+   ``rate``, divided by that time step.
+
+The plotting functions below take ``rate=True`` (and, where there is a choice of
+increment, ``mode=``) to plot rates; units are ``/s`` for strain rates and ``px/s``
+for velocities.
+
 I/O
 ---
 

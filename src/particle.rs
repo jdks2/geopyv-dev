@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     calibration::CalibrationParams,
-    masks::zone_at,
     mesh::MeshSolution,
     sequence::SequenceSolution,
     Error,
@@ -94,6 +93,14 @@ impl ParticleSource {
             Self::Mesh(_) => 1,
             Self::Sequence(s) => s.n_meshes(),
             Self::Loaded { inc_no, .. } => inc_no.saturating_sub(1),
+        }
+    }
+    /// Time of each row (image), seconds, if known — see [`crate::timing`].
+    pub fn time(&self) -> Option<Vec<f64>> {
+        match self {
+            Self::Mesh(m) => m.time.map(|(f, g)| vec![f, g]),
+            Self::Sequence(s) => s.row_times(s.n_meshes() + 1),
+            Self::Loaded { .. } => None,
         }
     }
     pub fn ref_update_at(&self, m: usize) -> bool {
@@ -350,15 +357,6 @@ pub struct MeshlessParams {
     pub max_iterations: usize,
     /// Tukey biweight tuning constant.
     pub tukey_c: f64,
-    /// When `true` and the source mesh carries a `ZonalMaskingRecord`
-    /// (`masking="zonal"` solve), restrict the meshless neighbourhood to
-    /// nodes sharing the query point's own zone -- the same exclusion
-    /// principle zonal masking already applies to a subset's own pixels,
-    /// applied instead to which neighbour subsets a particle's meshless
-    /// fit may draw on. A graceful no-op (identical to `false`) when the
-    /// mesh has no zonal record at all. Default `false` -- existing
-    /// callers are unaffected.
-    pub zone_aware: bool,
 }
 
 impl Default for MeshlessParams {
@@ -369,7 +367,6 @@ impl Default for MeshlessParams {
             min_neighbours: 6,
             max_iterations: 5,
             tukey_c: 4.685,
-            zone_aware: false,
         }
     }
 }
@@ -411,11 +408,6 @@ impl Default for StrainMethod {
 /// when fewer than `params.min_neighbours` remain, or when a fit is
 /// singular (e.g. collinear neighbours).
 ///
-/// `zonal`, when `Some((node_zone, zone_image))`, restricts the candidate
-/// neighbourhood to nodes sharing the query point's own zone (looked up via
-/// [`zone_at`]) -- see [`MeshlessParams::zone_aware`]. Ignored when `None`
-/// (the mesh has no `ZonalMaskingRecord`, or the caller didn't ask).
-///
 /// # Returns
 /// Warp increment vector of length `out_len` (`6 * mesh_order`), in the
 /// same layout as [`warp_increment`]: `[u, v, du/dx, dv/dx, du/dy, dv/dy,
@@ -428,7 +420,6 @@ pub fn meshless_warp_increment(
     c_zncc: ArrayView1<f64>,
     params: &MeshlessParams,
     out_len: usize,
-    zonal: Option<(ArrayView1<u32>, ArrayView2<u8>)>,
 ) -> Array1<f64> {
     let n_nodes = nodes.nrows();
     let r2 = params.radius * params.radius;
@@ -443,13 +434,9 @@ pub fn meshless_warp_increment(
     if let Some(gate) = params.quality_gate {
         candidates.retain(|&i| c_zncc[i] >= gate);
     }
-    if let Some((node_zone, zone_image)) = &zonal {
-        let query_zone = zone_at(zone_image.view(), coordinate) as u32;
-        candidates.retain(|&i| node_zone[i] == query_zone);
-    }
 
     if candidates.len() < params.min_neighbours {
-        return nearest_node_warp(coordinate, nodes, p, c_zncc, params.quality_gate, out_len, zonal);
+        return nearest_node_warp(coordinate, nodes, p, c_zncc, params.quality_gate, out_len);
     }
 
     let dx: Vec<f64> = candidates.iter().map(|&i| nodes[[i, 0]] - coordinate[0]).collect();
@@ -465,7 +452,7 @@ pub fn meshless_warp_increment(
 
     let mut fit = match weighted_affine_fit(&dx, &dy, &u, &v, &weights) {
         Some(f) => f,
-        None => return nearest_node_warp(coordinate, nodes, p, c_zncc, params.quality_gate, out_len, zonal),
+        None => return nearest_node_warp(coordinate, nodes, p, c_zncc, params.quality_gate, out_len),
     };
 
     for _ in 0..params.max_iterations {
@@ -701,13 +688,6 @@ fn median(values: &[f64]) -> f64 {
 /// Fallback for [`meshless_warp_increment`]: the nearest node's own `p` row,
 /// copied directly (zero-padded to `out_len`). Prefers quality-gated nodes;
 /// if the gate rejects every node, falls back to the plain nearest node.
-///
-/// `zonal`, when `Some((node_zone, zone_image))`, keeps the "never blends
-/// cross-zone data" guarantee unconditional: the search prefers a
-/// quality-gated same-zone node, then any same-zone node, and only falls
-/// through to the original zone-agnostic search if literally no node
-/// anywhere shares the query's own zone (degenerate -- shouldn't happen
-/// given a zone always contains at least the nodes that defined it).
 fn nearest_node_warp(
     coordinate: [f64; 2],
     nodes: ArrayView2<f64>,
@@ -715,7 +695,6 @@ fn nearest_node_warp(
     c_zncc: ArrayView1<f64>,
     quality_gate: Option<f64>,
     out_len: usize,
-    zonal: Option<(ArrayView1<u32>, ArrayView2<u8>)>,
 ) -> Array1<f64> {
     let n_nodes = nodes.nrows();
     let dist2 = |i: usize| {
@@ -732,17 +711,7 @@ fn nearest_node_warp(
     };
     let gated = |i: usize| quality_gate.map_or(true, |gate| c_zncc[i] >= gate);
 
-    let idx = if let Some((node_zone, zone_image)) = &zonal {
-        let query_zone = zone_at(zone_image.view(), coordinate) as u32;
-        let in_zone = |i: usize| node_zone[i] == query_zone;
-        nearest(&|i| gated(i) && in_zone(i))
-            .or_else(|| nearest(&in_zone))
-            .or_else(|| nearest(&gated))
-            .or_else(|| nearest(&|_| true))
-    } else {
-        nearest(&gated).or_else(|| nearest(&|_| true))
-    }
-    .unwrap_or(0);
+    let idx = nearest(&gated).or_else(|| nearest(&|_| true)).unwrap_or(0);
 
     let mut warp = Array1::<f64>::zeros(out_len);
     let cols = p.ncols().min(out_len);
@@ -891,7 +860,7 @@ pub fn vol_strains(volumes: &Array1<f64>) -> Array1<f64> {
 /// theta_p)` with `ep1 >= ep2` and `theta_p` (radians, in `(-pi/2, pi/2]`)
 /// the angle of the `ep1` eigenvector from the x-axis. Used by
 /// [`principal_strains`].
-fn principal_2x2(exx: f64, eyy: f64, exy: f64) -> (f64, f64, f64) {
+pub(crate) fn principal_2x2(exx: f64, eyy: f64, exy: f64) -> (f64, f64, f64) {
     let mean = (exx + eyy) / 2.0;
     let radius = ((exx - eyy) / 2.0).hypot(exy);
     let theta_p = 0.5 * (2.0 * exy).atan2(exx - eyy);
@@ -995,6 +964,10 @@ pub struct ParticleSolution {
     /// for what should be one signal).
     #[serde(default)]
     pub gamma_max_grad: Option<Array2<f64>>,
+    /// Time of each row (image), seconds, `(inc_no,)` — see
+    /// [`crate::timing`]. `None` when the source images had no times.
+    #[serde(default)]
+    pub time: Option<Vec<f64>>,
 }
 
 /// Lagrangian / Eulerian particle tracking and strain-path computation.
@@ -1117,11 +1090,6 @@ impl Particle {
                 self.coordinates[[self.reference_index, 0]],
                 self.coordinates[[self.reference_index, 1]],
             ];
-            let zonal = mesh
-                .zonal_masking
-                .as_ref()
-                .filter(|_| params.zone_aware)
-                .map(|z| (z.node_zone.view(), z.zone_image.view()));
             meshless_warp_increment(
                 coord,
                 mesh.nodes.view(),
@@ -1129,7 +1097,6 @@ impl Particle {
                 mesh.c_zncc.view(),
                 params,
                 self.incs.ncols(),
-                zonal,
             )
         } else if let Some(params) = calibration {
             // coord is in object space (maintained throughout calibrated solve).
@@ -1299,6 +1266,10 @@ impl Particle {
             // solved meshless; stays None for a standalone Particle::solve
             // (no neighbours) or an explicit StrainMethod::Mesh solve.
             gamma_max_grad: None,
+            time: match &self.solution {
+                Some(sol) => sol.time.clone(),
+                None => self.source.time(),
+            },
         }
     }
 }
@@ -1325,12 +1296,11 @@ mod tests {
                 let d = MeshlessParams::default();
                 assert_eq!(p.radius, d.radius);
                 assert_eq!(p.min_neighbours, d.min_neighbours);
-                assert!(!p.zone_aware);
             }
             StrainMethod::Mesh => panic!("core default must be meshless"),
         }
     }
-    use ndarray::{array, s};
+    use ndarray::array;
 
     // Unit right triangle: (0,0), (1,0), (0,1)
     fn tri_nodes() -> Array2<f64> {
@@ -1516,8 +1486,8 @@ mod tests {
             p[[i, 0]] = 1.0 + 0.2 * dx + 0.1 * dy;
             p[[i, 1]] = -0.5 + 0.05 * dx - 0.3 * dy;
         }
-        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
-        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6, None);
+        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685 };
+        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6);
         assert!((w[0] - 1.0).abs() < 1e-8, "u={}", w[0]);
         assert!((w[1] - (-0.5)).abs() < 1e-8, "v={}", w[1]);
         assert!((w[2] - 0.2).abs() < 1e-8, "du/dx={}", w[2]);
@@ -1554,8 +1524,8 @@ mod tests {
             p[[i, 0]] = uv[0];
             p[[i, 1]] = uv[1];
         }
-        let params = MeshlessParams { radius: 35.0, quality_gate: None, min_neighbours: 6, max_iterations: 10, tukey_c: 4.685, zone_aware: false };
-        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6, None);
+        let params = MeshlessParams { radius: 35.0, quality_gate: None, min_neighbours: 6, max_iterations: 10, tukey_c: 4.685 };
+        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6);
         assert!((w[0] - 3.5).abs() < 0.3, "u0={} (expected close to the near-side 3.5)", w[0]);
         assert!((w[0] - 3.5).abs() < (w[0] - 5.0).abs(), "u0={} ended up closer to the far side than the near side", w[0]);
         assert!((w[1] - 2.1).abs() < 0.2, "v0={} (expected close to 2.1)", w[1]);
@@ -1573,8 +1543,8 @@ mod tests {
             [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
         ];
         let c_zncc = array![1.0, 1.0, 1.0];
-        let params = MeshlessParams { radius: 5.0, quality_gate: None, min_neighbours: 6, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
-        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6, None);
+        let params = MeshlessParams { radius: 5.0, quality_gate: None, min_neighbours: 6, max_iterations: 5, tukey_c: 4.685 };
+        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6);
         // Nearest node (index 0, distance 1.0) wins over index 1 (distance 2.0).
         for j in 0..6 {
             assert!((w[j] - p[[0, j]]).abs() < 1e-12, "w[{j}]={}, expected {}", w[j], p[[0, j]]);
@@ -1611,128 +1581,10 @@ mod tests {
             p[[i, 1]] = 50.0;
             c_zncc[i] = 0.2;
         }
-        let params = MeshlessParams { radius: 20.0, quality_gate: Some(0.5), min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
-        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6, None);
+        let params = MeshlessParams { radius: 20.0, quality_gate: Some(0.5), min_neighbours: 4, max_iterations: 5, tukey_c: 4.685 };
+        let w = meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params, 6);
         assert!((w[0] - 2.0).abs() < 1e-6, "u0={} (low-quality outliers should be excluded)", w[0]);
         assert!((w[1] - (-1.0)).abs() < 1e-6, "v0={}", w[1]);
-    }
-
-    // -----------------------------------------------------------------------
-    // zone-aware meshless filtering
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn zone_at_matches_zone_mask_update_lookup() {
-        // Same coordinate, same zone_image -- zone_at() must return exactly
-        // what zone_mask_update's own centre-label lookup uses internally
-        // (extracted-helper equivalence, not a coincidence).
-        let mut zone_image = Array2::<u8>::zeros((20, 20));
-        zone_image.slice_mut(s![.., 10..]).fill(3);
-        let coord = [12.0, 5.0];
-        assert_eq!(zone_at(zone_image.view(), coord), 3);
-
-        let mut mask = crate::masks::LocalMask::circle(3).unwrap();
-        let before: std::collections::HashSet<(i64, i64)> =
-            mask.coords.outer_iter().map(|r| (r[0] as i64, r[1] as i64)).collect();
-        mask.zone_mask_update(coord, zone_image.view());
-        let after: std::collections::HashSet<(i64, i64)> =
-            mask.coords.outer_iter().map(|r| (r[0] as i64, r[1] as i64)).collect();
-        // Every kept offset's absolute pixel must share zone_at's own zone
-        // (3, since the whole neighbourhood here sits at x>=10).
-        for &(dx, dy) in &after {
-            let px = [coord[0] + dx as f64, coord[1] + dy as f64];
-            assert_eq!(zone_at(zone_image.view(), px), 3);
-        }
-        assert!(after.len() <= before.len());
-    }
-
-    #[test]
-    fn meshless_warp_increment_zone_aware_excludes_cross_zone_neighbours() {
-        // Two-zone step case, more extreme than the plain IRLS two-cluster
-        // test above: the "wrong side" is the numerical MAJORITY within
-        // radius (15 far-zone points vs 9 near-zone points), so an
-        // IRLS-only fit (no zone filter) is pulled measurably toward the
-        // wrong value; zone-aware filtering must still recover the exact
-        // near-side value regardless, because the far-zone points are
-        // never candidates at all.
-        let coordinate = [0.0, -2.0];
-        let mut rows: Vec<([f64; 2], [f64; 2], u32)> = Vec::new();
-        for &y in &[-15.0, -10.0, -5.0] {
-            for &x in &[-10.0, 0.0, 10.0] {
-                rows.push(([x, y], [3.5, 2.1], 1)); // near zone (query's own)
-            }
-        }
-        for &y in &[5.0, 10.0, 15.0, 20.0, 25.0] {
-            for &x in &[-10.0, 0.0, 10.0] {
-                rows.push(([x, y], [9.0, -4.0], 2)); // far zone -- numerical majority
-            }
-        }
-        let n = rows.len();
-        let mut nodes = Array2::<f64>::zeros((n, 2));
-        let mut p = Array2::<f64>::zeros((n, 6));
-        let mut node_zone = Array1::<u32>::zeros(n);
-        let c_zncc = Array1::<f64>::from_elem(n, 1.0);
-        for (i, &(coord, warp, z)) in rows.iter().enumerate() {
-            nodes[[i, 0]] = coord[0];
-            nodes[[i, 1]] = coord[1];
-            p[[i, 0]] = warp[0];
-            p[[i, 1]] = warp[1];
-            node_zone[i] = z;
-        }
-        // query_zone lookup: zone_image is all-1 except y>=0 which is zone 2
-        // (matches the near/far split above; coordinate itself is at y=-2,
-        // zone 1).
-        let mut zone_image = Array2::<u8>::ones((60, 60));
-        zone_image.slice_mut(s![30.., ..]).fill(2); // rows >= 30 (image y=30 <-> coord y=0)
-        let base_params =
-            MeshlessParams { radius: 40.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
-
-        let w_unaware =
-            meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &base_params, 6, None);
-        let zonal = Some((node_zone.view(), zone_image.view()));
-        let w_aware =
-            meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &base_params, 6, zonal);
-
-        assert!((w_aware[0] - 3.5).abs() < 1e-6, "zone-aware u={} (expected exactly 3.5)", w_aware[0]);
-        assert!((w_aware[1] - 2.1).abs() < 1e-6, "zone-aware v={}", w_aware[1]);
-        assert!(
-            (w_unaware[0] - 3.5).abs() > 0.5,
-            "unfiltered fit should be pulled well away from 3.5 by the majority far-zone \
-             cluster (got u={}), otherwise this test isn't exercising the filter",
-            w_unaware[0]
-        );
-    }
-
-    #[test]
-    fn nearest_node_warp_fallback_respects_zone_when_zone_aware() {
-        // Tiny radius forces the min_neighbours fallback. Nodes: one
-        // zone-2 node very close to the query, one zone-1 (query's own
-        // zone) node further away. zone_aware=false's fallback should pick
-        // the geometrically nearest (zone 2); zone_aware=true's fallback
-        // must pick the nearest SAME-ZONE node instead (zone 1), even
-        // though it's farther away.
-        let coordinate = [0.0, 0.0];
-        let nodes = array![[1.0, 0.0], [5.0, 0.0]];
-        let mut p = Array2::<f64>::zeros((2, 6));
-        p[[0, 0]] = 99.0; // zone 2 (near)
-        p[[1, 0]] = 7.0;  // zone 1 (query's own, farther)
-        let c_zncc = Array1::<f64>::from_elem(2, 1.0);
-        let node_zone = array![2u32, 1u32];
-        let mut zone_image = Array2::<u8>::ones((10, 10));
-        zone_image[[0, 0]] = 1; // query's own coordinate sits in zone 1
-
-        let params_unaware =
-            MeshlessParams { radius: 0.1, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
-        let w_unaware =
-            meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params_unaware, 6, None);
-        assert!((w_unaware[0] - 99.0).abs() < 1e-9, "zone-agnostic fallback should pick the nearest node overall (zone 2): got {}", w_unaware[0]);
-
-        let params_aware =
-            MeshlessParams { radius: 0.1, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: true };
-        let zonal = Some((node_zone.view(), zone_image.view()));
-        let w_aware =
-            meshless_warp_increment(coordinate, nodes.view(), p.view(), c_zncc.view(), &params_aware, 6, zonal);
-        assert!((w_aware[0] - 7.0).abs() < 1e-9, "zone-aware fallback should skip the cross-zone node and pick the nearest same-zone one: got {}", w_aware[0]);
     }
 
     // -----------------------------------------------------------------------
@@ -1761,7 +1613,7 @@ mod tests {
             points[[i, 1]] = y;
             values[i] = a + b * x + c * y;
         }
-        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
+        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685 };
         let query = [1.0, 2.0];
         let [value, dfdx, dfdy] = meshless_scalar_gradient(query, points.view(), values.view(), &params);
         assert!((dfdx - b).abs() < 1e-8, "d/dx={dfdx} (expected {b})");
@@ -1784,7 +1636,7 @@ mod tests {
             points[[i, 0]] = x;
             points[[i, 1]] = y;
         }
-        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
+        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685 };
         let [value, dfdx, dfdy] = meshless_scalar_gradient([0.0, 0.0], points.view(), values.view(), &params);
         assert!((value - 4.2).abs() < 1e-8, "value={value}");
         assert!(dfdx.abs() < 1e-8, "d/dx={dfdx} (expected 0)");
@@ -1797,7 +1649,7 @@ mod tests {
         // the nearest point's own value, zero gradient.
         let points = array![[1.0, 0.0], [-2.0, 0.0], [100.0, 100.0]];
         let values = array![7.0, 9.0, -1.0];
-        let params = MeshlessParams { radius: 5.0, quality_gate: None, min_neighbours: 6, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
+        let params = MeshlessParams { radius: 5.0, quality_gate: None, min_neighbours: 6, max_iterations: 5, tukey_c: 4.685 };
         let [value, dfdx, dfdy] = meshless_scalar_gradient([0.0, 0.0], points.view(), values.view(), &params);
         assert!((value - 7.0).abs() < 1e-12, "value={value} (expected nearest point's own 7.0)");
         assert_eq!(dfdx, 0.0);
@@ -1819,7 +1671,7 @@ mod tests {
             points[[i, 1]] = y;
             values[i] = 1.0 + 0.4 * x - 0.2 * y;
         }
-        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685, zone_aware: false };
+        let params = MeshlessParams { radius: 20.0, quality_gate: None, min_neighbours: 4, max_iterations: 5, tukey_c: 4.685 };
         let batch = meshless_scalar_gradient_batch(points.view(), points.view(), values.view(), &params);
         assert_eq!(batch.dim(), (n, 2));
         for i in 0..n {
@@ -2023,7 +1875,7 @@ mod tests {
             seed: None,
             template_shape: None,
             template_sizes: None,
-            zonal_masking: None,
+            time: None,
         }
     }
 
@@ -2043,6 +1895,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         })
     }
 
@@ -2113,6 +1967,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         });
         let mut p = Particle::new(
             ParticleSource::Sequence(seq),
@@ -2155,6 +2011,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         });
         (sol, paths)
     }
@@ -2223,6 +2081,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         });
 
         let mut p = Particle::new(

@@ -21,6 +21,7 @@ mod project;
 mod recent;
 mod sequence_tab;
 mod subset_tab;
+mod time_input;
 
 /// Open the geopyv window and block until it is closed.
 ///

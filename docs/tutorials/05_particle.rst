@@ -108,6 +108,10 @@ What a solved ``Particle`` gives you
    print(particle.strains.shape)       # (n_frames+1, 6): [eps_xx, eps_yy, eps_zz, eps_yz, eps_xz, eps_xy]
    print(particle.strain_incs.shape)   # (n_frames, 6) — per-increment strains
    print(particle.vol_strains)         # (n_frames+1,) — from Jacobian-based volume, not `strains`
+   print(particle.time)                # (n_frames+1,) — time of each row, seconds (None if untimed)
+
+Row *k* of every array is image *k* of the sequence, and ``particle.time`` holds
+those images' times (see :doc:`04_sequence`).
 
 ``strains``' out-of-plane components (``eps_zz``, ``eps_yz``, ``eps_xz``, indices
 2–4) are always zero — planar DIC only measures in-plane deformation; ``eps_xx``
@@ -124,12 +128,25 @@ Same conventions as :doc:`03_mesh`/:doc:`04_sequence` — free function or metho
 
    particle.inspect()                                    # initial position on the reference image
 
-   # history(): quantity is "warps", "strains", or "vol_strains" — full trajectory
-   particle.history(quantity="warps")                     # all components over frames
-   particle.history(quantity="strains", components=[0, 1, 5])   # just eps_xx, eps_yy, eps_xy
+   # history(): quantity is "warps", "strains", or "vol_strains" — full trajectory,
+   # plotted against time (or against image number if the sequence has no times)
+   particle.history(quantity="warps")                     # all components
+   particle.history(quantity="warps", components=[0, 1])  # just u, v
 
-   # trace(): one component's per-increment value, drawn along the particle's path
-   particle.trace(quantity="strains", component=5)         # shear strain along the trajectory
+   # rate=True plots the rate over each increment instead (/s; u, v in px/s)
+   particle.history(quantity="strains", rate=True)                       # from each row's reference image
+   particle.history(quantity="strains", rate=True, mode="sequential")    # from the previous image, as steps
+
+   # trace(): the particle's path, each segment coloured by
+   particle.trace(quantity="strains", component=5)                       # change since its reference image
+   particle.trace(quantity="strains", component=5, mode="sequential")    # change since the previous image
+   particle.trace(quantity="strains", component=5, mode="sequential", rate=True)  # ... per second
+   particle.trace(mode="time")                                           # when the particle moved
+
+``mode`` means the same as for a sequence's contours (:doc:`04_sequence`):
+``"leapfrog"`` (default) measures each increment from the reference image of the
+pair that produced it, ``"sequential"`` from the previous image. Rates need the
+sequence's times.
 
 Save and reload
 ~~~~~~~~~~~~~~~~~

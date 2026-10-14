@@ -171,9 +171,13 @@ impl Project {
     // File listing helpers
     // -----------------------------------------------------------------------
 
-    /// Sorted lexicographic list of image files in `/Images/Data/`.
+    /// Naturally sorted list of image files in `/Images/Data/`.
+    /// Chronological instead when every name carries a timestamp
+    /// (`geopyv_dev::timing`), as `Sequence.from_dir` orders them.
     pub fn list_images(&self) -> Vec<PathBuf> {
-        list_files_with_exts(&self.images_data_dir(), &["jpg", "jpeg", "png", "tif", "tiff"])
+        let mut images = list_files_with_exts(&self.images_data_dir(), &["jpg", "jpeg", "png", "tif", "tiff"]);
+        geopyv_dev::timing::sort_by_filename_time(&mut images);
+        images
     }
 
     /// Sorted list of `.pyv` files in `/Subsets/`.

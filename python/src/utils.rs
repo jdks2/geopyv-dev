@@ -36,3 +36,28 @@ where
     // SAFETY: same invariant as arc_array1 — see above.
     Ok(unsafe { PyArray2::borrow_from_array_bound(array_ref, capsule.into_any()) })
 }
+
+/// A Python `time=` argument: `None`, a scalar time increment (seconds
+/// between consecutive images), or one time per image (any sequence).
+pub fn extract_time_input(
+    time: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<geopyv_dev::timing::TimeInput>> {
+    use geopyv_dev::timing::TimeInput;
+    let Some(t) = time.filter(|t| !t.is_none()) else { return Ok(None) };
+    if t.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err("time must be a number or a sequence of numbers"));
+    }
+    if let Ok(dt) = t.extract::<f64>() {
+        return Ok(Some(TimeInput::Increment(dt)));
+    }
+    t.extract::<Vec<f64>>().map(|v| Some(TimeInput::Times(v))).map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "time must be a time increment (number) or one time per image (sequence of numbers)",
+        )
+    })
+}
+
+/// `"leapfrog"` / `"sequential"` as an [`IncrementMode`](geopyv_dev::timing::IncrementMode).
+pub fn parse_mode(mode: &str) -> PyResult<geopyv_dev::timing::IncrementMode> {
+    mode.parse().map_err(|e: geopyv_dev::Error| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}

@@ -12,6 +12,7 @@ use pyo3::types::PyTuple;
 use geopyv_dev::particle::{
     self, Particle, ParticleConfig, ParticleSolution, ParticleSource,
 };
+use geopyv_dev::field::SeriesQuantity;
 use geopyv_dev::mesh;
 
 use crate::{
@@ -21,6 +22,44 @@ use crate::{
     Error,
 };
 
+/// The [`SeriesQuantity`] `history()`/`trace()` name: ``"warps"`` /
+/// ``"strains"`` (column ``component``) or ``"vol_strains"``.
+fn series_quantity(quantity: &str, component: usize) -> PyResult<SeriesQuantity> {
+    match quantity {
+        "warps" => Ok(SeriesQuantity::Warp(component)),
+        "strains" => Ok(SeriesQuantity::Strain(component)),
+        "vol_strains" => Ok(SeriesQuantity::VolStrain),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "quantity must be one of ['strains', 'vol_strains', 'warps'], got {quantity:?}"
+        ))),
+    }
+}
+
+/// [`ParticleSolution::series_increments`] for the Python bindings.
+fn series_increments<'py>(
+    py: Python<'py>,
+    sol: &ParticleSolution,
+    quantity: &str,
+    component: usize,
+    mode: &str,
+    rate: bool,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let q = series_quantity(quantity, component)?;
+    let n_cols = match q {
+        SeriesQuantity::Warp(_) => sol.warps.ncols(),
+        SeriesQuantity::Strain(_) => sol.strains.ncols(),
+        SeriesQuantity::VolStrain => 1,
+    };
+    if !matches!(q, SeriesQuantity::VolStrain) && component >= n_cols {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "component {component} out of range for {n_cols} columns"
+        )));
+    }
+    let mode = crate::utils::parse_mode(mode)?;
+    let v = sol.series_increments(q, mode, rate)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(v.into_pyarray_bound(py))
+}
 
 // ---------------------------------------------------------------------------
 // ParticleSolution class
@@ -127,6 +166,28 @@ impl PyParticleSolution {
         arc_array2(py, &self.inner, |s| s.gamma_max_grad.as_ref().unwrap())
     }
 
+    /// Time of each row (image) in seconds ``(inc_no,)``, or ``None``.
+    #[getter]
+    fn time<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        Ok(self.inner.time.clone().map(|t| PyArray1::from_vec_bound(py, t)))
+    }
+
+    /// The change of ``quantity`` (column ``component``) into each row
+    /// ``k = 1..inc_no``: from row ``k - 1`` (``mode="sequential"``) or from
+    /// that row's reference image (``mode="leapfrog"``); with ``rate``,
+    /// divided by that time step (seconds).
+    #[pyo3(signature = (quantity="warps", component=0, mode="leapfrog", rate=false))]
+    fn series_increments<'py>(
+        &self,
+        py: Python<'py>,
+        quantity: &str,
+        component: usize,
+        mode: &str,
+        rate: bool,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        series_increments(py, &self.inner, quantity, component, mode, rate)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ParticleSolution(inc_no={}, warp_len={})",
@@ -158,14 +219,6 @@ impl PyParticleSolution {
 ///     Number of IRLS reweighting iterations. Default 5.
 /// tukey_c : float, optional
 ///     Tukey biweight tuning constant. Default 4.685.
-/// zone_aware : bool, optional
-///     When ``True`` and the source mesh was solved with
-///     ``solver_options={"masking": "zonal"}``, restrict the meshless
-///     neighbourhood to nodes sharing the query point's own zone -- the
-///     same exclusion principle zonal masking applies to a subset's own
-///     pixels, applied instead to which neighbour subsets a particle's
-///     meshless fit may draw on. A graceful no-op (identical to ``False``)
-///     when the mesh has no zonal record at all. Default ``False``.
 #[pyclass(name = "MeshlessParams")]
 #[derive(Clone)]
 pub struct PyMeshlessParams {
@@ -175,14 +228,13 @@ pub struct PyMeshlessParams {
 #[pymethods]
 impl PyMeshlessParams {
     #[new]
-    #[pyo3(signature = (radius, quality_gate=None, min_neighbours=6, max_iterations=5, tukey_c=4.685, zone_aware=false))]
+    #[pyo3(signature = (radius, quality_gate=None, min_neighbours=6, max_iterations=5, tukey_c=4.685))]
     fn new(
         radius: f64,
         quality_gate: Option<f64>,
         min_neighbours: usize,
         max_iterations: usize,
         tukey_c: f64,
-        zone_aware: bool,
     ) -> Self {
         Self {
             inner: particle::MeshlessParams {
@@ -191,7 +243,6 @@ impl PyMeshlessParams {
                 min_neighbours,
                 max_iterations,
                 tukey_c,
-                zone_aware,
             },
         }
     }
@@ -206,8 +257,6 @@ impl PyMeshlessParams {
     fn max_iterations(&self) -> usize { self.inner.max_iterations }
     #[getter]
     fn tukey_c(&self) -> f64 { self.inner.tukey_c }
-    #[getter]
-    fn zone_aware(&self) -> bool { self.inner.zone_aware }
 
     fn __repr__(&self) -> String {
         format!(
@@ -464,6 +513,28 @@ impl PyParticle {
             ));
         }
         arc_array2(py, sol, |s| s.gamma_max_grad.as_ref().unwrap())
+    }
+
+    /// Time of each row (image) in seconds ``(inc_no,)``, or ``None``.
+    #[getter]
+    fn time<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        Ok(self.require_solved()?.time.clone().map(|t| PyArray1::from_vec_bound(py, t)))
+    }
+
+    /// The change of ``quantity`` (column ``component``) into each row
+    /// ``k = 1..inc_no``: from row ``k - 1`` (``mode="sequential"``) or from
+    /// that row's reference image (``mode="leapfrog"``); with ``rate``,
+    /// divided by that time step (seconds).
+    #[pyo3(signature = (quantity="warps", component=0, mode="leapfrog", rate=false))]
+    fn series_increments<'py>(
+        &self,
+        py: Python<'py>,
+        quantity: &str,
+        component: usize,
+        mode: &str,
+        rate: bool,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        series_increments(py, self.require_solved()?, quantity, component, mode, rate)
     }
 
     fn __repr__(&self) -> String {

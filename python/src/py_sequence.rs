@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ndarray::{Array1, Array2};
-use numpy::IntoPyArray;
+use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -27,7 +27,6 @@ use crate::{
     py_image::PyImage,
     py_mesh::PyMesh,
     py_mask::PyMask,
-    py_particle::PyMeshlessParams,
     Error,
 };
 
@@ -121,7 +120,7 @@ pub struct PySequence {
 impl PySequence {
     #[new]
     #[pyo3(signature = (image_dir, boundary, target_nodes,
-                         size=(1.0, 1000.0), exclusions=None, mesh_order=2))]
+                         size=(1.0, 1000.0), exclusions=None, mesh_order=2, time=None))]
     fn new(
         image_dir: &str,
         boundary: &Bound<'_, PyAny>,
@@ -129,7 +128,9 @@ impl PySequence {
         size: (f64, f64),
         exclusions: Option<Vec<Bound<'_, PyAny>>>,
         mesh_order: u8,
+        time: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let time = crate::utils::extract_time_input(time)?;
         let boundary_region = extract_region_full(boundary)?;
         let excl_list = exclusions.unwrap_or_default();
         let excl_regions: Vec<geopyv_dev::geometry::region::Region> = excl_list
@@ -143,8 +144,9 @@ impl PySequence {
             target_nodes,
             mesh_order,
         };
-        let seq = Sequence::from_dir(std::path::Path::new(image_dir), mesh_cfg)
+        let mut seq = Sequence::from_dir(std::path::Path::new(image_dir), mesh_cfg)
             .map_err(Error::from)?;
+        seq.set_time(time.as_ref()).map_err(Error::from)?;
         let boundary_obj = Some(boundary.clone().unbind());
         let exclusion_objs = excl_list.iter().map(|o| o.clone().unbind()).collect();
         Ok(PySequence { inner: seq, boundary_obj, exclusion_objs })
@@ -182,27 +184,14 @@ impl PySequence {
     ///     ``"layer-RG"`` (layer-parallel; see
     ///     `geopyv_dev_fresh/layer_rg_plan.md`).
     /// masking : str, optional
-    ///     The ``masking`` axis, forwarded to every pair's `Mesh.solve`
-    ///     unchanged -- ``"uniform"`` (default) or ``"zonal"``. See
-    ///     `Mesh.solve`'s own docstring and
-    ///     `geopyv_dev_fresh/solver_options_restructure.md` §4's Stage B.
-    ///     `Sequence::solve`'s per-pair loop needed no structural change to
-    ///     support this -- it already calls `mesh.solve` once per pair.
-    /// zonal_k, zonal_smoothing_sigma, zonal_meshless_params, zonal_iterations
-    ///     : optional. Same meaning as on `Mesh.solve`; ``masking="zonal"``
-    ///     only (``ValueError`` with ``masking="uniform"``). There is no
-    ///     ``zonal_zone_map`` here: one caller-supplied map has no sensible
-    ///     meaning across a sequence of increments.
+    ///     ``"uniform"`` (default), the only option: zonal masking has been
+    ///     removed. Anything else raises ``ValueError``.
     #[pyo3(signature = (local_mask=None, seed_coord=None, seed_warp=None,
                          max_norm=1e-5, max_iterations=50, subset_order=2,
                          tolerance=0.75, seed_tolerance=0.9, method="icgn",
                          options=None, border=20, save=None,
                          preconditioning="RG",
                          masking="uniform",
-                         zonal_k=None,
-                         zonal_smoothing_sigma=None,
-                         zonal_meshless_params=None,
-                         zonal_iterations=None,
                          layer_rg_batch_factor=4,
                          layer_rg_root_rel_eps=0.02,
                          layer_rg_max_workers=None))]
@@ -224,10 +213,6 @@ impl PySequence {
         save: Option<&str>,
         preconditioning: &str,
         masking: &str,
-        zonal_k: Option<f64>,
-        zonal_smoothing_sigma: Option<f64>,
-        zonal_meshless_params: Option<PyRef<'_, PyMeshlessParams>>,
-        zonal_iterations: Option<usize>,
         layer_rg_batch_factor: usize,
         layer_rg_root_rel_eps: f64,
         layer_rg_max_workers: Option<usize>,
@@ -261,14 +246,7 @@ impl PySequence {
             root_rel_eps: layer_rg_root_rel_eps,
             max_workers: layer_rg_max_workers,
         };
-        let masking = crate::py_mesh::masking_from_py(
-            masking,
-            zonal_k,
-            zonal_smoothing_sigma,
-            zonal_meshless_params.map(|p| p.inner.clone()),
-            zonal_iterations,
-            None,
-        )?;
+        crate::py_mesh::check_masking(masking)?;
         let tmpl = local_mask
             .extract::<PyRef<'_, PyMask>>()
             .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
@@ -291,7 +269,6 @@ impl PySequence {
                 override_active: false,
                 preconditioning,
                 layer_rg,
-                masking,
                 ..Default::default()
             },
             local_mask,
@@ -348,6 +325,43 @@ impl PySequence {
         let sol = self.require_solved()?;
         let ms = sol.load_mesh_at(idx).map_err(Error::from)?;
         Py::new(py, PyMesh::from_solution(py, ms)?)
+    }
+
+    /// Pair ``mesh_index``'s nodal displacement increment ``(N, 2)`` and its
+    /// time step in seconds (``None`` without times), at that pair's nodes.
+    ///
+    /// ``mode="leapfrog"``: from the pair's reference image (its solved
+    /// displacements; ``dt = g_time - f_time``). ``mode="sequential"``: from
+    /// the previous target image (``u_m - u_{m-1}`` while the reference is
+    /// unchanged; ``dt = t_{m+1} - t_m``).
+    #[pyo3(signature = (mesh_index, mode="leapfrog"))]
+    fn increment_displacements<'py>(
+        &self,
+        py: Python<'py>,
+        mesh_index: usize,
+        mode: &str,
+    ) -> PyResult<(Bound<'py, PyArray2<f64>>, Option<f64>)> {
+        let mode = crate::utils::parse_mode(mode)?;
+        let sol = self.require_solved()?;
+        let (_, disp, dt) = sol.increment_displacements(mesh_index, mode).map_err(Error::from)?;
+        Ok((disp.into_pyarray_bound(py), dt))
+    }
+
+    /// Time of each image in seconds (``(n_images,)``), or ``None`` — from
+    /// ``time=`` or the image file names. Image ``k`` is Field row ``k``.
+    #[getter]
+    fn time<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        let t = self.inner.solution().and_then(|s| s.time.clone()).or_else(|| self.inner.time.clone());
+        t.map(|t| PyArray1::from_vec_bound(py, t))
+    }
+
+    /// Where ``time`` came from: ``"given"``, ``"filename (<format>)"`` or ``"none"``.
+    #[getter]
+    fn time_source(&self) -> String {
+        match self.inner.solution() {
+            Some(s) => s.time_source.describe(),
+            None => self.inner.time_source.describe(),
+        }
     }
 
     /// Per-pair C_ZNCC arrays without loading images.

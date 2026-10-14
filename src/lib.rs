@@ -9,6 +9,7 @@ pub mod progress;
 pub mod field;
 pub mod sequence;
 pub mod subset;
+pub mod timing;
 pub mod masks;
 pub mod speckle;
 pub mod validation;

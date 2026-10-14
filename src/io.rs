@@ -10,13 +10,14 @@
 //! [0..4]   magic  b"GPYV"
 //! [4]      version  0x01 (uncompressed, schema v0) | 0x02 (zstd, schema v0)
 //!                    | 0x03 (zstd, schema v1) | 0x07 (zstd, schema v2)
-//!                    | 0x08 (zstd, schema v3 — current)
+//!                    | 0x08 (zstd, schema v3) | 0x09 (zstd, schema v4)
+//!                    | 0x0A (zstd, schema v5 — current)
 //! [5..]    bincode v2 (standard config) encoded GeopyvObject (schema-version-
 //!          dependent shape — see "Schema versioning" below), zstd-compressed
 //!          (level 3) for every version except 0x01
 //! ```
 //!
-//! New files are always written with version 0x08 (zstd + current schema).
+//! New files are always written with version 0x0A (zstd + current schema).
 //! Bytes 0x04-0x06 were used only by unreleased development builds and are
 //! deliberately rejected as unsupported.
 //!
@@ -64,8 +65,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     calibration::CalibrationSolution,
-    field::FieldSolution,
+    field::{FieldRegion, FieldSolution},
     geometry::region::Region,
+    masks::MaskShape,
     mesh::{MeshSolution, SeedConfig, SolveConfig, SolveMethod},
     particle::{principal_strains, ParticleConfig, ParticleSolution, StrainMethod},
     sequence::{SequenceOptions, SequenceSolution},
@@ -96,9 +98,18 @@ const VERSION_ZSTD_V1: u8 = 0x03;
 /// `speckle_limit`. Still readable on load, but no longer written. (0x04-0x06
 /// skipped: used by unreleased development builds with incompatible shapes.)
 const VERSION_ZSTD_V2: u8 = 0x07;
-/// zstd-compressed, schema v3 (current). Relative to v2: `FieldSolution`
-/// gains `region`. Always written by [`save`].
-const CURRENT_VERSION: u8 = 0x08;
+/// zstd-compressed, schema v3. Relative to v2: `FieldSolution` gains
+/// `region`. Still readable on load, but no longer written.
+const VERSION_ZSTD_V3: u8 = 0x08;
+/// zstd-compressed, schema v4. Relative to v3: `SubsetSolution`,
+/// `MeshSolution`, `SequenceSolution` (+ `time_source`), `ParticleSolution`
+/// and `FieldSolution` gain `time`. Still readable on load, but no longer
+/// written.
+const VERSION_ZSTD_V4: u8 = 0x09;
+/// zstd-compressed, schema v5 (current). Relative to v4: `MeshSolution`
+/// loses `zonal_masking` (zonal masking removed; a stored record is dropped
+/// on load). Always written by [`save`].
+const CURRENT_VERSION: u8 = 0x0A;
 
 // ---------------------------------------------------------------------------
 // Tagged union for all serialisable object types
@@ -190,6 +201,7 @@ impl From<LegacySubsetSolution> for SubsetSolution {
             std_dev: l.std_dev,
             sssig: l.sssig,
             delta_f: l.delta_f,
+            time: None,
         }
     }
 }
@@ -239,7 +251,7 @@ impl From<LegacyMeshSolution> for MeshSolution {
             seed: None,
             template_shape: None,
             template_sizes: None,
-            zonal_masking: None,
+            time: None,
         }
     }
 }
@@ -282,6 +294,8 @@ impl From<LegacySequenceSolution> for SequenceSolution {
             exclusion_regions: l.exclusion_regions,
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         }
     }
 }
@@ -319,6 +333,7 @@ impl From<LegacyParticleSolution> for ParticleSolution {
             config: None,
             principal_strains: Some(principal),
             gamma_max_grad: None,
+            time: None,
         }
     }
 }
@@ -349,6 +364,7 @@ impl From<LegacyFieldSolution> for FieldSolution {
             depth: 0.0,
             track: false,
             region: None,
+            time: None,
         }
     }
 }
@@ -436,6 +452,7 @@ impl From<LegacySubsetSolutionV1> for SubsetSolution {
             std_dev: l.std_dev,
             sssig: l.sssig,
             delta_f: l.delta_f,
+            time: None,
         }
     }
 }
@@ -514,7 +531,7 @@ impl From<LegacyMeshSolutionV1> for MeshSolution {
             seed: l.seed,
             template_shape: None,
             template_sizes: None,
-            zonal_masking: None,
+            time: None,
         }
     }
 }
@@ -559,6 +576,8 @@ impl From<LegacySequenceSolutionV1> for SequenceSolution {
             exclusion_regions: l.exclusion_regions,
             options: l.options,
             border: l.border,
+            time: None,
+            time_source: Default::default(),
         }
     }
 }
@@ -610,6 +629,7 @@ impl From<LegacyParticleSolutionV1> for ParticleSolution {
             calibrated: l.calibrated,
             config: l.config.map(Into::into),
             gamma_max_grad: None,
+            time: None,
         }
     }
 }
@@ -644,6 +664,7 @@ impl From<LegacyFieldSolutionV1> for FieldSolution {
             depth: l.depth,
             track: l.track,
             region: None,
+            time: None,
         }
     }
 }
@@ -745,12 +766,12 @@ impl From<LegacyGeopyvObject> for GeopyvObject {
 // Legacy shapes (schema v2 — the 0x07 format). Frozen: do not edit these to
 // match future changes — freeze a new `Legacy*V3` set instead and chain it
 // in `load`. Only `FieldSolution` changed in v3; every other variant reuses
-// the current type.
+// the v3 shape.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyFieldSolutionV2 {
-    particles: Vec<Arc<ParticleSolution>>,
+    particles: Vec<Arc<LegacyParticleSolutionV3>>,
     initial_coordinates: ndarray::Array2<f64>,
     vol_totals: ndarray::Array1<f64>,
     reference_update_register: Vec<usize>,
@@ -767,7 +788,7 @@ struct LegacyFieldSolutionV2 {
 impl From<LegacyFieldSolutionV2> for FieldSolution {
     fn from(l: LegacyFieldSolutionV2) -> Self {
         FieldSolution {
-            particles: l.particles,
+            particles: l.particles.into_iter().map(arc_into).collect(),
             initial_coordinates: l.initial_coordinates,
             vol_totals: l.vol_totals,
             reference_update_register: l.reference_update_register,
@@ -776,17 +797,18 @@ impl From<LegacyFieldSolutionV2> for FieldSolution {
             depth: l.depth,
             track: l.track,
             region: None,
+            time: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum LegacyGeopyvObjectV2 {
-    Subset(SubsetSolution),
-    Mesh(MeshSolution),
+    Subset(LegacySubsetSolutionV3),
+    Mesh(LegacyMeshSolutionV3),
     Field(LegacyFieldSolutionV2),
-    Sequence(SequenceSolution),
-    Particle(ParticleSolution),
+    Sequence(LegacySequenceSolutionV3),
+    Particle(LegacyParticleSolutionV3),
     Speckle(Speckle),
     Calibration(CalibrationSolution),
 }
@@ -794,13 +816,381 @@ enum LegacyGeopyvObjectV2 {
 impl From<LegacyGeopyvObjectV2> for GeopyvObject {
     fn from(l: LegacyGeopyvObjectV2) -> Self {
         match l {
-            LegacyGeopyvObjectV2::Subset(s) => GeopyvObject::Subset(s),
-            LegacyGeopyvObjectV2::Mesh(m) => GeopyvObject::Mesh(m),
+            LegacyGeopyvObjectV2::Subset(s) => GeopyvObject::Subset(s.into()),
+            LegacyGeopyvObjectV2::Mesh(m) => GeopyvObject::Mesh(m.into()),
             LegacyGeopyvObjectV2::Field(f) => GeopyvObject::Field(f.into()),
-            LegacyGeopyvObjectV2::Sequence(s) => GeopyvObject::Sequence(s),
-            LegacyGeopyvObjectV2::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV2::Sequence(s) => GeopyvObject::Sequence(s.into()),
+            LegacyGeopyvObjectV2::Particle(p) => GeopyvObject::Particle(p.into()),
             LegacyGeopyvObjectV2::Speckle(s) => GeopyvObject::Speckle(s),
             LegacyGeopyvObjectV2::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v3 — the 0x08 format). Frozen: do not edit these to
+// match future changes — freeze a new `Legacy*V4` set instead and chain it
+// in `load`. v4 added `time` to every solution type (and `time_source` to
+// `SequenceSolution`).
+// ---------------------------------------------------------------------------
+
+fn arc_into<L: Clone + Into<T>, T>(l: Arc<L>) -> Arc<T> {
+    Arc::new(Arc::unwrap_or_clone(l).into())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySubsetSolutionV3 {
+    coord: [f64; 2],
+    mask: MaskSummary,
+    ref_image: PathBuf,
+    target_image: PathBuf,
+    result: SolveResult,
+    std_dev: f64,
+    sssig: f64,
+    delta_f: f64,
+}
+
+impl From<LegacySubsetSolutionV3> for SubsetSolution {
+    fn from(l: LegacySubsetSolutionV3) -> Self {
+        SubsetSolution {
+            coord: l.coord,
+            mask: l.mask,
+            ref_image: l.ref_image,
+            target_image: l.target_image,
+            result: l.result,
+            std_dev: l.std_dev,
+            sssig: l.sssig,
+            delta_f: l.delta_f,
+            time: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMeshSolutionV3 {
+    nodes: ndarray::Array2<f64>,
+    elements: ndarray::Array2<usize>,
+    boundary: Vec<usize>,
+    exclusions: Vec<Vec<usize>>,
+    centroids: ndarray::Array2<f64>,
+    areas: ndarray::Array1<f64>,
+    warps: ndarray::Array2<f64>,
+    displacements: ndarray::Array2<f64>,
+    c_zncc: ndarray::Array1<f64>,
+    p: ndarray::Array2<f64>,
+    seed_node: usize,
+    mesh_order: u8,
+    subset_order: u8,
+    iterations: ndarray::Array1<u32>,
+    norms: ndarray::Array1<f64>,
+    f_img_path: PathBuf,
+    g_img_path: PathBuf,
+    solve_config: Option<SolveConfig>,
+    seed: Option<SeedConfig>,
+    template_shape: Option<MaskShape>,
+    template_sizes: Option<ndarray::Array1<u32>>,
+    zonal_masking: Option<LegacyZonalMaskingRecord>,
+}
+
+impl From<LegacyMeshSolutionV3> for MeshSolution {
+    fn from(l: LegacyMeshSolutionV3) -> Self {
+        MeshSolution {
+            nodes: l.nodes,
+            elements: l.elements,
+            boundary: l.boundary,
+            exclusions: l.exclusions,
+            centroids: l.centroids,
+            areas: l.areas,
+            warps: l.warps,
+            displacements: l.displacements,
+            c_zncc: l.c_zncc,
+            p: l.p,
+            seed_node: l.seed_node,
+            mesh_order: l.mesh_order,
+            subset_order: l.subset_order,
+            iterations: l.iterations,
+            norms: l.norms,
+            f_img_path: l.f_img_path,
+            g_img_path: l.g_img_path,
+            solve_config: l.solve_config,
+            seed: l.seed,
+            template_shape: l.template_shape,
+            template_sizes: l.template_sizes,
+            time: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySequenceSolutionV3 {
+    mesh_solutions: Vec<Arc<LegacyMeshSolutionV3>>,
+    mesh_paths: Vec<PathBuf>,
+    all_converged: bool,
+    unsolvable: bool,
+    override_log: Vec<usize>,
+    reference_updates: Vec<bool>,
+    mesh_order: u8,
+    first_f_img_path: Option<PathBuf>,
+    boundary_region: Region,
+    exclusion_regions: Vec<Region>,
+    options: Option<SequenceOptions>,
+    border: usize,
+}
+
+impl From<LegacySequenceSolutionV3> for SequenceSolution {
+    fn from(l: LegacySequenceSolutionV3) -> Self {
+        SequenceSolution {
+            mesh_solutions: l.mesh_solutions.into_iter().map(arc_into).collect(),
+            mesh_paths: l.mesh_paths,
+            all_converged: l.all_converged,
+            unsolvable: l.unsolvable,
+            override_log: l.override_log,
+            reference_updates: l.reference_updates,
+            mesh_order: l.mesh_order,
+            first_f_img_path: l.first_f_img_path,
+            boundary_region: l.boundary_region,
+            exclusion_regions: l.exclusion_regions,
+            options: l.options,
+            border: l.border,
+            time: None,
+            time_source: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyParticleSolutionV3 {
+    coordinates: ndarray::Array2<f64>,
+    warps: ndarray::Array2<f64>,
+    incs: ndarray::Array2<f64>,
+    volumes: ndarray::Array1<f64>,
+    strains: ndarray::Array2<f64>,
+    strain_incs: ndarray::Array2<f64>,
+    vol_strains: ndarray::Array1<f64>,
+    reference_update_register: Vec<usize>,
+    image_0_path: Option<PathBuf>,
+    calibrated: bool,
+    config: Option<ParticleConfig>,
+    principal_strains: Option<ndarray::Array2<f64>>,
+    gamma_max_grad: Option<ndarray::Array2<f64>>,
+}
+
+impl From<LegacyParticleSolutionV3> for ParticleSolution {
+    fn from(l: LegacyParticleSolutionV3) -> Self {
+        ParticleSolution {
+            coordinates: l.coordinates,
+            warps: l.warps,
+            incs: l.incs,
+            volumes: l.volumes,
+            strains: l.strains,
+            strain_incs: l.strain_incs,
+            vol_strains: l.vol_strains,
+            reference_update_register: l.reference_update_register,
+            image_0_path: l.image_0_path,
+            calibrated: l.calibrated,
+            config: l.config,
+            principal_strains: l.principal_strains,
+            gamma_max_grad: l.gamma_max_grad,
+            time: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyFieldSolutionV3 {
+    particles: Vec<Arc<LegacyParticleSolutionV3>>,
+    initial_coordinates: ndarray::Array2<f64>,
+    vol_totals: ndarray::Array1<f64>,
+    reference_update_register: Vec<usize>,
+    image_0_path: Option<PathBuf>,
+    calibrated: bool,
+    depth: f64,
+    track: bool,
+    region: Option<FieldRegion>,
+}
+
+impl From<LegacyFieldSolutionV3> for FieldSolution {
+    fn from(l: LegacyFieldSolutionV3) -> Self {
+        FieldSolution {
+            particles: l.particles.into_iter().map(arc_into).collect(),
+            initial_coordinates: l.initial_coordinates,
+            vol_totals: l.vol_totals,
+            reference_update_register: l.reference_update_register,
+            image_0_path: l.image_0_path,
+            calibrated: l.calibrated,
+            depth: l.depth,
+            track: l.track,
+            region: l.region,
+            time: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV3 {
+    Subset(LegacySubsetSolutionV3),
+    Mesh(LegacyMeshSolutionV3),
+    Field(LegacyFieldSolutionV3),
+    Sequence(LegacySequenceSolutionV3),
+    Particle(LegacyParticleSolutionV3),
+    Speckle(Speckle),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV3> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV3) -> Self {
+        match l {
+            LegacyGeopyvObjectV3::Subset(s) => GeopyvObject::Subset(s.into()),
+            LegacyGeopyvObjectV3::Mesh(m) => GeopyvObject::Mesh(m.into()),
+            LegacyGeopyvObjectV3::Field(f) => GeopyvObject::Field(f.into()),
+            LegacyGeopyvObjectV3::Sequence(s) => GeopyvObject::Sequence(s.into()),
+            LegacyGeopyvObjectV3::Particle(p) => GeopyvObject::Particle(p.into()),
+            LegacyGeopyvObjectV3::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV3::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v4 — the 0x09 format). Frozen: do not edit these to
+// match future changes — freeze a new `Legacy*V5` set instead and chain it
+// in `load`. v5 removed `MeshSolution::zonal_masking` (zonal masking was
+// removed); the record is read and dropped. `LegacyZonalMaskingRecord` is
+// that record's shape from v2 (0x07) to v4.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyZonalMaskingRecord {
+    node_gamma_max: ndarray::Array1<f64>,
+    node_gamma_max_grad: ndarray::Array1<f64>,
+    node_boundary: Vec<bool>,
+    node_zone: ndarray::Array1<u32>,
+    node_pre_px: ndarray::Array1<u32>,
+    node_post_px: ndarray::Array1<u32>,
+    node_guard_fallback: Vec<bool>,
+    k: f64,
+    grad_median: f64,
+    grad_mad: f64,
+    grad_cutoff: f64,
+    zone_image: ndarray::Array2<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMeshSolutionV4 {
+    nodes: ndarray::Array2<f64>,
+    elements: ndarray::Array2<usize>,
+    boundary: Vec<usize>,
+    exclusions: Vec<Vec<usize>>,
+    centroids: ndarray::Array2<f64>,
+    areas: ndarray::Array1<f64>,
+    warps: ndarray::Array2<f64>,
+    displacements: ndarray::Array2<f64>,
+    c_zncc: ndarray::Array1<f64>,
+    p: ndarray::Array2<f64>,
+    seed_node: usize,
+    mesh_order: u8,
+    subset_order: u8,
+    iterations: ndarray::Array1<u32>,
+    norms: ndarray::Array1<f64>,
+    f_img_path: PathBuf,
+    g_img_path: PathBuf,
+    solve_config: Option<SolveConfig>,
+    seed: Option<SeedConfig>,
+    template_shape: Option<MaskShape>,
+    template_sizes: Option<ndarray::Array1<u32>>,
+    zonal_masking: Option<LegacyZonalMaskingRecord>,
+    time: Option<(f64, f64)>,
+}
+
+impl From<LegacyMeshSolutionV4> for MeshSolution {
+    fn from(l: LegacyMeshSolutionV4) -> Self {
+        MeshSolution {
+            nodes: l.nodes,
+            elements: l.elements,
+            boundary: l.boundary,
+            exclusions: l.exclusions,
+            centroids: l.centroids,
+            areas: l.areas,
+            warps: l.warps,
+            displacements: l.displacements,
+            c_zncc: l.c_zncc,
+            p: l.p,
+            seed_node: l.seed_node,
+            mesh_order: l.mesh_order,
+            subset_order: l.subset_order,
+            iterations: l.iterations,
+            norms: l.norms,
+            f_img_path: l.f_img_path,
+            g_img_path: l.g_img_path,
+            solve_config: l.solve_config,
+            seed: l.seed,
+            template_shape: l.template_shape,
+            template_sizes: l.template_sizes,
+            time: l.time,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySequenceSolutionV4 {
+    mesh_solutions: Vec<Arc<LegacyMeshSolutionV4>>,
+    mesh_paths: Vec<PathBuf>,
+    all_converged: bool,
+    unsolvable: bool,
+    override_log: Vec<usize>,
+    reference_updates: Vec<bool>,
+    mesh_order: u8,
+    first_f_img_path: Option<PathBuf>,
+    boundary_region: Region,
+    exclusion_regions: Vec<Region>,
+    options: Option<SequenceOptions>,
+    border: usize,
+    time: Option<Vec<f64>>,
+    time_source: crate::timing::TimeSource,
+}
+
+impl From<LegacySequenceSolutionV4> for SequenceSolution {
+    fn from(l: LegacySequenceSolutionV4) -> Self {
+        SequenceSolution {
+            mesh_solutions: l.mesh_solutions.into_iter().map(arc_into).collect(),
+            mesh_paths: l.mesh_paths,
+            all_converged: l.all_converged,
+            unsolvable: l.unsolvable,
+            override_log: l.override_log,
+            reference_updates: l.reference_updates,
+            mesh_order: l.mesh_order,
+            first_f_img_path: l.first_f_img_path,
+            boundary_region: l.boundary_region,
+            exclusion_regions: l.exclusion_regions,
+            options: l.options,
+            border: l.border,
+            time: l.time,
+            time_source: l.time_source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV4 {
+    Subset(SubsetSolution),
+    Mesh(LegacyMeshSolutionV4),
+    Field(FieldSolution),
+    Sequence(LegacySequenceSolutionV4),
+    Particle(ParticleSolution),
+    Speckle(Speckle),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV4> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV4) -> Self {
+        match l {
+            LegacyGeopyvObjectV4::Subset(s) => GeopyvObject::Subset(s),
+            LegacyGeopyvObjectV4::Mesh(m) => GeopyvObject::Mesh(m.into()),
+            LegacyGeopyvObjectV4::Field(f) => GeopyvObject::Field(f),
+            LegacyGeopyvObjectV4::Sequence(s) => GeopyvObject::Sequence(s.into()),
+            LegacyGeopyvObjectV4::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV4::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV4::Calibration(c) => GeopyvObject::Calibration(c),
         }
     }
 }
@@ -833,7 +1223,7 @@ pub fn save<P: AsRef<Path>>(path: P, object: &GeopyvObject) -> Result<(), Error>
 /// Returns [`Error::UnsupportedVersion`] for any unrecognised version byte.
 ///
 /// Files with version `0x01`/`0x02` (schema v0), `0x03` (schema v1, the
-/// released package's format) or `0x07` (schema v2) are decoded via the frozen `Legacy*` /
+/// released package's format), `0x07` (schema v2), `0x08` (schema v3) or `0x09` (schema v4) are decoded via the frozen `Legacy*` /
 /// `Legacy*V1` types and migrated into the current shapes — see "Schema
 /// versioning" in the module docs.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
@@ -855,7 +1245,8 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
 
     let data = match ver_buf[0] {
         VERSION_UNCOMPRESSED => raw,
-        VERSION_ZSTD_V0 | VERSION_ZSTD_V1 | VERSION_ZSTD_V2 | CURRENT_VERSION => {
+        VERSION_ZSTD_V0 | VERSION_ZSTD_V1 | VERSION_ZSTD_V2 | VERSION_ZSTD_V3 | VERSION_ZSTD_V4
+        | CURRENT_VERSION => {
             zstd::decode_all(raw.as_slice()).map_err(|e| Error::Io(e.to_string()))?
         }
         v => return Err(Error::UnsupportedVersion(v)),
@@ -870,6 +1261,24 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
                 )
                 .map_err(|e| Error::Io(e.to_string()))?;
             Ok(object)
+        }
+        VERSION_ZSTD_V4 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV4, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V3 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV3, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
         }
         VERSION_ZSTD_V2 => {
             let (legacy, _) =
@@ -959,7 +1368,7 @@ mod tests {
             }),
             template_shape: Some(crate::masks::MaskShape::Circle),
             template_sizes: Some(ndarray::array![8u32, 8, 8]),
-            zonal_masking: None,
+            time: None,
         }
     }
 
@@ -987,49 +1396,65 @@ mod tests {
                 assert_eq!(seed.coord, original.seed.as_ref().unwrap().coord);
                 assert_eq!(m.template_shape, original.template_shape);
                 assert_eq!(m.template_sizes, original.template_sizes);
-                assert!(m.zonal_masking.is_none());
             }
             _ => panic!("expected Mesh variant"),
         }
         let _ = std::fs::remove_file(tmp);
     }
 
-    /// A populated `ZonalMaskingRecord` survives save/load at schema v3.
+    /// A schema v4 (0x09) mesh file carrying a zonal-masking record loads,
+    /// with the record dropped and everything else (incl. `time`) kept.
     #[test]
-    fn test_zonal_masking_record_round_trips() {
-        use crate::mesh::ZonalMaskingRecord;
-        let mut original = make_mesh_solution();
+    fn test_schema_v4_zonal_mesh_file_loads_without_record() {
+        let m = make_mesh_solution();
         let mut zone_image = ndarray::Array2::<u8>::ones((6, 8));
         zone_image.slice_mut(ndarray::s![.., 4..]).fill(2);
-        original.zonal_masking = Some(ZonalMaskingRecord {
-            node_gamma_max: array![0.01_f64, 0.4, 0.02],
-            node_gamma_max_grad: array![0.002_f64, 0.05, 0.003],
-            node_boundary: vec![false, true, false],
-            node_zone: array![1_u32, 2, 1],
-            node_pre_px: array![120_u32, 120, 120],
-            node_post_px: array![118_u32, 61, 119],
-            node_guard_fallback: vec![false, false, true],
-            k: 2.0,
-            grad_median: 0.003,
-            grad_mad: 0.001,
-            grad_cutoff: 0.003 + 2.0 * 1.4826 * 0.001,
-            zone_image: zone_image.clone(),
+        let legacy = LegacyGeopyvObjectV4::Mesh(LegacyMeshSolutionV4 {
+            nodes: m.nodes.clone(),
+            elements: m.elements.clone(),
+            boundary: m.boundary.clone(),
+            exclusions: m.exclusions.clone(),
+            centroids: m.centroids.clone(),
+            areas: m.areas.clone(),
+            warps: m.warps.clone(),
+            displacements: m.displacements.clone(),
+            c_zncc: m.c_zncc.clone(),
+            p: m.p.clone(),
+            seed_node: m.seed_node,
+            mesh_order: m.mesh_order,
+            subset_order: m.subset_order,
+            iterations: m.iterations.clone(),
+            norms: m.norms.clone(),
+            f_img_path: m.f_img_path.clone(),
+            g_img_path: m.g_img_path.clone(),
+            solve_config: m.solve_config.clone(),
+            seed: m.seed.clone(),
+            template_shape: m.template_shape.clone(),
+            template_sizes: m.template_sizes.clone(),
+            zonal_masking: Some(LegacyZonalMaskingRecord {
+                node_gamma_max: array![0.01_f64, 0.4, 0.02],
+                node_gamma_max_grad: array![0.002_f64, 0.05, 0.003],
+                node_boundary: vec![false, true, false],
+                node_zone: array![1_u32, 2, 1],
+                node_pre_px: array![120_u32, 120, 120],
+                node_post_px: array![118_u32, 61, 119],
+                node_guard_fallback: vec![false, false, true],
+                k: 2.0,
+                grad_median: 0.003,
+                grad_mad: 0.001,
+                grad_cutoff: 0.003 + 2.0 * 1.4826 * 0.001,
+                zone_image,
+            }),
+            time: Some((0.0, 0.5)),
         });
-        let tmp = std::env::temp_dir().join("geopyv_test_zonal_record.pyv");
-        save(&tmp, &GeopyvObject::Mesh(original.clone())).unwrap();
-        let loaded = load(&tmp).unwrap();
-        match loaded {
-            GeopyvObject::Mesh(m) => {
-                let rec = m.zonal_masking.as_ref().expect("zonal record round-trips");
-                assert_eq!(rec.node_boundary, vec![false, true, false]);
-                assert_eq!(rec.node_gamma_max_grad, array![0.002_f64, 0.05, 0.003]);
-                assert_eq!(rec.node_zone, array![1_u32, 2, 1]);
-                assert_eq!(rec.node_post_px, array![118_u32, 61, 119]);
-                assert_eq!(rec.node_guard_fallback, vec![false, false, true]);
-                assert_eq!(rec.zone_image, zone_image);
-                assert!((rec.k - 2.0).abs() < 1e-15);
+        let tmp = write_versioned("geopyv_test_v4_zonal_mesh.pyv", VERSION_ZSTD_V4, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => {
+                assert_eq!(l.displacements, m.displacements);
+                assert_eq!(l.template_sizes, m.template_sizes);
+                assert_eq!(l.time, Some((0.0, 0.5)));
             }
-            _ => panic!("expected Mesh variant"),
+            _ => panic!("expected Mesh"),
         }
         let _ = std::fs::remove_file(tmp);
     }
@@ -1089,7 +1514,6 @@ mod tests {
                 assert_eq!(m.boundary, vec![0, 1, 2]);
                 assert!(m.template_shape.is_none());
                 assert!(m.template_sizes.is_none());
-                assert!(m.zonal_masking.is_none());
                 assert_eq!(m.seed.as_ref().unwrap().coord, [0.5, 0.5]);
                 let cfg = m.solve_config.as_ref().unwrap();
                 assert!(matches!(cfg.method, SolveMethod::Fagn));
@@ -1122,6 +1546,8 @@ mod tests {
                 override_: false,
             }),
             border: 20,
+            time: None,
+            time_source: Default::default(),
         };
         let tmp = std::env::temp_dir().join("geopyv_test_seq.pyv");
         save(&tmp, &GeopyvObject::Sequence(sol.clone())).unwrap();
@@ -1217,6 +1643,7 @@ mod tests {
             config: None,
             principal_strains: Some(Array2::zeros((2, 4))),
             gamma_max_grad: None,
+            time: None,
         }
     }
 
@@ -1237,6 +1664,7 @@ mod tests {
             depth: 1.0,
             track: true,
             region: Some(region.clone()),
+            time: None,
         };
         let tmp = std::env::temp_dir().join("geopyv_test_field_region.pyv");
         save(&tmp, &GeopyvObject::Field(sol)).unwrap();
@@ -1255,7 +1683,7 @@ mod tests {
     #[test]
     fn test_schema_v2_field_file_loads_via_legacy_path() {
         let legacy = LegacyGeopyvObjectV2::Field(LegacyFieldSolutionV2 {
-            particles: vec![Arc::new(make_particle_solution())],
+            particles: vec![Arc::new(v3_particle(make_particle_solution()))],
             initial_coordinates: array![[1.0_f64, 2.0]],
             vol_totals: array![1.0_f64, 1.0],
             reference_update_register: vec![1],
@@ -1281,6 +1709,130 @@ mod tests {
                 assert_eq!(f.particles[0].coordinates, array![[1.0_f64, 2.0], [1.5, 2.5]]);
             }
             _ => panic!("expected Field"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// The schema-v3 shape of a current `ParticleSolution` (no `time`).
+    fn v3_particle(p: ParticleSolution) -> LegacyParticleSolutionV3 {
+        LegacyParticleSolutionV3 {
+            coordinates: p.coordinates,
+            warps: p.warps,
+            incs: p.incs,
+            volumes: p.volumes,
+            strains: p.strains,
+            strain_incs: p.strain_incs,
+            vol_strains: p.vol_strains,
+            reference_update_register: p.reference_update_register,
+            image_0_path: p.image_0_path,
+            calibrated: p.calibrated,
+            config: p.config,
+            principal_strains: p.principal_strains,
+            gamma_max_grad: p.gamma_max_grad,
+        }
+    }
+
+    fn write_versioned<T: Serialize>(name: &str, version: u8, obj: &T) -> PathBuf {
+        let encoded = bincode::serde::encode_to_vec(obj, bincode::config::standard()).unwrap();
+        let compressed = zstd::encode_all(encoded.as_slice(), 3).unwrap();
+        let tmp = std::env::temp_dir().join(name);
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(MAGIC).unwrap();
+        f.write_all(&[version]).unwrap();
+        f.write_all(&compressed).unwrap();
+        tmp
+    }
+
+    /// Schema v3 (0x08) field and mesh files load via the legacy path with
+    /// no `time`.
+    #[test]
+    fn test_schema_v3_files_load_without_time() {
+        let legacy = LegacyGeopyvObjectV3::Field(LegacyFieldSolutionV3 {
+            particles: vec![Arc::new(v3_particle(make_particle_solution()))],
+            initial_coordinates: array![[1.0_f64, 2.0]],
+            vol_totals: array![1.0_f64, 1.0],
+            reference_update_register: vec![],
+            image_0_path: None,
+            calibrated: false,
+            depth: 3.0,
+            track: true,
+            region: None,
+        });
+        let tmp = write_versioned("geopyv_test_v3_field.pyv", VERSION_ZSTD_V3, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Field(f) => {
+                assert!(f.time.is_none());
+                assert!(f.particles[0].time.is_none());
+                assert_eq!(f.depth, 3.0);
+            }
+            _ => panic!("expected Field"),
+        }
+        let _ = std::fs::remove_file(tmp);
+
+        let m = make_mesh_solution();
+        let legacy = LegacyGeopyvObjectV3::Mesh(LegacyMeshSolutionV3 {
+            nodes: m.nodes.clone(),
+            elements: m.elements.clone(),
+            boundary: m.boundary.clone(),
+            exclusions: m.exclusions.clone(),
+            centroids: m.centroids.clone(),
+            areas: m.areas.clone(),
+            warps: m.warps.clone(),
+            displacements: m.displacements.clone(),
+            c_zncc: m.c_zncc.clone(),
+            p: m.p.clone(),
+            seed_node: m.seed_node,
+            mesh_order: m.mesh_order,
+            subset_order: m.subset_order,
+            iterations: m.iterations.clone(),
+            norms: m.norms.clone(),
+            f_img_path: m.f_img_path.clone(),
+            g_img_path: m.g_img_path.clone(),
+            solve_config: m.solve_config.clone(),
+            seed: m.seed.clone(),
+            template_shape: None,
+            template_sizes: None,
+            zonal_masking: None,
+        });
+        let tmp = write_versioned("geopyv_test_v3_mesh.pyv", VERSION_ZSTD_V3, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => {
+                assert!(l.time.is_none());
+                assert_eq!(l.displacements, m.displacements);
+            }
+            _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// `time` survives a current-format round trip on every solution type.
+    #[test]
+    fn test_time_round_trip() {
+        let mut m = make_mesh_solution();
+        m.time = Some((0.5, 0.75));
+        let tmp = std::env::temp_dir().join("geopyv_test_time_mesh.pyv");
+        save(&tmp, &GeopyvObject::Mesh(m.clone())).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => assert_eq!(l.time, Some((0.5, 0.75))),
+            _ => panic!("expected Mesh"),
+        }
+        let mut seq = SequenceSolution::from_mesh_solution(Arc::new(m));
+        seq.time_source = crate::timing::TimeSource::Filename("date-time".into());
+        save(&tmp, &GeopyvObject::Sequence(seq)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Sequence(s) => {
+                assert_eq!(s.time, Some(vec![0.5, 0.75]));
+                assert_eq!(s.time_source, crate::timing::TimeSource::Filename("date-time".into()));
+                assert_eq!(s.mesh_solutions[0].time, Some((0.5, 0.75)));
+            }
+            _ => panic!("expected Sequence"),
+        }
+        let mut p = make_particle_solution();
+        p.time = Some(vec![0.0, 0.1]);
+        save(&tmp, &GeopyvObject::Particle(p)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Particle(l) => assert_eq!(l.time, Some(vec![0.0, 0.1])),
+            _ => panic!("expected Particle"),
         }
         let _ = std::fs::remove_file(tmp);
     }
@@ -1453,6 +2005,7 @@ mod tests {
             std_dev: 71.5,
             sssig: 430193.5,
             delta_f: 3166.75,
+            time: None,
         };
         let tmp = std::env::temp_dir().join("geopyv_test_eta_omitted_round_trip.pyv");
         save(&tmp, &GeopyvObject::Subset(sol.clone())).unwrap();

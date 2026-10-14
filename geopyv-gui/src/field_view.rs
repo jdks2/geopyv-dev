@@ -10,6 +10,7 @@ use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use geopyv_dev::field::{ContourReduction, FieldQuantity, FieldSolution, SeriesQuantity};
 use geopyv_dev::io::GeopyvObject;
+use geopyv_dev::timing::IncrementMode;
 
 use crate::colormap::{self, ColormapType};
 use crate::draw::ImageCoord;
@@ -75,17 +76,49 @@ fn warp_label(c: usize) -> String {
     WARP_LABELS.get(c).map_or_else(|| c.to_string(), |s| s.to_string())
 }
 
+/// How `trace()` colours each path segment (row `k - 1` → `k`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TraceMode {
+    /// Change since the segment's reference image.
+    #[default]
+    Leapfrog,
+    /// Change since the previous image.
+    Sequential,
+    /// The time (or image number) the segment ends at.
+    Time,
+}
+
+/// Rate label for `name`: displacement-like series get `(px/s)` (or
+/// calibrated units), dimensionless ones `(/s)`.
+fn rate_label(name: &str, displacement: bool, calibrated: bool) -> String {
+    match (displacement, calibrated) {
+        (true, false) => format!("{name} (px/s)"),
+        (true, true) => format!("{name} (units/s)"),
+        (false, _) => format!("{name} (/s)"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Contour settings + caches
 // ---------------------------------------------------------------------------
 
+/// Which rows a contour reduces: a free window, or one increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Extent {
+    #[default]
+    Window,
+    Increment,
+}
+
 struct ContourSettings {
     quantity: FieldQuantity,
+    extent: Extent,
     /// Half-open increment window `[start, stop)`.
     window: (usize, usize),
-    use_dt: bool,
-    dt_text: String,
-    dt: f64,
+    /// Row `k` of `Extent::Increment` (the change into row `k`).
+    increment: usize,
+    mode: IncrementMode,
+    rate: bool,
     absolute: bool,
     deformed: bool,
     /// matplotlib's `tricontourf` default `N = 7` (→ `MaxNLocator(N + 1)`).
@@ -98,10 +131,11 @@ impl Default for ContourSettings {
     fn default() -> Self {
         Self {
             quantity: FieldQuantity::U,
+            extent: Extent::Window,
             window: (0, 1),
-            use_dt: false,
-            dt_text: "1.0".to_string(),
-            dt: 1.0,
+            increment: 1,
+            mode: IncrementMode::Leapfrog,
+            rate: false,
             absolute: false,
             deformed: false,
             n_levels: 7,
@@ -114,21 +148,24 @@ impl Default for ContourSettings {
 impl ContourSettings {
     fn reduction(&self) -> ContourReduction {
         ContourReduction {
-            window: Some(self.window),
-            dt: self.use_dt.then_some(self.dt),
+            window: (self.extent == Extent::Window).then_some(self.window),
+            increment: (self.extent == Extent::Increment).then_some(self.increment),
+            mode: self.mode,
+            rate: self.rate,
             absolute: self.absolute,
         }
     }
 
     /// Colorbar label, as `contour_field` builds it.
-    fn label(&self) -> String {
+    fn label(&self, calibrated: bool) -> String {
         let name = self.quantity.name();
-        if self.use_dt {
-            format!("{name} /s")
-        } else if self.absolute {
-            format!("{name} (abs)")
-        } else {
-            name.to_string()
+        let abs = if self.absolute { " (abs)" } else { "" };
+        match self.quantity {
+            _ if !self.rate => format!("{name}{abs}"),
+            FieldQuantity::ThetaP => "theta_p of strain rate (rad)".to_string(),
+            FieldQuantity::GammaMaxGrad if calibrated => format!("{name}{abs} (/unit/s)"),
+            FieldQuantity::GammaMaxGrad => format!("{name}{abs} (/px/s)"),
+            q => rate_label(&format!("{name}{abs}"), matches!(q, FieldQuantity::U | FieldQuantity::V | FieldQuantity::R), calibrated),
         }
     }
 }
@@ -175,8 +212,12 @@ pub struct FieldViewState {
     selected_particle: Option<usize>,
     history_kind: SeriesKind,
     history_warps: [bool; 12],
+    history_rate: bool,
+    history_mode: IncrementMode,
     trace_kind: SeriesKind,
     trace_component: usize,
+    trace_mode: TraceMode,
+    trace_rate: bool,
     /// Core `contour_triangles()` for the loaded solution.
     triangles: Vec<[usize; 3]>,
     contour_cache: Option<ContourCache>,
@@ -208,8 +249,12 @@ impl FieldViewState {
             selected_particle: None,
             history_kind: SeriesKind::default(),
             history_warps,
+            history_rate: false,
+            history_mode: IncrementMode::Leapfrog,
             trace_kind: SeriesKind::default(),
             trace_component: 0,
+            trace_mode: TraceMode::default(),
+            trace_rate: false,
             triangles: Vec::new(),
             contour_cache: None,
             bands_cache: None,
@@ -230,6 +275,12 @@ impl FieldViewState {
             .unwrap_or_default();
         let inc_no = solution.as_ref().map_or(1, |s| s.inc_no().max(1));
         self.contour.window = (0, inc_no);
+        self.contour.increment = inc_no.saturating_sub(1).max(1);
+        if solution.as_ref().is_some_and(|s| s.time.is_none()) {
+            self.contour.rate = false;
+            self.history_rate = false;
+            self.trace_rate = false;
+        }
         self.selected_particle = None;
         self.contour_cache = None;
         self.bands_cache = None;
@@ -403,7 +454,7 @@ impl FieldViewState {
         }
         let (lo, hi) = self.colour_range(data.range);
         let alpha = (self.contour.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let label = self.contour.label();
+        let label = self.contour.label(self.solution.as_ref().is_some_and(|s| s.calibrated));
 
         if self.contour.smooth {
             let (lo, hi) = if hi > lo { (lo, hi) } else { (lo - 1e-12, hi + 1e-12) };
@@ -467,18 +518,39 @@ impl FieldViewState {
         }
     }
 
-    /// `trace_field`: every particle's path, each segment coloured by the
-    /// change of the chosen series over that increment.
+    /// `trace_field`: every particle's path, each segment (row `k - 1` →
+    /// `k`) coloured per `trace_mode`: the change since its reference image
+    /// (leapfrog) or the previous image (sequential), optionally per second,
+    /// or the time it ends at.
     fn paint_trace(&self, painter: &egui::Painter, viewer_rect: egui::Rect, coord: &ImageCoord) {
         let sol = self.solution.as_ref().expect("checked by caller");
         let q = self.trace_quantity();
         let mut segments = Vec::new();
         for p in &sol.particles {
-            let s = p.series(q);
-            for m in 1..p.coordinates.nrows().min(s.len()) {
+            let values: Vec<f64> = match self.trace_mode {
+                TraceMode::Time => match &p.time {
+                    Some(t) => t[1..].to_vec(),
+                    None => (1..p.coordinates.nrows()).map(|k| k as f64).collect(),
+                },
+                TraceMode::Leapfrog | TraceMode::Sequential => {
+                    let mode = if self.trace_mode == TraceMode::Leapfrog {
+                        IncrementMode::Leapfrog
+                    } else {
+                        IncrementMode::Sequential
+                    };
+                    match p.series_increments(q, mode, self.trace_rate) {
+                        Ok(v) => v.to_vec(),
+                        Err(e) => {
+                            paint_message(painter, viewer_rect, &e.to_string());
+                            return;
+                        }
+                    }
+                }
+            };
+            for m in 1..p.coordinates.nrows().min(values.len() + 1) {
                 let a = egui::pos2(p.coordinates[[m - 1, 0]] as f32, p.coordinates[[m - 1, 1]] as f32);
                 let b = egui::pos2(p.coordinates[[m, 0]] as f32, p.coordinates[[m, 1]] as f32);
-                segments.push((a, b, s[m] - s[m - 1]));
+                segments.push((a, b, values[m - 1]));
             }
         }
         let finite = segments.iter().map(|s| s.2).filter(|v| v.is_finite());
@@ -507,11 +579,22 @@ impl FieldViewState {
     }
 
     fn trace_label(&self) -> String {
-        match self.trace_kind {
-            SeriesKind::Warps => warp_label(self.trace_component),
-            SeriesKind::Strains => STRAIN_LABELS.get(self.trace_component).unwrap_or(&"?").to_string(),
-            SeriesKind::VolStrains => "ε_vol".to_string(),
+        let sol = self.solution.as_ref();
+        if self.trace_mode == TraceMode::Time {
+            let timed = sol.and_then(|s| s.particles.first()).is_some_and(|p| p.time.is_some());
+            return if timed { "Time (s)" } else { "Image number" }.to_string();
         }
+        let (name, displacement) = match self.trace_kind {
+            SeriesKind::Warps => (warp_label(self.trace_component), self.trace_component < 2),
+            SeriesKind::Strains => (STRAIN_LABELS.get(self.trace_component).unwrap_or(&"?").to_string(), false),
+            SeriesKind::VolStrains => ("ε_vol".to_string(), false),
+        };
+        if !self.trace_rate {
+            return name;
+        }
+        // Drop a displacement label's own "(px)" before adding the rate unit.
+        let name = name.trim_end_matches(" (px)").to_string();
+        rate_label(&name, displacement, sol.is_some_and(|s| s.calibrated))
     }
 
     /// `history_field`: the selected particle's series against image number.
@@ -541,22 +624,47 @@ impl FieldViewState {
             ],
             SeriesKind::VolStrains => vec![("ε_vol".to_string(), SeriesQuantity::VolStrain)],
         };
-        let y_label = match self.history_kind {
-            SeriesKind::Warps => "Value",
-            SeriesKind::Strains => "Strain, ε",
-            SeriesKind::VolStrains => "Volumetric strain, ε_vol",
+        let y_label = match (self.history_kind, self.history_rate) {
+            (SeriesKind::Warps, false) => "Value",
+            (SeriesKind::Strains, false) => "Strain, ε",
+            (SeriesKind::VolStrains, false) => "Volumetric strain, ε_vol",
+            (SeriesKind::Warps, true) => "Rate (/s; u, v in px/s)",
+            (_, true) => "Strain rate (/s)",
         };
+        // Time when the solution has it, image number otherwise.
+        let x: Vec<f64> = match &p.time {
+            Some(t) => t.clone(),
+            None => (0..p.coordinates.nrows()).map(|i| i as f64).collect(),
+        };
+        let x_label = if p.time.is_some() { "Time, t (s)" } else { "Image number, i" };
+        let mut error = None;
         Plot::new("field_history_plot")
             .legend(Legend::default())
-            .x_axis_label("Image number, i")
+            .x_axis_label(x_label)
             .y_axis_label(y_label)
             .show(ui, |plot_ui| {
                 for (name, q) in lines {
-                    let s = p.series(q);
-                    let pts: Vec<[f64; 2]> = s.iter().enumerate().map(|(i, &v)| [i as f64, v]).collect();
+                    let pts: Vec<[f64; 2]> = if !self.history_rate {
+                        p.series(q).iter().zip(&x).map(|(&v, &t)| [t, v]).collect()
+                    } else {
+                        match p.series_increments(q, self.history_mode, true) {
+                            // Sequential: a step over each image interval.
+                            Ok(v) if self.history_mode == IncrementMode::Sequential => (1..x.len())
+                                .flat_map(|k| [[x[k - 1], v[k - 1]], [x[k], v[k - 1]]])
+                                .collect(),
+                            Ok(v) => (1..x.len()).map(|k| [x[k], v[k - 1]]).collect(),
+                            Err(e) => {
+                                error = Some(e.to_string());
+                                Vec::new()
+                            }
+                        }
+                    };
                     plot_ui.line(Line::new(PlotPoints::from(pts)).name(name));
                 }
             });
+        if let Some(e) = error {
+            ui.label(egui::RichText::new(e).color(ui.visuals().error_fg_color));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -577,11 +685,13 @@ impl FieldViewState {
         let inc_no = sol.inc_no();
         let n_warps = sol.particles.first().map_or(0, |p| p.warps.ncols());
         let has_region = sol.region.is_some();
+        let has_time = sol.time.is_some();
 
         section_header(ui, "Field");
         meta_row(ui, "Particles", &n_particles.to_string());
         meta_row(ui, "Increments", &inc_no.saturating_sub(1).to_string());
         meta_row(ui, "Region stored", if has_region { "yes" } else { "no (re-solve)" });
+        meta_row(ui, "Image times", if has_time { "yes" } else { "no" });
         separator(ui);
 
         section_header(ui, "Display");
@@ -591,10 +701,10 @@ impl FieldViewState {
         separator(ui);
 
         match self.mode {
-            FieldPlotMode::Contour => self.contour_controls(ui, inc_no),
+            FieldPlotMode::Contour => self.contour_controls(ui, inc_no, has_time),
             FieldPlotMode::Inspect => self.inspect_controls(ui, n_particles),
-            FieldPlotMode::History => self.history_controls(ui, n_particles, n_warps),
-            FieldPlotMode::Trace => self.trace_controls(ui, n_warps),
+            FieldPlotMode::History => self.history_controls(ui, n_particles, n_warps, has_time),
+            FieldPlotMode::Trace => self.trace_controls(ui, n_warps, has_time),
         }
 
         separator(ui);
@@ -623,7 +733,7 @@ impl FieldViewState {
         }
     }
 
-    fn contour_controls(&mut self, ui: &mut egui::Ui, inc_no: usize) {
+    fn contour_controls(&mut self, ui: &mut egui::Ui, inc_no: usize, has_time: bool) {
         let c = &mut self.contour;
         section_header(ui, "Quantity");
         egui::ComboBox::from_id_salt("field_contour_quantity")
@@ -636,32 +746,40 @@ impl FieldViewState {
             });
 
         ui.add_space(4.0);
-        section_header(ui, "Window (increments)");
+        section_header(ui, "Rows");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut c.extent, Extent::Window, "Window");
+            ui.add_enabled_ui(inc_no > 1, |ui| {
+                ui.radio_value(&mut c.extent, Extent::Increment, "Increment");
+            });
+        });
         let max = inc_no.max(1);
-        let (mut start, mut stop) = c.window;
-        ui.add(egui::Slider::new(&mut start, 0..=max - 1).text("start"));
-        ui.add(egui::Slider::new(&mut stop, 1..=max).text("stop (excl.)"));
-        if start != c.window.0 {
-            stop = stop.max(start + 1);
-        } else if stop != c.window.1 {
-            start = start.min(stop - 1);
+        if c.extent == Extent::Window || inc_no < 2 {
+            c.extent = Extent::Window;
+            let (mut start, mut stop) = c.window;
+            ui.add(egui::Slider::new(&mut start, 0..=max - 1).text("start"));
+            ui.add(egui::Slider::new(&mut stop, 1..=max).text("stop (excl.)"));
+            if start != c.window.0 {
+                stop = stop.max(start + 1);
+            } else if stop != c.window.1 {
+                start = start.min(stop - 1);
+            }
+            c.window = (start.min(max - 1), stop.clamp(start + 1, max));
+        } else {
+            ui.add(egui::Slider::new(&mut c.increment, 1..=max - 1).text("into row"));
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut c.mode, IncrementMode::Leapfrog, "Leapfrog")
+                    .on_hover_text("Change since the row's reference image");
+                ui.radio_value(&mut c.mode, IncrementMode::Sequential, "Sequential")
+                    .on_hover_text("Change since the previous image");
+            });
         }
-        c.window = (start.min(max - 1), stop.clamp(start + 1, max));
 
         ui.add_space(4.0);
         section_header(ui, "Reduction");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut c.use_dt, "Rate, dt =");
-            let r = ui.add_enabled(c.use_dt, egui::TextEdit::singleline(&mut c.dt_text).desired_width(60.0));
-            if r.changed() {
-                if let Ok(v) = c.dt_text.trim().parse::<f64>() {
-                    if v > 0.0 {
-                        c.dt = v;
-                    }
-                }
-            }
-        });
-        ui.add_enabled(!c.use_dt, egui::Checkbox::new(&mut c.absolute, "Absolute (sum of |Δ|)"));
+        ui.add_enabled(has_time, egui::Checkbox::new(&mut c.rate, "Rate (per second)"))
+            .on_disabled_hover_text("No image times stored: set Δt or use timestamped file names, then re-solve");
+        ui.checkbox(&mut c.absolute, "Absolute (sum of |Δ|)");
 
         ui.add_space(4.0);
         section_header(ui, "Position");
@@ -699,7 +817,7 @@ impl FieldViewState {
         }
     }
 
-    fn history_controls(&mut self, ui: &mut egui::Ui, n_particles: usize, n_warps: usize) {
+    fn history_controls(&mut self, ui: &mut egui::Ui, n_particles: usize, n_warps: usize, has_time: bool) {
         section_header(ui, "Particle");
         let mut idx = self.selected_particle.unwrap_or(0);
         if ui.add(egui::DragValue::new(&mut idx).range(0..=n_particles.saturating_sub(1))).changed()
@@ -713,6 +831,15 @@ impl FieldViewState {
         section_header(ui, "Quantity");
         for k in SeriesKind::ALL {
             ui.radio_value(&mut self.history_kind, k, k.label());
+        }
+        ui.add_space(4.0);
+        ui.add_enabled(has_time, egui::Checkbox::new(&mut self.history_rate, "Rate (per second)"))
+            .on_disabled_hover_text("No image times stored: set Δt or use timestamped file names, then re-solve");
+        if self.history_rate {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.history_mode, IncrementMode::Leapfrog, "Leapfrog");
+                ui.radio_value(&mut self.history_mode, IncrementMode::Sequential, "Sequential");
+            });
         }
         if self.history_kind == SeriesKind::Warps {
             ui.add_space(4.0);
@@ -728,7 +855,21 @@ impl FieldViewState {
         }
     }
 
-    fn trace_controls(&mut self, ui: &mut egui::Ui, n_warps: usize) {
+    fn trace_controls(&mut self, ui: &mut egui::Ui, n_warps: usize, has_time: bool) {
+        section_header(ui, "Colour by");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.trace_mode, TraceMode::Leapfrog, "Leapfrog")
+                .on_hover_text("Change since the segment's reference image");
+            ui.radio_value(&mut self.trace_mode, TraceMode::Sequential, "Sequential")
+                .on_hover_text("Change since the previous image");
+            ui.radio_value(&mut self.trace_mode, TraceMode::Time, "Time");
+        });
+        ui.add_enabled(
+            has_time && self.trace_mode != TraceMode::Time,
+            egui::Checkbox::new(&mut self.trace_rate, "Rate (per second)"),
+        )
+        .on_disabled_hover_text("Needs stored image times, and a leapfrog/sequential colouring");
+        ui.add_space(4.0);
         section_header(ui, "Quantity");
         for k in SeriesKind::ALL {
             if ui.radio_value(&mut self.trace_kind, k, k.label()).changed() {
@@ -993,6 +1134,7 @@ mod tests {
                     config: None,
                     principal_strains: Some(Array2::zeros((2, 4))),
                     gamma_max_grad: None,
+                    time: None,
                 }));
             }
         }
@@ -1009,6 +1151,7 @@ mod tests {
                 boundary: array![[0.0, 0.0], [6.0, 0.0], [6.0, 6.0], [0.0, 6.0]],
                 exclusions: vec![array![[2.6, 2.6], [3.4, 2.6], [3.4, 3.4], [2.6, 3.4]]],
             }),
+            time: None,
         }
     }
 

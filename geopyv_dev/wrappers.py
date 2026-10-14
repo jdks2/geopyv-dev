@@ -30,7 +30,7 @@ class MeshWrapper:
 
     def inspect(self, **kwargs):
         """See ``geopyv_dev.plots.inspect_mesh`` -- accepts ``subset_idx=``,
-        ``zones=True`` (zonal-masking map), ``show_areas=True``."""
+        ``show_areas=True``."""
         return plots.inspect_mesh(self._inner, **kwargs)
 
     def convergence(self, quantity="C_ZNCC", **kwargs):

@@ -12,6 +12,7 @@ use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::geometry::region::{Region, RegionOption};
 use geopyv_dev::sequence::{Sequence, SequenceMeshConfig, SequenceOptions as LibSequenceOptions, SequenceSolution, SequenceSolveConfig};
 use geopyv_dev::masks::{LocalMask, MaskShape};
+use geopyv_dev::timing::IncrementMode;
 
 use crate::progress::GuiProgress;
 
@@ -19,20 +20,31 @@ use crate::colormap::ColormapType;
 use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
 use crate::mesh_tab::{
-    extract_nodal_values, format_sci, mesh_coord_from_bounds, render_colorbar,
+    displacement_values, extract_nodal_values, format_sci, mesh_coord_from_bounds, plot_label, render_colorbar,
     render_mesh_overlay, MeshGenConfig, MeshOrder, MeshPlotType, RangeMode,
 };
 use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
 
 // ---------------------------------------------------------------------------
-// Reference mode
+// Nodal values
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReferenceMode {
-    Fixed,
-    #[default]
-    Sequential,
+/// Per-node values of `plot` for frame `m`: displacements measured per
+/// `mode` (and ÷ Δt with `rate`), or the frame's quality values.
+fn sequence_nodal_values(
+    sol: &SequenceSolution,
+    m: usize,
+    plot: MeshPlotType,
+    mode: IncrementMode,
+    rate: bool,
+) -> Vec<f64> {
+    if !matches!(plot, MeshPlotType::Ux | MeshPlotType::Uy | MeshPlotType::UMag) {
+        return sol.load_mesh_at(m).map(|ms| extract_nodal_values(&ms, plot, false)).unwrap_or_default();
+    }
+    match sol.increment_displacements(m, mode) {
+        Ok((_, disp, dt)) => displacement_values(&disp, plot, rate.then(|| dt.unwrap_or(f64::NAN))),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +96,7 @@ pub struct NewSequenceForm {
     pub solver: SolverConfig,
     pub seq_opts: SequenceOptions,
     pub draw: crate::draw::DrawState,
+    pub time: crate::time_input::TimeInputForm,
     pub form_error: Option<String>,
 }
 
@@ -103,6 +116,7 @@ impl Default for NewSequenceForm {
             solver: SolverConfig::default(),
             seq_opts: SequenceOptions::default(),
             draw: crate::draw::DrawState::new(),
+            time: Default::default(),
             form_error: None,
         }
     }
@@ -128,6 +142,7 @@ impl NewSequenceForm {
             && self.draw.seed_ok()
             && self.gen_cfg.is_valid()
             && self.solver.is_valid()
+            && self.time.is_valid()
     }
 }
 
@@ -151,7 +166,11 @@ pub struct SequenceViewState {
     pub range_min: f64,
     pub range_max_text: String,
     pub range_max: f64,
-    pub reference_mode: ReferenceMode,
+    /// What each frame's displacement is measured from (leapfrog: the
+    /// pair's reference image; sequential: the previous target).
+    pub increment_mode: IncrementMode,
+    /// Plot displacements as velocities (÷ the increment's Δt).
+    pub rate: bool,
     pub show_wireframe: bool,
     pub show_node_indices: bool,
     /// Cached (frame_index, plot_type, values) — invalidated on frame/type change.
@@ -175,7 +194,8 @@ impl SequenceViewState {
             range_min: 0.0,
             range_max_text: "1".to_string(),
             range_max: 1.0,
-            reference_mode: ReferenceMode::default(),
+            increment_mode: IncrementMode::default(),
+            rate: false,
             show_wireframe: false,
             show_node_indices: false,
             nodal_cache: None,
@@ -233,6 +253,7 @@ pub struct SequenceSpawnParams {
     pub sync: bool,
     pub override_: bool,
     pub border: usize,
+    pub time: Option<geopyv_dev::timing::TimeInput>,
     /// Directory /Meshes/<name>/ for per-frame .pyv files.
     pub mesh_subdir: PathBuf,
     /// Directory /Sequences/ for the overall SequenceSolution.
@@ -458,13 +479,10 @@ impl SequenceTabState {
                 .unwrap_or(false);
 
             if !cache_valid {
-                if let Some(mesh_sol) = self
-                    .view
-                    .solution
-                    .as_ref()
-                    .and_then(|s| s.mesh_solutions.get(current_frame))
-                {
-                    let vals = extract_nodal_values(mesh_sol, plot_type);
+                if let Some(sol) = self.view.solution.as_ref() {
+                    let vals = sequence_nodal_values(
+                        sol, current_frame, plot_type, self.view.increment_mode, self.view.rate,
+                    );
                     self.view.nodal_cache = Some((current_frame, plot_type, vals));
                 }
             }
@@ -501,7 +519,7 @@ impl SequenceTabState {
                         show_node_indices,
                         &coord,
                     );
-                    render_colorbar(&painter, image_rect, vmin, vmax, colormap, plot_type.label());
+                    render_colorbar(&painter, image_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate));
                 }
             }
         }
@@ -698,18 +716,20 @@ impl SequenceTabState {
             }
         });
 
-        // Reference mode.
+        // Increment mode.
         ui.add_space(4.0);
-        section_header(ui, "Reference");
+        section_header(ui, "Increment");
         ui.add_space(2.0);
+        let old_mode = self.view.increment_mode;
         ui.horizontal(|ui| {
-            ui.radio_value(&mut self.view.reference_mode, ReferenceMode::Fixed, "Fixed");
-            ui.radio_value(
-                &mut self.view.reference_mode,
-                ReferenceMode::Sequential,
-                "Sequential",
-            );
+            ui.radio_value(&mut self.view.increment_mode, IncrementMode::Leapfrog, "Leapfrog")
+                .on_hover_text("Displacement from the pair's reference image");
+            ui.radio_value(&mut self.view.increment_mode, IncrementMode::Sequential, "Sequential")
+                .on_hover_text("Displacement from the previous target image");
         });
+        if self.view.increment_mode != old_mode {
+            self.view.nodal_cache = None;
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -731,6 +751,13 @@ impl SequenceTabState {
             ui.radio_value(&mut self.view.plot_type, MeshPlotType::Uy, "u_y");
             ui.radio_value(&mut self.view.plot_type, MeshPlotType::UMag, "|u|");
         });
+        let has_time = self.view.solution.as_ref().is_some_and(|s| s.time.is_some());
+        let r = ui
+            .add_enabled(has_time, egui::Checkbox::new(&mut self.view.rate, "Rate (velocity, px/s)"))
+            .on_disabled_hover_text("No image times: set Δt or use timestamped file names, then re-solve");
+        if r.changed() {
+            self.view.nodal_cache = None;
+        }
 
         ui.add_space(3.0);
         ui.label(
@@ -1082,6 +1109,21 @@ impl SequenceTabState {
                         .color(ui.visuals().weak_text_color()),
                 );
             }
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // Timing.
+        section_header(ui, "Timing");
+        ui.add_space(4.0);
+        {
+            let selected: &[PathBuf] = match (form.start_idx, form.end_idx) {
+                (Some(s), Some(e)) if e > s && e < images.len() => &images[s..=e],
+                _ => &[],
+            };
+            form.time.show(ui, "seq_time_grid", selected);
         }
 
         ui.add_space(6.0);
@@ -1476,6 +1518,7 @@ impl SequenceTabState {
                     sync: form.seq_opts.sync,
                     override_: form.seq_opts.override_,
                     border: form.seq_opts.border,
+                    time: form.time.input().ok().flatten(),
                     mesh_subdir: PathBuf::new(),
                     sequences_dir: PathBuf::new(),
                 });
@@ -1611,6 +1654,10 @@ fn run_solve(
             return;
         }
     };
+    if let Err(e) = sequence.set_time(params.time.as_ref()) {
+        set_error(&state, format!("Time error: {e}"));
+        return;
+    }
 
     let subset_order = if matches!(params.subset_order, SubsetOrder::First) { 1 } else { 2 };
     let cfg = SequenceSolveConfig {

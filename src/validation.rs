@@ -361,6 +361,7 @@ mod tests {
             config: None,
             principal_strains: None,
             gamma_max_grad: None,
+            time: None,
         }
     }
 
@@ -382,6 +383,7 @@ mod tests {
             depth: 1.0,
             track: false,
             region: None,
+            time: None,
         }
     }
 
@@ -422,6 +424,7 @@ mod tests {
                 config: None,
                 principal_strains: None,
                 gamma_max_grad: None,
+                time: None,
             }));
         }
 
@@ -438,6 +441,7 @@ mod tests {
             depth: 1.0,
             track: false,
             region: None,
+            time: None,
         };
 
         let validation = Validation::new(

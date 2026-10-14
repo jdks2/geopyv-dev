@@ -38,7 +38,7 @@ use ndarray::{Array1, Array2, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, Error};
+use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, timing::{resolve_pair_time, TimeInput, TimeSource}, Error};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -88,6 +88,9 @@ pub struct Subset {
     // Image handles — None when images unavailable (load-from-disk path).
     pub f_img: Option<Arc<Image>>,
     pub g_img: Option<Arc<Image>>,
+    /// `(f_time, g_time)`, seconds; `None` until [`Subset::set_time`].
+    pub time: Option<(f64, f64)>,
+    pub time_source: TimeSource,
 
     // Image-dependent — None when images unavailable.
     /// Subset pixel coordinates, shape `(n_px, 2)`.
@@ -126,6 +129,9 @@ pub struct SubsetSolution {
     /// `sqrt(Σ(f_i − f_m)²)` — normalisation factor for ZNSSD.
     #[serde(default)]
     pub delta_f: f64,
+    /// `(f_time, g_time)` of the image pair, seconds — see [`crate::timing`].
+    #[serde(default)]
+    pub time: Option<(f64, f64)>,
 }
 
 /// Output of a DIC solve ([`Subset::solve_icgn`] / [`Subset::solve_fagn`]).
@@ -976,6 +982,8 @@ impl Subset {
             delta_f,
             f_img: Some(f_img),
             g_img: Some(g_img),
+            time: None,
+            time_source: TimeSource::None,
             f_coords: Some(f_coords),
             f: Some(f),
             f_m: Some(f_m),
@@ -1000,6 +1008,8 @@ impl Subset {
             delta_f: sol.delta_f,
             f_img: None,
             g_img: None,
+            time: sol.time,
+            time_source: if sol.time.is_some() { TimeSource::Given } else { TimeSource::None },
             f_coords: None,
             f: None,
             f_m: None,
@@ -1102,7 +1112,19 @@ impl Subset {
             std_dev: self.delta_f / (n_px as f64).sqrt(),
             sssig: self.sssig,
             delta_f: self.delta_f,
+            time: self.time,
         }
+    }
+
+    /// Set the pair's `(f_time, g_time)` from `time=` (`None`: parse the
+    /// image file names) — see [`crate::timing`].
+    pub fn set_time(&mut self, input: Option<&TimeInput>) -> Result<(), Error> {
+        let path = |img: &Option<Arc<Image>>| img.as_ref().and_then(|i| i.filepath.clone());
+        let (f, g) = (path(&self.f_img), path(&self.g_img));
+        let (time, source) = resolve_pair_time(f.as_deref(), g.as_deref(), input)?;
+        self.time = time;
+        self.time_source = source;
+        Ok(())
     }
 
     /// Inverse Compositional Gauss-Newton solve computation (no mutation).

@@ -172,12 +172,10 @@ def _load_img_gs(img_path):
     return cv2.imread(img_path, cv2.IMREAD_GRAYSCALE).astype(float)
 
 
-def _render_template_crop(ax, img_gs, coord, size, shape, cut_coords=None):
+def _render_template_crop(ax, img_gs, coord, size, shape):
     """Draw a subset template as a square crop of ``img_gs`` centred on
     ``coord`` (absolute ``[x, y]``); ``circle`` / ``semicircle`` templates
-    are masked to their own shape. ``cut_coords`` (absolute ``[x, y]`` from
-    :func:`_geopyv_dev.zoned_subset_footprint`) are the zone-removed pixels,
-    overlaid in red.
+    are masked to their own shape.
 
     Mirrors :func:`inspect_subset`'s crop rendering; kept separate because
     that function also has an image-less (f/f_coords) path meshes never hit.
@@ -205,98 +203,28 @@ def _render_template_crop(ax, img_gs, coord, size, shape, cut_coords=None):
         display[outside] = np.nan
 
     ax.imshow(display, cmap="gist_gray", extent=[x0, x1, y1, y0])
-    if cut_coords is not None and len(cut_coords):
-        ax.scatter(cut_coords[:, 0], cut_coords[:, 1], s=10, c="red", marker="s",
-                   linewidths=0, alpha=0.55, zorder=5)
     ax.scatter([x], [y], color="red", s=40, marker="x", zorder=6)
     ax.set_xlim(x0, x1)
     ax.set_ylim(y1, y0)
     ax.set_axis_off()
 
 
-_ZONE_COLOURS = [
-    "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4",
-    "#f032e6", "#bfef45", "#fabed4", "#469990", "#dcbeff", "#9a6324",
-    "#fffac8", "#800000", "#aaffc3", "#808000", "#ffd8b1", "#000075",
-]
-
-
-def _overlay_zone_map(ax, zonal, legend=True):
-    """Sharp, high-contrast per-zone colour overlay + black zone-boundary
-    lines over the current axes.
-
-    Raw zone ids are sparse (connected-component labels: 1, 5, 21, ...), so
-    ``imshow``-ing them directly on a continuous colormap puts neighbouring
-    zones on near-identical colours. This remaps them to a dense range and
-    assigns each a distinct saturated hue.
-    """
-    from matplotlib.colors import ListedColormap, BoundaryNorm
-    from matplotlib.patches import Patch
-
-    zi = np.asarray(zonal.zone_image)
-    ids = np.array(sorted(int(v) for v in np.unique(zi) if v != 0))
-    if ids.size == 0:
-        return
-    remap = np.zeros(int(zi.max()) + 1, dtype=int)
-    for k, zid in enumerate(ids):
-        remap[zid] = k
-    dense = np.ma.array(remap[zi], mask=(zi == 0))
-
-    colours = [_ZONE_COLOURS[k % len(_ZONE_COLOURS)] for k in range(ids.size)]
-    cmap = ListedColormap(colours)
-    norm = BoundaryNorm(np.arange(-0.5, ids.size + 0.5), ids.size)
-    ax.imshow(dense, cmap=cmap, norm=norm, alpha=0.5, interpolation="nearest")
-
-    # Crisp black boundary lines wherever the label changes. Contour on a
-    # coarsened copy -- marching-squares over a full 2000^2 grid is seconds
-    # per call and the lines only need to read as sharp, not pixel-exact.
-    if ids.size > 1:
-        h, w = zi.shape
-        step = max(1, int(round(max(h, w) / 700)))
-        lab = remap[zi][::step, ::step].astype(float)
-        ax.contour(np.arange(0, w, step), np.arange(0, h, step), lab,
-                   levels=np.arange(0.5, ids.size - 0.5),
-                   colors="k", linewidths=1.1)
-
-    if legend and ids.size > 1:
-        ax.legend(handles=[Patch(facecolor=c, edgecolor="k", label=f"zone {zid}")
-                           for c, zid in zip(colours, ids)],
-                  loc="upper right", fontsize=8, framealpha=0.9)
-
-
-def inspect_mesh(mesh, subset_idx=None, show_areas=False, zones=False, ax=None,
+def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None,
                  show=True, block=True, save=False, **kwargs):
     """Render the mesh over its reference image.
 
     ``subset_idx`` : int, optional
         Highlight one node. When the mesh records its subset template
-        (every solve from schema ``0x07`` on), and ``zones`` is not set,
-        the plot becomes a crop of that node's subset template (like
-        ``subset.inspect()``); for a zonally-solved mesh the zone-removed
-        template pixels are shaded red and the pre/post pixel counts,
-        ``|∇γ|`` and any minimum-pixel-guard fallback are captioned.
-    ``zones`` : bool, default False
-        Overlay the whole-image zone-label map from a
-        ``solver_options={"masking": "zonal"}`` solve. Raises
-        ``RuntimeError`` if the mesh was not solved that way (or its pass 2
-        fell back). When combined with ``subset_idx`` the chosen subset's
-        kept (green) / removed (red) footprint is drawn at its true
-        location on the full map.
+        (every solve from schema ``0x07`` on) the plot becomes a crop of
+        that node's subset template (like ``subset.inspect()``).
     """
     nodes = np.asarray(mesh.nodes)
     elements = np.asarray(mesh.elements)
     f_img_path = getattr(mesh, 'f_img_path', None)
-    zonal = getattr(mesh, 'zonal_masking', None)
     tmpl_shape = getattr(mesh, 'template_shape', None)
     tmpl_sizes = getattr(mesh, 'template_sizes', None)
     if tmpl_sizes is not None:
         tmpl_sizes = np.asarray(tmpl_sizes)
-
-    if zones and zonal is None:
-        raise RuntimeError(
-            "mesh was not solved with solver_options={'masking': 'zonal'} "
-            "(or its pass 2 fell back) -- no zone map to inspect"
-        )
 
     owned = ax is None
     if ax is None:
@@ -306,29 +234,13 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, zones=False, ax=None,
 
     has_idx = subset_idx is not None and 0 <= subset_idx < len(nodes)
 
-    # --- Per-subset template crop (only when not showing the zone map) -----
-    if has_idx and not zones and tmpl_shape is not None and tmpl_sizes is not None:
+    # --- Per-subset template crop -----------------------------------------
+    if has_idx and tmpl_shape is not None and tmpl_sizes is not None:
         coord = nodes[subset_idx]
         size = int(tmpl_sizes[subset_idx])
         img_gs = _load_img_gs(f_img_path)
-        cut = None
         caption = f"Subset {subset_idx}: {tmpl_shape} r={size}"
-        if zonal is not None:
-            fp = _core.zoned_subset_footprint(
-                np.asarray(zonal.zone_image), [float(coord[0]), float(coord[1])],
-                str(tmpl_shape), size,
-            )
-            cut = np.asarray(fp["coords_cut"])
-            pre = int(np.asarray(zonal.node_pre_px)[subset_idx])
-            post = int(np.asarray(zonal.node_post_px)[subset_idx])
-            ggrad = float(np.asarray(zonal.node_gamma_max_grad)[subset_idx])
-            zid = int(np.asarray(zonal.node_zone)[subset_idx])
-            fell_back = bool(np.asarray(zonal.node_guard_fallback)[subset_idx])
-            caption = (f"Subset {subset_idx}  zone {zid}: kept {post}/{pre} px, "
-                       f"$|\\nabla\\gamma|$={ggrad:.3g}")
-            if fell_back:
-                caption += "  — GUARD FALLBACK (solved un-zoned)"
-        _render_template_crop(ax, img_gs, coord, size, str(tmpl_shape), cut_coords=cut)
+        _render_template_crop(ax, img_gs, coord, size, str(tmpl_shape))
         ax.text(0.5, -0.06, caption, transform=ax.transAxes, ha="center")
         plt.tight_layout()
         _show_save_close(fig, show, block, save, owned=owned)
@@ -339,21 +251,17 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, zones=False, ax=None,
     imshow_kwargs.update(kwargs)
     _imshow_or_blank(ax, f_img_path, **imshow_kwargs)
 
-    if zones:
-        _overlay_zone_map(ax, zonal)
-    else:
-        # Element edges -- one LineCollection, not tens of thousands of
-        # ax.plot() calls (an 8000-node mesh has ~16k elements). Omitted
-        # under the zone overlay, where they only obscure the zones.
-        tri = nodes[elements[:, :3]]                   # (M, 3, 2)
-        segs = np.concatenate(
-            [tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=0)
-        ax.add_collection(LineCollection(
-            segs, colors="b", linewidths=0.5 if len(elements) <= 2000 else 0.2))
+    # Element edges -- one LineCollection, not tens of thousands of
+    # ax.plot() calls (an 8000-node mesh has ~16k elements).
+    tri = nodes[elements[:, :3]]                   # (M, 3, 2)
+    segs = np.concatenate(
+        [tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=0)
+    ax.add_collection(LineCollection(
+        segs, colors="b", linewidths=0.5 if len(elements) <= 2000 else 0.2))
 
-    if not zones and len(elements) <= 400:
-        # Element index annotations (skipped under the zone wash, and on a
-        # dense mesh where 10^4 labels are unreadable and slow anyway).
+    if len(elements) <= 400:
+        # Element index annotations (skipped on a dense mesh, where 10^4
+        # labels are unreadable and slow anyway).
         for i, elem in enumerate(elements):
             cx = nodes[elem[:3], 0].mean()
             cy = nodes[elem[:3], 1].mean()
@@ -368,19 +276,6 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, zones=False, ax=None,
     if has_idx:
         node = nodes[subset_idx]
         ax.scatter([node[0]], [node[1]], color='red', s=60, zorder=10)
-        if zones and zonal is not None and tmpl_shape is not None and tmpl_sizes is not None:
-            fp = _core.zoned_subset_footprint(
-                np.asarray(zonal.zone_image), [float(node[0]), float(node[1])],
-                str(tmpl_shape), int(tmpl_sizes[subset_idx]),
-            )
-            kept = np.asarray(fp["coords_kept"])
-            cut = np.asarray(fp["coords_cut"])
-            if len(kept):
-                ax.scatter(kept[:, 0], kept[:, 1], s=6, c="lime", marker="s",
-                           linewidths=0, alpha=0.5, zorder=8)
-            if len(cut):
-                ax.scatter(cut[:, 0], cut[:, 1], s=6, c="red", marker="s",
-                           linewidths=0, alpha=0.5, zorder=8)
 
     plt.tight_layout()
     _show_save_close(fig, show, block, save, owned=owned)
@@ -486,12 +381,28 @@ def convergence_mesh(mesh, quantity, ax=None, show=True, block=True, save=False,
     return fig, ax
 
 
-def contour_sequence(sequence, mesh_idx, quantity, **kwargs):
+_NO_TIME_MSG = (
+    "rate=True needs image times, and this solution has none: pass time= (a time "
+    "increment, or one time per image) to the Sequence/Mesh, or use image file names "
+    "that carry a timestamp, then re-solve"
+)
+
+
+def contour_sequence(sequence, mesh_idx, quantity, mode="leapfrog", rate=False, **kwargs):
+    """Contour pair ``mesh_idx``. For ``u``/``v``/``R``, ``mode`` sets what the
+    displacement is measured from: ``"leapfrog"`` (default) the pair's reference
+    image, ``"sequential"`` the previous target image. ``rate=True`` divides by
+    the matching time step (velocity, px/s)."""
     _require_solved(sequence)
     if mesh_idx is None:
         raise ValueError("mesh_idx is required")
+    if mode not in ("leapfrog", "sequential"):
+        raise ValueError(f"mode must be 'leapfrog' or 'sequential', got {mode!r}")
     mesh = sequence.mesh_solution_at(mesh_idx)
-    return contour_mesh(mesh, quantity, **kwargs)
+    if quantity in ("u", "v", "R"):
+        displacements, dt = sequence.increment_displacements(mesh_idx, mode)
+        return _contour_mesh(mesh, quantity, np.asarray(displacements), dt, rate, **kwargs)
+    return contour_mesh(mesh, quantity, rate=rate, **kwargs)
 
 
 def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_ZNCC",
@@ -515,8 +426,16 @@ def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_Z
         return fig, ax
 
 
-def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, mesh_overlay=False,
-                  calibration=None, **kwargs):
+def contour_mesh(mesh, quantity, rate=False, **kwargs):
+    """Contour a solved mesh. ``rate=True`` plots ``u``/``v``/``R`` as
+    velocities: displacement / (``g_time - f_time``), in px/s."""
+    _require_solved(mesh)
+    displacements = np.asarray(mesh.displacements) if quantity in ("u", "v", "R") else None
+    return _contour_mesh(mesh, quantity, displacements, mesh.dt, rate, **kwargs)
+
+
+def _contour_mesh(mesh, quantity, displacements, dt, rate, ax=None, show=True, block=True,
+                  save=False, mesh_overlay=False, calibration=None, **kwargs):
     _require_solved(mesh)
     valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R"}
     if quantity not in valid:
@@ -525,10 +444,13 @@ def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, mes
         raise ValueError(
             f"calibration only applies to quantity in ['R', 'u', 'v'], not {quantity!r}"
         )
+    if rate and quantity not in {"u", "v", "R"}:
+        raise ValueError(f"rate only applies to quantity in ['R', 'u', 'v'], not {quantity!r}")
+    if rate and dt is None:
+        raise ValueError(_NO_TIME_MSG)
 
     nodes = np.asarray(mesh.nodes)
     elements = np.asarray(mesh.elements)
-    displacements = np.asarray(mesh.displacements)
     if calibration is not None:
         # Node positions stay in pixel space (the background image and mesh layout are
         # never re-projected — lens distortion means "calibrated positions" would be a
@@ -537,6 +459,9 @@ def contour_mesh(mesh, quantity, ax=None, show=True, block=True, save=False, mes
         displacements = calibration.i2o(nodes + displacements) - calibration.i2o(nodes)
 
     unit = "calibrated" if calibration is not None else "px"
+    if rate:
+        unit += "/s"
+        displacements = displacements / dt if dt != 0 else np.full_like(displacements, np.nan)
     labels = {
         "C_ZNCC": r"$C_{ZNCC}$ (-)",
         "iterations": "Iterations (-)",
@@ -604,13 +529,40 @@ _STRAIN_LABELS_HISTORY = [
 ]
 
 
-def history_particle(particle, quantity="warps", components=None,
+def _time_axis(particle, n):
+    """``(x, xlabel)``: the particle's image times when stored, else image number."""
+    t = getattr(particle, "time", None)
+    if t is not None:
+        return np.asarray(t)[:n], r"Time, $t$ ($s$)"
+    return np.arange(n, dtype=float), r"Image Number, $i$ ($-$)"
+
+
+def _rate_label(label, displacement):
+    """``label`` with its unit replaced by a per-second one: ``px/s`` for a
+    displacement, ``/s`` otherwise."""
+    name = label.split(" (")[0]
+    return f"{name} ($px/s$)" if displacement else f"{name} ($/s$)"
+
+
+def _check_mode(mode, allowed=("leapfrog", "sequential")):
+    if mode not in allowed:
+        raise ValueError(f"mode must be one of {list(allowed)!r}, got {mode!r}")
+
+
+def history_particle(particle, quantity="warps", components=None, rate=False, mode="leapfrog",
                      ax=None, show=True, block=True, save=None,
                      xlim=None, ylim=None, **kwargs):
+    """Plot a particle's series against time (image number if it has no
+    stored times). ``rate=True`` plots the rate over each increment instead,
+    measured from that row's reference image (``mode="leapfrog"``, default)
+    or from the previous image (``mode="sequential"``, drawn as steps)."""
     _require_solved(particle)
     valid = {"warps", "strains", "vol_strains"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+    _check_mode(mode)
+    if rate and getattr(particle, "time", None) is None:
+        raise ValueError(_NO_TIME_MSG)
 
     owned = ax is None
     if ax is None:
@@ -618,32 +570,49 @@ def history_particle(particle, quantity="warps", components=None,
     else:
         fig = ax.get_figure()
 
+    n = np.asarray(particle.coordinates).shape[0]
+    x, xlabel = _time_axis(particle, n)
+
+    def line(series_quantity, component, label, displacement=False):
+        if not rate:
+            if series_quantity == "warps":
+                y = np.asarray(particle.warps)[:, component]
+            elif series_quantity == "strains":
+                y = np.asarray(particle.strains)[:, component]
+            else:
+                y = np.asarray(particle.vol_strains)
+            ax.plot(x[:len(y)], y, label=label, **kwargs)
+            return
+        y = np.asarray(particle.series_increments(series_quantity, component, mode, True))
+        label = _rate_label(label, displacement)
+        if mode == "sequential":
+            ax.stairs(y, x[:len(y) + 1], label=label, baseline=None, **kwargs)
+        else:
+            ax.plot(x[1:len(y) + 1], y, marker=".", label=label, **kwargs)
+
     if quantity == "warps":
         data = np.asarray(particle.warps)
         if components is None:
             components = range(data.shape[1])
         for c in components:
             label = _WARP_LABELS_HISTORY[c] if c < len(_WARP_LABELS_HISTORY) else str(c)
-            ax.plot(range(data.shape[0]), data[:, c], label=label, **kwargs)
-        ax.set_ylabel("Value")
+            line("warps", c, label, displacement=c < 2)
+        ax.set_ylabel("Rate" if rate else "Value")
         ax.legend()
 
     elif quantity == "strains":
-        strains = np.asarray(particle.strains)
-        vol_strains = np.asarray(particle.vol_strains)
-        ax.plot(range(strains.shape[0]), strains[:, 0], label=_STRAIN_LABELS_HISTORY[0], **kwargs)
-        ax.plot(range(strains.shape[0]), strains[:, 1], label=_STRAIN_LABELS_HISTORY[1], **kwargs)
-        ax.plot(range(strains.shape[0]), strains[:, 5], label=_STRAIN_LABELS_HISTORY[5], **kwargs)
-        ax.plot(range(len(vol_strains)), vol_strains, label=r"$\epsilon_{vol}$ ($-$)", **kwargs)
-        ax.set_ylabel(r"Strain, $\epsilon$")
+        for c in (0, 1, 5):
+            line("strains", c, _STRAIN_LABELS_HISTORY[c])
+        line("vol_strains", 0, r"$\epsilon_{vol}$ ($-$)")
+        ax.set_ylabel(r"Strain rate, $\dot{\epsilon}$ ($/s$)" if rate else r"Strain, $\epsilon$")
         ax.legend()
 
     elif quantity == "vol_strains":
-        vol_strains = np.asarray(particle.vol_strains)
-        ax.plot(range(len(vol_strains)), vol_strains, **kwargs)
-        ax.set_ylabel(r"Volumetric strain, $\epsilon_{vol}$ ($-$)")
+        line("vol_strains", 0, r"$\epsilon_{vol}$ ($-$)")
+        ax.set_ylabel(r"Volumetric strain rate, $\dot{\epsilon}_{vol}$ ($/s$)" if rate
+                      else r"Volumetric strain, $\epsilon_{vol}$ ($-$)")
 
-    ax.set_xlabel(r"Image Number, $i$ ($-$)")
+    ax.set_xlabel(xlabel)
     ax.set_xscale("linear")
     ax.set_yscale("linear")
     if xlim is not None:
@@ -658,6 +627,8 @@ def history_particle(particle, quantity="warps", components=None,
 def history_field(field, particle_index, quantity="warps", components=None,
                   ax=None, show=True, block=True, save=None,
                   xlim=None, ylim=None, **kwargs):
+    """``history_particle`` for particle ``particle_index`` of a field --
+    ``rate=`` and ``mode=`` are passed through."""
     _require_solved(field)
     particle = field.particles[particle_index]
     return history_particle(particle, quantity, components=components,
@@ -665,28 +636,57 @@ def history_field(field, particle_index, quantity="warps", components=None,
                             xlim=xlim, ylim=ylim, **kwargs)
 
 
-def trace_particle(particle, quantity="warps", component=0,
-                   imshow=True, ax=None, show=True, block=True, save=None,
-                   xlim=None, ylim=None, **kwargs):
-    _require_solved(particle)
+def _trace_values(particle, quantity, component, mode, rate):
+    """One colour value per path segment (row ``k - 1`` -> ``k``): the change
+    of the series since the segment's reference image (``"leapfrog"``) or the
+    previous image (``"sequential"``), per second if ``rate``; or the time
+    (image number without times) the segment ends at (``"time"``)."""
+    if mode == "time":
+        n = np.asarray(particle.coordinates).shape[0]
+        return _time_axis(particle, n)[0][1:]
+    return np.asarray(particle.series_increments(quantity, component, mode, rate))
+
+
+def _trace_label(particle, quantity, component, mode, rate):
+    if mode == "time":
+        return _time_axis(particle, 1)[1]
+    if quantity == "warps":
+        label = _WARP_LABELS_HISTORY[component] if component < len(_WARP_LABELS_HISTORY) else str(component)
+    elif quantity == "strains":
+        label = _STRAIN_LABELS_HISTORY[component] if component < len(_STRAIN_LABELS_HISTORY) else str(component)
+    else:
+        label = r"$\epsilon_{vol}$ ($-$)"
+    return _rate_label(label, quantity == "warps" and component < 2) if rate else label
+
+
+def _check_trace_args(particle, quantity, mode, rate):
     valid = {"warps", "strains", "vol_strains"}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+    _check_mode(mode, ("leapfrog", "sequential", "time"))
+    if rate and mode == "time":
+        raise ValueError("rate=True needs mode='leapfrog' or 'sequential', not 'time'")
+    if rate and getattr(particle, "time", None) is None:
+        raise ValueError(_NO_TIME_MSG)
+
+
+def trace_particle(particle, quantity="warps", component=0, mode="leapfrog", rate=False,
+                   imshow=True, ax=None, show=True, block=True, save=None,
+                   xlim=None, ylim=None, **kwargs):
+    """Draw the particle's path, each segment coloured per ``mode``: the
+    change since its reference image (``"leapfrog"``, default), since the
+    previous image (``"sequential"``), or the time it ends at (``"time"``).
+    ``rate=True`` divides the leapfrog/sequential change by its time step."""
+    _require_solved(particle)
+    _check_trace_args(particle, quantity, mode, rate)
 
     coords = np.asarray(particle.coordinates)
-    if quantity == "warps":
-        values = np.diff(np.asarray(particle.warps)[:, component])
-        label = _WARP_LABELS_HISTORY[component] if component < len(_WARP_LABELS_HISTORY) else str(component)
-    elif quantity == "strains":
-        values = np.diff(np.asarray(particle.strains)[:, component])
-        label = _STRAIN_LABELS_HISTORY[component] if component < len(_STRAIN_LABELS_HISTORY) else str(component)
-    else:
-        values = np.diff(np.asarray(particle.vol_strains))
-        label = _STRAIN_LABELS_HISTORY[3]
+    values = _trace_values(particle, quantity, component, mode, rate)
+    label = _trace_label(particle, quantity, component, mode, rate)
 
     points = coords.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    norm = plt.Normalize(values.min(), values.max())
+    norm = plt.Normalize(np.nanmin(values), np.nanmax(values))
     lc = LineCollection(segments, cmap="viridis", norm=norm, **kwargs)
     lc.set_array(values)
 
@@ -718,39 +718,29 @@ def trace_particle(particle, quantity="warps", component=0,
     return fig, ax
 
 
-def trace_field(field, quantity="warps", component=0,
+def trace_field(field, quantity="warps", component=0, mode="leapfrog", rate=False,
                 imshow=True, ax=None, show=True, block=True, save=None,
                 xlim=None, ylim=None, **kwargs):
+    """Every particle's path, coloured as in ``trace_particle``."""
     _require_solved(field)
-    valid = {"warps", "strains", "vol_strains"}
-    if quantity not in valid:
-        raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
+    particles = field.particles
+    if not particles:
+        raise ValueError("field has no particles")
+    _check_trace_args(particles[0], quantity, mode, rate)
 
     all_segments = []
     all_values = []
-    for p in field.particles:
+    for p in particles:
         coords = np.asarray(p.coordinates)
-        if quantity == "warps":
-            v = np.diff(np.asarray(p.warps)[:, component])
-        elif quantity == "strains":
-            v = np.diff(np.asarray(p.strains)[:, component])
-        else:
-            v = np.diff(np.asarray(p.vol_strains))
         pts = coords.reshape(-1, 1, 2)
         all_segments.append(np.concatenate([pts[:-1], pts[1:]], axis=1))
-        all_values.append(v)
+        all_values.append(_trace_values(p, quantity, component, mode, rate))
 
     all_segments = np.concatenate(all_segments, axis=0)
     all_values = np.concatenate(all_values)
+    label = _trace_label(particles[0], quantity, component, mode, rate)
 
-    if quantity == "warps":
-        label = _WARP_LABELS_HISTORY[component] if component < len(_WARP_LABELS_HISTORY) else str(component)
-    elif quantity == "strains":
-        label = _STRAIN_LABELS_HISTORY[component] if component < len(_STRAIN_LABELS_HISTORY) else str(component)
-    else:
-        label = _STRAIN_LABELS_HISTORY[3]
-
-    norm = plt.Normalize(all_values.min(), all_values.max())
+    norm = plt.Normalize(np.nanmin(all_values), np.nanmax(all_values))
     lc = LineCollection(all_segments, cmap="viridis", norm=norm, **kwargs)
     lc.set_array(all_values)
 
@@ -781,6 +771,20 @@ def trace_field(field, quantity="warps", component=0,
     return fig, ax
 
 
+def _field_contour_label(quantity, rate, absolute, calibrated):
+    name = quantity + (" (abs)" if absolute else "")
+    if not rate:
+        return name
+    unit = "calibrated" if calibrated else "px"
+    if quantity == "theta_p":
+        return "theta_p of strain rate (rad)"
+    if quantity == "gamma_max_grad":
+        return f"{name} (/{unit}/s)"
+    if quantity in ("u", "v", "R"):
+        return f"{name} ({unit}/s)"
+    return f"{name} (/s)"
+
+
 def _resolve_window(window, inc_no):
     """contour_field's ``window`` as a concrete half-open ``(start, stop)``
     increment range (``None`` -> ``None``, i.e. all increments). Accepts a
@@ -801,9 +805,22 @@ def _resolve_window(window, inc_no):
     return (k, k + 1)
 
 
-def contour_field(field, quantity, window=None, dt=None, absolute=False, deformed=False,
-                   ax=None, show=True, block=True, save=False, **kwargs):
+def contour_field(field, quantity, window=None, increment=None, mode="leapfrog", rate=False,
+                  absolute=False, deformed=False, ax=None, show=True, block=True, save=False,
+                  **kwargs):
     """Filled contour of one reduced value per particle.
+
+    Rows: ``window`` (``None``: all, i.e. the total; an int ``k``: the value
+    at row ``k``; a pair/slice: last-minus-first over that half-open range),
+    or ``increment=k``, the change *into* row ``k`` -- measured from that
+    row's reference image (``mode="leapfrog"``, default) or from the previous
+    image (``mode="sequential"``). ``absolute`` sums the absolute row-to-row changes.
+
+    ``rate=True`` divides by the elapsed time between the first and last rows
+    (the stored image times): strain rates in /s, ``u``/``v``/``R`` as
+    velocities in px/s (``R`` the speed). Principal quantities (``ep1``,
+    ``ep2``, ``gamma_max``, ``theta_p``) are then those of the strain-rate
+    tensor, not the change in the principal strains.
 
     Values, positions and triangles all come from the core
     (``Field.contour_values`` / ``contour_coordinates`` /
@@ -826,9 +843,16 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False, deforme
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
 
+    _check_mode(mode)
+    if window is not None and increment is not None:
+        raise ValueError("give window or increment, not both")
+    if rate and getattr(field, "time", None) is None:
+        raise ValueError(_NO_TIME_MSG)
     w = _resolve_window(window, field.inc_no)
-    values = np.asarray(field.contour_values(quantity, window=w, dt=dt, absolute=absolute))
-    coords = np.asarray(field.contour_coordinates(deformed=deformed, window=w))
+    values = np.asarray(field.contour_values(
+        quantity, window=w, increment=increment, mode=mode, rate=rate, absolute=absolute))
+    coords = np.asarray(field.contour_coordinates(
+        deformed=deformed, window=w, increment=increment, mode=mode))
     triangles = np.asarray(field.contour_triangles())
     if field.region is None:
         warnings.warn(
@@ -851,10 +875,7 @@ def contour_field(field, quantity, window=None, dt=None, absolute=False, deforme
     else:
         cf = ax.scatter(coords[:, 0], coords[:, 1], c=values, **kwargs)
 
-    if dt is None:
-        label = f"{quantity}" + (" (abs)" if absolute else "")
-    else:
-        label = f"{quantity} /s"
+    label = _field_contour_label(quantity, rate, absolute, getattr(field, "calibrated", False))
 
     cbar = fig.colorbar(cf, ax=ax)
     cbar.set_label(label)
