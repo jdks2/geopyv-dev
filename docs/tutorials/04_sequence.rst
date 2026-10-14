@@ -7,8 +7,9 @@ each successive pair and carrying geometry and warp information forward between
 them — the natural extension when you want to track *progressive* deformation
 rather than a single before/after snapshot.
 
-This tutorial covers: reference-image strategy, ``SequenceOptions``, per-pair
-solving, and extracting/plotting results across a sequence.
+This tutorial covers: image timing, reference-image strategy, ``SequenceOptions``,
+per-pair solving, and extracting/plotting results — including rates — across a
+sequence.
 
 Setup
 ------
@@ -39,10 +40,55 @@ Constructing a ``Sequence``
        target_nodes = 80,
        size         = (15.0, 70.0),
        mesh_order   = 2,
+       time         = 0.1,              # images taken at 10 Hz — see below
    )
 
 The geometry for the first pair is generated immediately, the same as a standalone
 ``Mesh`` (:doc:`03_mesh`) — no correlation has happened yet.
+
+Image timing
+~~~~~~~~~~~~~~
+
+``time`` records when each image was taken, so results can later be plotted as
+rates (velocities, strain rates). It takes one of:
+
+- **A number** — the time step between consecutive images, in seconds:
+  ``time=0.1`` for images taken at 10 Hz gives times ``0.0, 0.1, 0.2, …``. If you
+  have thinned the image directory (say, kept every 10th frame), give the spacing
+  of the images you kept.
+- **A list** — the time of every image in the directory, in sorted order, e.g.
+  ``time=[0.0, 0.5, 2.0, 2.1, 6.0]``. The spacing can be irregular.
+- **Nothing** (``None``, the default) — the times are read from the file names,
+  when every name carries a timestamp. Three forms are recognised:
+
+  .. list-table::
+     :header-rows: 1
+
+     * - Form
+       - Examples
+     * - Date and time, with optional fractional seconds
+       - ``img_2026-10-14T13-45-02.123``, ``cam_20261014_134502123_0001``
+     * - Unix epoch in s, ms, µs or ns (10, 13, 16 or 19 digits)
+       - ``frame_1697283902123``
+     * - Time of day, with separators (a midnight crossing is handled)
+       - ``shot_13-45-02.500``
+
+  The timestamp must be found in the same place in every name. A bare number such
+  as ``shear_3`` or ``frame_000123`` is always taken as a frame counter, never a
+  time, so the canonical shear series above needs ``time`` to be given. When
+  timestamps are found, the images are ordered by them, and a one-line message
+  says which form was matched, so a wrong match is easy to spot.
+
+.. code-block:: python
+
+   print(sequence.time)          # [0.  0.1 0.2 0.3 0.4] — seconds, one per image
+   print(sequence.time_source)   # "given", "filename (<format>)" or "none"
+
+Times are stored relative to the first image (except an explicit list, which is
+kept as given) and are carried into every pair's ``MeshSolution`` as
+``(f_time, g_time)`` — the times of *that pair's* reference and target images —
+and on into ``Particle`` and ``Field`` (:doc:`05_particle`, :doc:`06_field`).
+They survive ``save``/``load``.
 
 Solve
 ------
@@ -211,6 +257,39 @@ composition:
    sequence.convergence(quantity="C_ZNCC")               # all pairs pooled together
    sequence.contour(quantity="R", mesh_idx=3)             # displacement magnitude, last pair
 
+Leapfrog and sequential increments, and rates
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each pair's displacements are measured from that pair's reference image — frame 0
+throughout, unless the reference leapfrogged forward. That is often not what you
+want to look at: in a progressive test you usually want *what happened between
+this frame and the last one*. ``mode`` chooses, for ``u``, ``v`` and ``R``:
+
+- ``mode="leapfrog"`` (default) — from the pair's own reference image, i.e. the
+  displacements as solved. The time step is ``g_time - f_time``.
+- ``mode="sequential"`` — from the previous target image, whatever the reference
+  was. While the reference is unchanged this is ``u(pair m) − u(pair m−1)`` at
+  each node (interpolated onto pair *m*'s nodes if the meshes differ); where the
+  reference has just moved to the previous frame, the pair's own displacement
+  already is that increment. The time step is the time between the two target
+  images.
+
+So a leapfrog-solved sequence can still be plotted sequentially, and vice versa.
+``rate=True`` divides by the matching time step, giving a velocity in px/s:
+
+.. code-block:: python
+
+   sequence.contour(quantity="R", mesh_idx=3, mode="sequential")              # last increment only
+   sequence.contour(quantity="u", mesh_idx=3, mode="sequential", rate=True)   # its velocity, px/s
+   sequence.contour(quantity="u", mesh_idx=3, rate=True)                      # mean velocity since frame 0
+
+   # The same numbers without plotting: an (N, 2) increment and its time step
+   du, dt = sequence.increment_displacements(3, mode="sequential")
+
+Rates need the sequence's times (see *Image timing* above); without them
+``rate=True`` raises an error saying how to supply them. Strain rates come from a
+``Field`` — see :doc:`06_field`.
+
 Save and reload
 ~~~~~~~~~~~~~~~~~
 
@@ -233,6 +312,10 @@ Key takeaways
   changed, and resets automatically when it has.
 - Two ways to reach a pair's data: direct array getters (``sequence.nodes(i, ...)``),
   or a full ``mesh_solution_at(i)`` when you want the whole ``Mesh``-like API.
+- ``time`` (a time step, one time per image, or timestamps read from the file
+  names) lets results be plotted as rates; ``mode="leapfrog"``/``"sequential"``
+  chooses whether a pair's displacement is measured from its reference image or
+  from the previous frame.
 
 **Next:** :doc:`05_particle` — tracking material points through time with
 ``Particle``.

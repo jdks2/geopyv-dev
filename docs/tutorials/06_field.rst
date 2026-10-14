@@ -131,6 +131,10 @@ After solving, the following attributes are available:
    * - ``field.inc_no``
      - int
      - Number of increments solved (= number of meshes + 1)
+   * - ``field.time``
+     - ``(inc_no,)`` or ``None``
+     - Time of each row's image, seconds — from the sequence's ``time``
+       (:doc:`04_sequence`)
 
 Per-particle access
 ~~~~~~~~~~~~~~~~~~~~~
@@ -156,37 +160,84 @@ Plotting
 
 The ``geopyv_dev.plots`` module provides three plot types for fields.
 
-**Spatial contour at a given increment**
+**Spatial contours: total, incremental, and rates**
+
+``quantity`` is one of ``"u"``, ``"v"``, ``"R"`` (displacement magnitude),
+``"ep_xx"``, ``"ep_yy"``, ``"ep_xy"``, ``"ep_vol"``, ``"ep1"``, ``"ep2"``,
+``"gamma_max"``, ``"theta_p"`` (principal strains, maximum shear strain and the
+principal angle) or ``"gamma_max_grad"`` (the spatial gradient of
+``gamma_max``). Which rows of each particle's history are used is set by
+``window`` or ``increment``:
 
 .. code-block:: python
 
    import geopyv_dev.plots as gpp
 
-   # Filled contour of volumetric strain at the last increment
-   gpp.contour_field(
-       field,
-       quantity  = "vol_strains",
-       window    = -1,             # increment index; -1 = last
-       cmap      = "RdBu_r",
-   )
+   # Total: the change over the whole test (the default)
+   gpp.contour_field(field, quantity="ep_vol", cmap="RdBu_r")
 
-``quantity`` accepts any ``ParticleSolution`` attribute that has shape
-``(inc_no,)`` or ``(inc_no, n_components)``.  Use ``absolute=True`` to plot the
-magnitude rather than the signed value.
+   # The value at one row (increment index; -1 = last)
+   gpp.contour_field(field, quantity="gamma_max", window=-1)
+
+   # The change over a range of rows (half-open, like a slice)
+   gpp.contour_field(field, quantity="gamma_max", window=(1, 3))
+
+   # Incremental: the change into row 3 ...
+   gpp.contour_field(field, quantity="gamma_max", increment=3)                      # ... since its reference image
+   gpp.contour_field(field, quantity="gamma_max", increment=3, mode="sequential")   # ... since the previous image
+
+``mode`` has the same meaning as for a sequence (:doc:`04_sequence`):
+``"leapfrog"`` (default) measures the increment from the reference image of the
+pair that produced row 3; ``"sequential"`` from row 2, the previous image. The two
+agree whenever the reference image was advanced every frame. ``absolute=True``
+sums the size of every row-to-row change instead of taking last minus first.
+
+``rate=True`` divides by the time elapsed between the first and last rows used,
+taken from ``field.time`` — so spacing between images can be irregular:
+
+.. code-block:: python
+
+   gpp.contour_field(field, quantity="ep_xx", rate=True)                    # mean strain rate over the test, /s
+   gpp.contour_field(field, quantity="gamma_max", increment=3,
+                     mode="sequential", rate=True)                          # strain rate over one increment, /s
+   gpp.contour_field(field, quantity="R", increment=3, rate=True)           # speed, px/s
+
+Two quantities change meaning under ``rate=True``:
+
+- ``ep1``, ``ep2``, ``gamma_max`` and ``theta_p`` become the principal values,
+  maximum shear rate and principal direction of the **strain-rate tensor**
+  (the change in strain divided by the time step) — not the rate of change of
+  the principal strains, which differs whenever the principal directions rotate,
+  as they do in a developing shear band. ``theta_p`` stays an angle.
+- ``R`` becomes the speed, the size of the change in displacement per second,
+  rather than the rate of change of the displacement's magnitude.
+
+Rates need image times (:doc:`04_sequence`); without them ``rate=True`` raises an
+error saying how to supply them. The colour bar shows the units: ``/s`` for
+strain rates, ``px/s`` for velocities.
 
 **Strain path for one particle**
 
 .. code-block:: python
 
-   # Evolution of warp component 0 (u-displacement) over time for particle 5
+   # u-displacement against time (image number if the sequence has no times), particle 5
    gpp.history_field(field, particle_index=5, quantity="warps", components=[0])
+
+   # Its strain rates over each increment, from the previous image (drawn as steps)
+   gpp.history_field(field, particle_index=5, quantity="strains", rate=True, mode="sequential")
 
 **Spatial traces**
 
 .. code-block:: python
 
-   # Trajectory of all particles (Lagrangian paths overlaid on the reference image)
+   # All particle paths, each segment coloured by the change in u since its reference image
    gpp.trace_field(field, quantity="warps", component=0)
+
+   # ... since the previous image, per second
+   gpp.trace_field(field, quantity="warps", component=0, mode="sequential", rate=True)
+
+   # ... or by the time each segment ends at
+   gpp.trace_field(field, mode="time")
 
 Save and reload
 ~~~~~~~~~~~~~~~~~
@@ -206,6 +257,10 @@ Key takeaways
 - Per-particle results are in ``field.particles``; index ``-1`` gives the final-increment value.
 - ``contour_field``, ``history_field``, and ``trace_field`` cover spatial, temporal,
   and trajectory views respectively.
+- ``window`` gives totals over a range of rows, ``increment`` the change into one
+  row (``mode="leapfrog"`` from its reference image, ``"sequential"`` from the
+  previous image), and ``rate=True`` turns either into a rate using the stored
+  image times — with principal quantities taken from the strain-rate tensor.
 
 **Next:** :doc:`07_validation` — checking results against known synthetic deformations
 with ``Validation``.

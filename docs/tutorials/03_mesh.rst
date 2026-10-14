@@ -85,11 +85,35 @@ Constructing a ``Mesh``
        exclusions    = [exclusion],       # optional holes in the mesh
        exclusions_hard = [True],          # per-exclusion hard flag (default: all True)
        mesh_order    = 2,                 # 1 = linear triangles; 2 = quadratic
+       time          = 0.4,               # optional: seconds between the two images
    )
    print(f"{mesh.nodes.shape[0]} nodes, {mesh.elements.shape[0]} elements")
 
 The geometry (``mesh.nodes``, ``mesh.elements``, ``mesh.boundary``,
 ``mesh.exclusions``) is available immediately — no correlation has happened yet.
+
+Image timing
+~~~~~~~~~~~~~~
+
+``time`` tells the mesh when the two images were taken, so that results can be
+plotted as rates (velocities) as well as displacements. It takes one of:
+
+- **A number** — the time step between the two images, in seconds. ``time=0.4``
+  is the same as ``time=(0.0, 0.4)``.
+- **Two numbers** — the time of each image, ``(f_time, g_time)``, on any clock.
+- **Nothing** (``None``, the default) — the time is read from the image file
+  names, if both carry a timestamp. :doc:`04_sequence` lists the formats
+  recognised. ``shear_0.jpg`` and ``shear_4.jpg`` don't carry one (a bare number
+  is read as a frame counter, never a time), which is why ``time`` is given above.
+
+.. code-block:: python
+
+   print(mesh.time)          # (0.0, 0.4)  — (f_time, g_time), seconds
+   print(mesh.dt)            # 0.4         — g_time - f_time
+   print(mesh.time_source)   # "given", "filename (<format>)" or "none"
+
+The time is stored with the solution, so it survives ``save``/``load``. Without
+it, everything else works as before; only the rate plots below are unavailable.
 
 Linear vs quadratic elements
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -207,6 +231,10 @@ per-node array is there, both by direct indexing and located visually on the mes
    mesh.contour("C_ZNCC", ax=ax2, show=False)
    plt.tight_layout()
 
+   # rate=True plots u, v or R as a velocity: displacement / mesh.dt, in px/s.
+   # It needs the mesh's time (see "Image timing" above).
+   mesh.contour("R", rate=True)
+
    # convergence(): a histogram across all nodes (not a per-iteration trace like
    # Subset.convergence() — a Mesh has many nodes, each with its own history)
    mesh.convergence(quantity="C_ZNCC")
@@ -218,17 +246,22 @@ Building, solving, and inspecting a mesh in the GUI
    A short screen recording of this workflow will be added here.
 
 1. Switch to the **Meshes** tab and click **New**.
-2. In **Mesh Generation**, set target nodes, element size bounds, and mesh order.
-3. In **Solver**, choose ICGN/FAGN, subset order, and the tolerance/iteration limits.
-4. In **Define Region**, pick a drawing mode (Rectangular / Circular / Free), then
+2. In **Timing**, enter the time between the two images as either **Δt (s)** or
+   **Rate (Hz)** — editing one fills in the other. Leave both blank to read the
+   times from the image file names; the line underneath says which timestamp
+   format was found, if any.
+3. In **Mesh Generation**, set target nodes, element size bounds, and mesh order.
+4. In **Solver**, choose ICGN/FAGN, subset order, and the tolerance/iteration limits.
+5. In **Define Region**, pick a drawing mode (Rectangular / Circular / Free), then
    click **Boundary ▶** and draw the region of interest on the image viewer;
    optionally click **Exclusion ▶** to add holes, and **Seed ▶** to place the seed
    node. Status indicators confirm boundary/exclusions/seed are set.
-5. Click **Run** once the mesh is fully specified — it solves in a background
+6. Click **Run** once the mesh is fully specified — it solves in a background
    thread so the UI stays responsive.
-6. Once solved, switch to **View** mode: the metadata row shows node count, mesh
-   order, and seed node; **Displacements** / **Strains** / **Quality** buttons (plus
-   **Iterations** / **Norms** radios) switch the overlay — the same information as
-   ``mesh.contour(...)`` above.
+7. Once solved, switch to **View** mode: the metadata row shows node count, mesh
+   order, and seed node; the **Displacements** / **Quality** buttons and their
+   radios switch the overlay — the same information as ``mesh.contour(...)``
+   above. Under **Displacements**, **Rate (velocity, px/s)** divides by the
+   pair's Δt (shown underneath); it is greyed out when the mesh has no times.
 
 **Next:** :doc:`04_sequence` — extending to a full image sequence with ``Sequence``.

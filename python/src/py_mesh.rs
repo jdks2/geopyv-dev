@@ -17,21 +17,20 @@ use ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::PyTuple;
 
 use geopyv_dev::image::Image;
 use geopyv_dev::io::{save as io_save, GeopyvObject};
-use geopyv_dev::masks::{LocalMask, MaskShape};
+use geopyv_dev::masks::MaskShape;
 use geopyv_dev::mesh::{
-    self, LayerRgConfig, Masking, Mesh, MeshSolution, Preconditioning, SeedConfig, SolveConfig,
-    SolveMethod, ZonalConfig, ZonalMaskingRecord,
+    self, LayerRgConfig, Mesh, MeshSolution, Preconditioning, SeedConfig, SolveConfig,
+    SolveMethod,
 };
 
 use crate::{
     py_geometry::extract_region,
     py_image::PyImage,
     py_mask::PyMask,
-    py_particle::PyMeshlessParams,
     utils::{arc_array1, arc_array2},
     Error,
 };
@@ -77,7 +76,8 @@ impl PyMesh {
     #[new]
     #[pyo3(signature = (boundary, target_nodes, f_img, g_img,
                          size=(1.0, 1000.0), exclusions=None, exclusions_hard=None,
-                         mesh_order=2))]
+                         mesh_order=2, time=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         _py: Python<'_>,
         boundary: &Bound<'_, PyAny>,
@@ -88,7 +88,9 @@ impl PyMesh {
         exclusions: Option<Vec<Bound<'_, PyAny>>>,
         exclusions_hard: Option<Vec<bool>>,
         mesh_order: u8,
+        time: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let time = crate::utils::extract_time_input(time)?;
         let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
         let excl_owned: Vec<Array2<f64>> = exclusions
             .unwrap_or_default()
@@ -106,7 +108,7 @@ impl PyMesh {
         let f_arc = Arc::clone(&f_ref.inner);
         let g_arc = Arc::clone(&g_ref.inner);
 
-        let inner = Mesh::new(
+        let mut inner = Mesh::new(
             boundary_nodes.view(),
             boundary_hard,
             &excl_views,
@@ -118,6 +120,7 @@ impl PyMesh {
             g_arc,
         )
         .map_err(Error::from)?;
+        inner.set_time(time.as_ref()).map_err(Error::from)?;
 
         Ok(PyMesh {
             inner,
@@ -161,47 +164,8 @@ impl PyMesh {
     ///     mesh that's mostly failing. Default ``False`` (matches prior
     ///     behaviour exactly).
     /// masking : str, optional
-    ///     The ``masking`` axis of ``solver_options`` -- ``"uniform"``
-    ///     (default, today's plain solve) or ``"zonal"``. ``"zonal"`` runs
-    ///     an ordinary solve, builds a ``Field`` at the mesh's own node
-    ///     positions to get each node's shear strain, classifies nodes via
-    ///     a robust threshold, rasterises that classification to a
-    ///     whole-image zone label (meshless nearest-node lookup, not mesh-
-    ///     element interpolation), then solves again with that label
-    ///     applied as an internal per-subset exclusion mask. See
-    ///     ``geopyv_dev_fresh/solver_options_restructure.md`` §4's Stage B.
-    ///     Internal plumbing: the ``geopyv_dev`` Python package's own
-    ///     ``Mesh.solve()`` wrapper validates ``solver_options`` before
-    ///     reaching this binding. Every ``zonal_*`` argument below belongs
-    ///     to ``masking="zonal"`` alone: passing any of them with
-    ///     ``masking="uniform"`` raises ``ValueError``.
-    /// zonal_k : float, optional
-    ///     Robust-threshold multiplier for ``masking="zonal"``'s ridge
-    ///     classification: a node sits on an interface ridge when its
-    ///     ``|∇γ|`` exceeds ``median + zonal_k * 1.4826 * MAD`` across all
-    ///     nodes. Default ``2.0``.
-    /// zonal_smoothing_sigma : float, optional
-    ///     Gaussian σ (pixels) applied to the rasterised ``|∇γ|`` image
-    ///     before thresholding. ``None`` ⇒ the mesh's own node spacing.
-    /// zonal_meshless_params : MeshlessParams, optional
-    ///     Params for ``masking="zonal"``'s own internal field solve (the
-    ///     one that computes each node's shear strain and its gradient).
-    ///     Default ``None`` (``MeshlessParams``'s own defaults).
-    /// zonal_iterations : int, optional
-    ///     ``masking="zonal"`` classifier refit passes. ``1`` (default) =
-    ///     classify once -- identical to the pre-iterator behaviour. ``>1``
-    ///     re-solves the internal field ``zone_aware`` (same-zone neighbours
-    ///     only), seeded by the current zone map, and reclassifies, up to
-    ///     this many times or until the per-node zone partition converges.
-    ///     Ignored when ``zonal_zone_map`` is supplied (nothing to refit).
-    /// zonal_zone_map : np.ndarray (H, W), dtype uint8, optional
-    ///     Caller-supplied whole-image zone-label grid matching the
-    ///     reference image. When given (and ``masking="zonal"``), the
-    ///     classifier is skipped and this grid drives pass 2's per-subset
-    ///     masking directly -- use it to mask from a partition you already
-    ///     know (e.g. from specimen geometry) rather than one detected from
-    ///     the strain field. Reserve label ``0`` for "no zone". Default
-    ///     ``None``.
+    ///     ``"uniform"`` (default), the only option: zonal masking has been
+    ///     removed. Anything else raises ``ValueError``.
     /// preconditioning : str, optional
     ///     Intra-mesh RG frontier traversal strategy -- ``"RG"`` (default,
     ///     today's serial cascade) or ``"layer-RG"`` (layer-parallel
@@ -224,11 +188,6 @@ impl PyMesh {
                         override_active=false,
                         preconditioning="RG",
                         masking="uniform",
-                        zonal_k=None,
-                        zonal_smoothing_sigma=None,
-                        zonal_meshless_params=None,
-                        zonal_iterations=None,
-                        zonal_zone_map=None,
                         layer_rg_batch_factor=4,
                         layer_rg_root_rel_eps=0.02,
                         layer_rg_max_workers=None))]
@@ -248,11 +207,6 @@ impl PyMesh {
         override_active: bool,
         preconditioning: &str,
         masking: &str,
-        zonal_k: Option<f64>,
-        zonal_smoothing_sigma: Option<f64>,
-        zonal_meshless_params: Option<PyRef<'_, PyMeshlessParams>>,
-        zonal_iterations: Option<usize>,
-        zonal_zone_map: Option<PyReadonlyArray2<u8>>,
         layer_rg_batch_factor: usize,
         layer_rg_root_rel_eps: f64,
         layer_rg_max_workers: Option<usize>,
@@ -289,14 +243,7 @@ impl PyMesh {
             root_rel_eps: layer_rg_root_rel_eps,
             max_workers: layer_rg_max_workers,
         };
-        let masking = masking_from_py(
-            masking,
-            zonal_k,
-            zonal_smoothing_sigma,
-            zonal_meshless_params.map(|p| p.inner.clone()),
-            zonal_iterations,
-            zonal_zone_map.map(|a| a.as_array().to_owned()),
-        )?;
+        check_masking(masking)?;
         let cfg = SolveConfig {
             max_norm,
             max_iterations,
@@ -306,7 +253,6 @@ impl PyMesh {
             override_active,
             preconditioning,
             layer_rg,
-            masking,
         };
         self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
         Ok(())
@@ -352,6 +298,25 @@ impl PyMesh {
     }
 
     /// Reference image used at construction, or ``None``.
+    /// ``(f_time, g_time)`` of the image pair in seconds, or ``None`` —
+    /// from ``time=`` or the image file names.
+    #[getter]
+    fn time(&self) -> Option<(f64, f64)> {
+        self.inner.time
+    }
+
+    /// ``g_time - f_time`` in seconds, or ``None``.
+    #[getter]
+    fn dt(&self) -> Option<f64> {
+        self.inner.time.map(|(f, g)| g - f)
+    }
+
+    /// Where ``time`` came from: ``"given"``, ``"filename (<format>)"`` or ``"none"``.
+    #[getter]
+    fn time_source(&self) -> String {
+        self.inner.time_source.describe()
+    }
+
     #[getter]
     fn f_img(&self, py: Python<'_>) -> Option<Py<PyImage>> {
         self.f_img.as_ref().map(|img| img.clone_ref(py))
@@ -460,17 +425,6 @@ impl PyMesh {
             .template_sizes
             .as_ref()
             .map(|a| a.clone().into_pyarray_bound(py)))
-    }
-
-    /// Zonal-masking diagnostics, or ``None`` unless this mesh was solved
-    /// with ``solver_options={"masking": "zonal"}`` and pass 2 succeeded.
-    #[getter]
-    fn zonal_masking(&self) -> PyResult<Option<PyZonalMaskingRecord>> {
-        Ok(self
-            .require_solved()?
-            .zonal_masking
-            .clone()
-            .map(|inner| PyZonalMaskingRecord { inner }))
     }
 
     // -----------------------------------------------------------------------
@@ -643,7 +597,7 @@ impl PyMeshSolution {
                 seed: None,
                 template_shape: None,
                 template_sizes: None,
-                zonal_masking: None,
+                time: None,
             },
         }
     }
@@ -748,12 +702,16 @@ impl PyMeshSolution {
             .map(|a| a.clone().into_pyarray_bound(py))
     }
 
+    /// ``(f_time, g_time)`` of the image pair in seconds, or ``None``.
     #[getter]
-    fn zonal_masking(&self) -> Option<PyZonalMaskingRecord> {
-        self.inner
-            .zonal_masking
-            .clone()
-            .map(|inner| PyZonalMaskingRecord { inner })
+    fn time(&self) -> Option<(f64, f64)> {
+        self.inner.time
+    }
+
+    /// ``g_time - f_time`` in seconds, or ``None``.
+    #[getter]
+    fn dt(&self) -> Option<f64> {
+        self.inner.dt()
     }
 
     fn __repr__(&self) -> String {
@@ -772,10 +730,6 @@ impl PyMeshSolution {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Zonal-masking inspection
-// ---------------------------------------------------------------------------
-
 fn mask_shape_name(shape: &MaskShape) -> String {
     match shape {
         MaskShape::Circle => "circle",
@@ -783,175 +737,6 @@ fn mask_shape_name(shape: &MaskShape) -> String {
         MaskShape::Semicircle => "semicircle",
     }
     .to_string()
-}
-
-/// Read-only view of a solved mesh's zonal-masking diagnostics — see
-/// `geopyv_dev::mesh::ZonalMaskingRecord`. Returned by
-/// ``Mesh.zonal_masking`` / ``MeshSolution.zonal_masking``; all per-node
-/// arrays are indexed like ``mesh.nodes``.
-#[pyclass(name = "ZonalMaskingRecord", module = "geopyv_dev._geopyv_dev")]
-pub struct PyZonalMaskingRecord {
-    inner: ZonalMaskingRecord,
-}
-
-#[pymethods]
-impl PyZonalMaskingRecord {
-    /// Stage-2 meshless shear strain (``gamma_max``) per node, ``(N,)`` —
-    /// context only; the classifier keys off its gradient.
-    #[getter]
-    fn node_gamma_max<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.node_gamma_max.clone().into_pyarray_bound(py)
-    }
-
-    /// Stage-2 meshless shear-strain gradient magnitude ``|∇γ|`` per node,
-    /// ``(N,)`` — the classifying signal.
-    #[getter]
-    fn node_gamma_max_grad<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.node_gamma_max_grad.clone().into_pyarray_bound(py)
-    }
-
-    /// ``True`` where the node's ``|∇γ|`` exceeded ``grad_cutoff`` (sits on
-    /// an interface ridge rather than inside a regime), ``(N,)``.
-    #[getter]
-    fn node_boundary(&self) -> Vec<bool> {
-        self.inner.node_boundary.clone()
-    }
-
-    /// Zone id under each node's own centre in ``zone_image``, ``(N,)``.
-    #[getter]
-    fn node_zone<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
-        self.inner.node_zone.clone().into_pyarray_bound(py)
-    }
-
-    /// Retained pixel count before the zone cut (shape ∩ boundary), ``(N,)``.
-    #[getter]
-    fn node_pre_px<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
-        self.inner.node_pre_px.clone().into_pyarray_bound(py)
-    }
-
-    /// Retained pixel count after the zone cut
-    /// (shape ∩ boundary ∩ zone), ``(N,)``.
-    #[getter]
-    fn node_post_px<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u32>> {
-        self.inner.node_post_px.clone().into_pyarray_bound(py)
-    }
-
-    /// ``True`` where the minimum-pixel guard rejected the zone cut and the
-    /// node was solved un-zoned, ``(N,)``.
-    #[getter]
-    fn node_guard_fallback(&self) -> Vec<bool> {
-        self.inner.node_guard_fallback.clone()
-    }
-
-    /// Whole-image zone-label grid pass 2 applied, ``(H, W)`` uint8.
-    #[getter]
-    fn zone_image<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<u8>> {
-        self.inner.zone_image.clone().into_pyarray_bound(py)
-    }
-
-    #[getter]
-    fn k(&self) -> f64 {
-        self.inner.k
-    }
-
-    /// Median of the per-node ``|∇γ|``.
-    #[getter]
-    fn grad_median(&self) -> f64 {
-        self.inner.grad_median
-    }
-
-    /// Median absolute deviation of the per-node ``|∇γ|``.
-    #[getter]
-    fn grad_mad(&self) -> f64 {
-        self.inner.grad_mad
-    }
-
-    /// ``grad_median + k * 1.4826 * grad_mad`` — the ridge cut-off on ``|∇γ|``.
-    #[getter]
-    fn grad_cutoff(&self) -> f64 {
-        self.inner.grad_cutoff
-    }
-
-    fn __repr__(&self) -> String {
-        let n = self.inner.node_zone.len();
-        let n_ridge = self.inner.node_boundary.iter().filter(|&&e| e).count();
-        let n_fallback = self.inner.node_guard_fallback.iter().filter(|&&e| e).count();
-        let n_zones = self
-            .inner
-            .zone_image
-            .iter()
-            .copied()
-            .collect::<HashSet<u8>>()
-            .len();
-        format!(
-            "ZonalMaskingRecord(nodes={n}, zones={n_zones}, ridge_nodes={n_ridge}, \
-             guard_fallback={n_fallback}, k={:.3}, grad_cutoff={:.4})",
-            self.inner.k, self.inner.grad_cutoff,
-        )
-    }
-}
-
-/// Reconstruct one subset's template footprint under a zone-label image:
-/// which pixels of a ``(template_shape, template_size)`` ``LocalMask``
-/// centred at ``node_coord`` survive ``zone_image``'s per-subset zone cut
-/// (`LocalMask::zone_mask_update`), and which are removed.
-///
-/// Pure geometry — the mesh's boundary/exclusion mask is deliberately NOT
-/// applied here (it only trims pixels at the mesh edge; the authoritative
-/// pre/post counts are in ``ZonalMaskingRecord``). Returns a dict with
-/// ``coords_kept`` ``(K, 2)`` and ``coords_cut`` ``(L, 2)``, both absolute
-/// ``[x, y]`` pixel coordinates.
-#[pyfunction]
-fn zoned_subset_footprint<'py>(
-    py: Python<'py>,
-    zone_image: PyReadonlyArray2<u8>,
-    node_coord: [f64; 2],
-    template_shape: &str,
-    template_size: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let base = match template_shape {
-        "circle" => LocalMask::circle(template_size),
-        "square" => LocalMask::square(template_size),
-        "semicircle" => LocalMask::semicircle(template_size),
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unknown template_shape {other:?} (expected circle/square/semicircle)"
-            )))
-        }
-    }
-    .map_err(Error::from)?;
-
-    let full: Vec<(i64, i64)> = base
-        .coords
-        .outer_iter()
-        .map(|r| (r[0] as i64, r[1] as i64))
-        .collect();
-
-    let mut cut = base.clone();
-    cut.zone_mask_update(node_coord, zone_image.as_array());
-    let kept_set: HashSet<(i64, i64)> = cut
-        .coords
-        .outer_iter()
-        .map(|r| (r[0] as i64, r[1] as i64))
-        .collect();
-
-    let to_abs = |offsets: &[(i64, i64)]| -> Array2<f64> {
-        let mut a = Array2::<f64>::zeros((offsets.len(), 2));
-        for (i, &(dx, dy)) in offsets.iter().enumerate() {
-            a[[i, 0]] = node_coord[0] + dx as f64;
-            a[[i, 1]] = node_coord[1] + dy as f64;
-        }
-        a
-    };
-
-    let kept: Vec<(i64, i64)> = full.iter().copied().filter(|o| kept_set.contains(o)).collect();
-    let removed: Vec<(i64, i64)> =
-        full.iter().copied().filter(|o| !kept_set.contains(o)).collect();
-
-    let d = PyDict::new_bound(py);
-    d.set_item("coords_kept", to_abs(&kept).into_pyarray_bound(py))?;
-    d.set_item("coords_cut", to_abs(&removed).into_pyarray_bound(py))?;
-    Ok(d)
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,55 +854,15 @@ fn mesh_r_calc(displacement: [f64; 2]) -> f64 {
     mesh::r_calc(displacement)
 }
 
-/// Build the `masking` axis from the binding's flat `masking=` /
-/// `zonal_*` arguments (shared by `Mesh.solve` and `Sequence.solve`). Every
-/// `zonal_*` argument belongs to `masking="zonal"` alone: supplying one with
-/// `masking="uniform"` is an error rather than silently ignored.
-pub(crate) fn masking_from_py(
-    masking: &str,
-    zonal_k: Option<f64>,
-    zonal_smoothing_sigma: Option<f64>,
-    zonal_meshless_params: Option<geopyv_dev::particle::MeshlessParams>,
-    zonal_iterations: Option<usize>,
-    zonal_zone_map: Option<Array2<u8>>,
-) -> PyResult<Masking> {
+/// `masking=` is kept for compatibility; `"uniform"` is its only value
+/// since zonal masking was removed.
+pub(crate) fn check_masking(masking: &str) -> PyResult<()> {
     match masking {
-        "uniform" => {
-            let given: Vec<&str> = [
-                ("zonal_k", zonal_k.is_some()),
-                ("zonal_smoothing_sigma", zonal_smoothing_sigma.is_some()),
-                ("zonal_meshless_params", zonal_meshless_params.is_some()),
-                ("zonal_iterations", zonal_iterations.is_some()),
-                ("zonal_zone_map", zonal_zone_map.is_some()),
-            ]
-            .iter()
-            .filter(|(_, g)| *g)
-            .map(|(n, _)| *n)
-            .collect();
-            if !given.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "{given:?} only apply with masking='zonal' (got masking='uniform')"
-                )));
-            }
-            Ok(Masking::Uniform)
-        }
-        "zonal" => {
-            let defaults = ZonalConfig::default();
-            let iterations = zonal_iterations.unwrap_or(defaults.iterations);
-            if iterations == 0 {
-                return Err(PyValueError::new_err("zonal_iterations must be >= 1"));
-            }
-            Ok(Masking::Zonal(ZonalConfig {
-                meshless_params: zonal_meshless_params.unwrap_or(defaults.meshless_params),
-                k: zonal_k.unwrap_or(defaults.k),
-                smoothing_sigma: zonal_smoothing_sigma,
-                iterations,
-                zone_map: zonal_zone_map,
-            }))
-        }
-        other => Err(PyValueError::new_err(format!(
-            "masking must be 'uniform' or 'zonal', got {other:?}"
-        ))),
+        "uniform" => Ok(()),
+        "zonal" => Err(PyValueError::new_err(
+            "masking='zonal' has been removed; 'uniform' is the only masking option",
+        )),
+        other => Err(PyValueError::new_err(format!("masking must be 'uniform', got {other:?}"))),
     }
 }
 
@@ -1127,9 +872,7 @@ pub(crate) fn masking_from_py(
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMesh>()?;
-    m.add_class::<PyZonalMaskingRecord>()?;
     // PyMeshSolution intentionally NOT registered — serialisation boundary only.
-    m.add_function(wrap_pyfunction!(zoned_subset_footprint, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_element_area, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_element_strains, m)?)?;
     m.add_function(wrap_pyfunction!(mesh_shape_function, m)?)?;

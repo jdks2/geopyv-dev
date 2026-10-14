@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "geopyv-dev"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bincode",
  "image",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "geopyv-dev-python"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "geopyv-dev",
  "geopyv-gui",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "geopyv-gui"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "dirs",
  "eframe",

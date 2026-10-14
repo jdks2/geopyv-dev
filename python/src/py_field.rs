@@ -69,6 +69,12 @@ impl PyFieldSolution {
         self.inner.calibrated
     }
 
+    /// Time of each row (image) in seconds ``(inc_no,)``, or ``None``.
+    #[getter]
+    fn time<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner.time.clone().map(|t| PyArray1::from_vec_bound(py, t))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "FieldSolution(particles={}, inc_no={})",
@@ -257,38 +263,64 @@ impl PyField {
         }))
     }
 
+    /// Time of each row (image) in seconds ``(inc_no,)``, or ``None``.
+    #[getter]
+    fn time<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        Ok(self.require_solved()?.time.clone().map(|t| PyArray1::from_vec_bound(py, t)))
+    }
+
     /// One reduced value of ``quantity`` per particle ``(N,)``.
     ///
-    /// ``window`` is a half-open increment range ``(start, stop)`` (``None``:
-    /// all). With ``dt`` unset the value is last-minus-first over the window,
-    /// or the sum of |increment deltas| if ``absolute``; with ``dt`` it is the
-    /// mean rate. ``gamma_max_grad`` reduces each gradient component and
-    /// returns the magnitude.
-    #[pyo3(signature = (quantity, window=None, dt=None, absolute=false))]
+    /// Rows: ``window``, a half-open range ``(start, stop)`` (``None``: all),
+    /// or ``increment=k``, the change *into* row ``k`` — from row ``k - 1``
+    /// (``mode="sequential"``) or from that row's reference image
+    /// (``mode="leapfrog"``). Over several rows the value is last-minus-first,
+    /// or the sum of |row-to-row changes| if ``absolute``; one row gives its
+    /// own value. ``rate`` divides by the elapsed time (stored ``time``);
+    /// under a rate ``R`` is the speed and the principal quantities are those
+    /// of the strain-rate tensor. ``gamma_max_grad`` reduces each gradient
+    /// component and returns the magnitude.
+    #[pyo3(signature = (quantity, window=None, increment=None, mode="leapfrog", rate=false, absolute=false))]
+    #[allow(clippy::too_many_arguments)]
     fn contour_values<'py>(
         &self,
         py: Python<'py>,
         quantity: &str,
         window: Option<(usize, usize)>,
-        dt: Option<f64>,
+        increment: Option<usize>,
+        mode: &str,
+        rate: bool,
         absolute: bool,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let q: FieldQuantity = quantity.parse().map_err(value_error)?;
-        let red = ContourReduction { window, dt, absolute };
+        let mode = crate::utils::parse_mode(mode)?;
+        let red = ContourReduction { window, increment, mode, rate, absolute };
         let v = self.require_solved()?.contour_values(q, &red).map_err(value_error)?;
         Ok(v.into_pyarray_bound(py))
     }
 
+    /// The half-open ``(start, stop)`` rows ``contour_values`` reduces over
+    /// for this ``window`` / ``increment`` / ``mode``.
+    #[pyo3(signature = (window=None, increment=None, mode="leapfrog"))]
+    fn contour_range(&self, window: Option<(usize, usize)>, increment: Option<usize>, mode: &str) -> PyResult<(usize, usize)> {
+        let mode = crate::utils::parse_mode(mode)?;
+        let red = ContourReduction { window, increment, mode, ..Default::default() };
+        self.require_solved()?.contour_range(&red).map_err(value_error)
+    }
+
     /// Particle positions ``(N, 2)`` to contour at: initial, or (``deformed``)
-    /// at the last increment of ``window``.
-    #[pyo3(signature = (deformed=false, window=None))]
+    /// at the last row of ``window`` / ``increment``.
+    #[pyo3(signature = (deformed=false, window=None, increment=None, mode="leapfrog"))]
     fn contour_coordinates<'py>(
         &self,
         py: Python<'py>,
         deformed: bool,
         window: Option<(usize, usize)>,
+        increment: Option<usize>,
+        mode: &str,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        let red = ContourReduction { window, ..Default::default() };
+        let mode = crate::utils::parse_mode(mode)?;
+        let red = ContourReduction { window, increment, mode, ..Default::default() };
         let c = self.require_solved()?.contour_coordinates(deformed, &red).map_err(value_error)?;
         Ok(c.into_pyarray_bound(py))
     }

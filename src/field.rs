@@ -37,10 +37,11 @@ use crate::{
     calibration::CalibrationParams,
     geometry::utilities::point_in_polygon,
     particle::{
-        meshless_scalar_gradient_batch, Particle, ParticleConfig, ParticleSource,
+        meshless_scalar_gradient_batch, principal_2x2, Particle, ParticleConfig, ParticleSource,
         ParticleSolution, StrainMethod,
     },
-    sequence::SequenceSolution,
+    sequence::{reference_row, SequenceSolution},
+    timing::IncrementMode,
     Error,
 };
 
@@ -208,6 +209,10 @@ pub struct FieldSolution {
     /// solutions predating this field (.pyv schema < 0x08).
     #[serde(default)]
     pub region: Option<FieldRegion>,
+    /// Time of each row (image), seconds, `(inc_no,)` — see
+    /// [`crate::timing`]. `None` when the source images had no times.
+    #[serde(default)]
+    pub time: Option<Vec<f64>>,
 }
 
 /// Boundary and exclusion polygons of a [`Field`], each `(N, 2)` `[x, y]`.
@@ -364,6 +369,8 @@ impl Field {
             exclusion_regions: Vec::new(),
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         });
         let n = sol.initial_coordinates.nrows();
         let mut volumes = Array1::<f64>::zeros(n);
@@ -511,6 +518,7 @@ impl Field {
                 Some(params) => r.i2o(params),
                 None => r,
             }),
+            time: source.row_times(n_meshes + 1),
         });
         Ok(())
     }
@@ -574,21 +582,51 @@ impl std::str::FromStr for FieldQuantity {
 
 /// How a per-increment series is collapsed to one contour value.
 ///
-/// `window` is a half-open increment range `[start, stop)`; `None` means the
-/// whole series. With `dt` unset the value is last-minus-first over the
-/// window (or the sum of |increment deltas| if `absolute`); with `dt` set it
-/// is the mean rate `(last - first) / (len * dt)`.
+/// The rows reduced are `window` (half-open `[start, stop)`; `None` = all),
+/// or, with `increment = Some(k)`, the change *into* row `k`: from row
+/// `k - 1` ([`IncrementMode::Sequential`]) or from the reference image of the
+/// pair that produced row `k` ([`IncrementMode::Leapfrog`]). `mode` only
+/// affects `increment`.
+///
+/// Over more than one row the value is last-minus-first (or, if `absolute`,
+/// the sum of |row-to-row changes|); a single row gives that row's value.
+/// With `rate` it is divided by the time elapsed between the first and last
+/// rows (for a single row `k`: since row 0), from the solution's stored
+/// `time`. Under `rate`, `R` is the speed `|Δ(u, v)| / Δt`, and `ep1`,
+/// `ep2`, `gamma_max`, `theta_p` are the principal values/angle of the
+/// strain-rate tensor `Δε / Δt`, not the change in the principal strains.
+/// A zero time step gives NaN.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ContourReduction {
     pub window: Option<(usize, usize)>,
-    pub dt: Option<f64>,
+    pub increment: Option<usize>,
+    pub mode: IncrementMode,
+    pub rate: bool,
     pub absolute: bool,
 }
 
 impl ContourReduction {
-    /// The concrete `[start, stop)` range for a series of `inc_no` values.
-    fn range(&self, inc_no: usize) -> Result<(usize, usize), Error> {
-        let (start, stop) = self.window.unwrap_or((0, inc_no));
+    /// The concrete `[start, stop)` rows for a solution of `inc_no` rows
+    /// whose reference image was updated at the pair indices `register`.
+    pub fn range(&self, inc_no: usize, register: &[usize]) -> Result<(usize, usize), Error> {
+        let (start, stop) = match (self.increment, self.window) {
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidInput("give window or increment, not both".to_string()))
+            }
+            (Some(k), None) => {
+                if k == 0 || k >= inc_no {
+                    return Err(Error::InvalidInput(format!(
+                        "increment must be in 1..{inc_no} (the change into that row), got {k}"
+                    )));
+                }
+                let from = match self.mode {
+                    IncrementMode::Sequential => k - 1,
+                    IncrementMode::Leapfrog => reference_row(register, k),
+                };
+                (from, k + 1)
+            }
+            (None, w) => w.unwrap_or((0, inc_no)),
+        };
         if start >= stop || stop > inc_no {
             return Err(Error::InvalidInput(format!(
                 "window [{start}, {stop}) is empty or exceeds the {inc_no} increments"
@@ -596,16 +634,24 @@ impl ContourReduction {
         }
         Ok((start, stop))
     }
+}
 
-    fn reduce(&self, v: &[f64]) -> f64 {
-        let n = v.len();
-        match self.dt {
-            None if self.absolute => v.windows(2).map(|w| (w[1] - w[0]).abs()).sum(),
-            None if n > 1 => v[n - 1] - v[0],
-            None => v[n - 1],
-            Some(dt) if n > 1 => (v[n - 1] - v[0]) / (n as f64 * dt),
-            Some(_) => 0.0,
-        }
+/// `Δt` between rows `a` and `b`; NaN for a zero step.
+fn elapsed(time: &[f64], a: usize, b: usize) -> f64 {
+    let dt = time[b] - time[a];
+    if dt == 0.0 { f64::NAN } else { dt }
+}
+
+/// The stored row times, or an error explaining how to supply them.
+fn require_time(time: Option<&Vec<f64>>, inc_no: usize) -> Result<&[f64], Error> {
+    match time {
+        Some(t) if t.len() >= inc_no => Ok(&t[..inc_no]),
+        _ => Err(Error::InvalidInput(
+            "rates need image times, and this solution has none: pass time= (a time \
+             increment, or one time per image) to the Sequence/Mesh, or use image file \
+             names that carry a timestamp, then re-solve"
+                .to_string(),
+        )),
     }
 }
 
@@ -629,6 +675,126 @@ impl ParticleSolution {
             SeriesQuantity::VolStrain => self.vol_strains.clone(),
         }
     }
+
+    /// The change of `q` into each row `k = 1..inc_no` (length
+    /// `inc_no - 1`): from row `k - 1` (sequential) or from row `k`'s
+    /// reference image (leapfrog); with `rate`, divided by that `Δt`.
+    pub fn series_increments(&self, q: SeriesQuantity, mode: IncrementMode, rate: bool) -> Result<Array1<f64>, Error> {
+        let s = self.series(q);
+        let n = s.len();
+        let time = if rate { Some(require_time(self.time.as_ref(), n)?) } else { None };
+        Ok((1..n)
+            .map(|k| {
+                let from = match mode {
+                    IncrementMode::Sequential => k - 1,
+                    IncrementMode::Leapfrog => reference_row(&self.reference_update_register, k),
+                };
+                let d = s[k] - s[from];
+                time.map_or(d, |t| d / elapsed(t, from, k))
+            })
+            .collect())
+    }
+
+    /// One reduced value of `q` over rows `[start, stop)` — see
+    /// [`ContourReduction`]. `time` is required when `red.rate`.
+    fn reduce(&self, q: FieldQuantity, red: &ContourReduction, (start, stop): (usize, usize), time: Option<&[f64]>) -> Result<f64, Error> {
+        let principal = || {
+            self.principal_strains.as_ref().ok_or_else(|| Error::InvalidInput(
+                "principal_strains is not available on this solution (it predates \
+                 this field -- re-solve to populate it)".to_string(),
+            ))
+        };
+        // Rows reduced and the time they span: a single row `k` under a rate
+        // is its change since row 0.
+        let (a, b) = if red.rate && stop - start == 1 { (0, start) } else { (start, stop - 1) };
+        let reduce_scalar = |v: &dyn Fn(usize) -> f64| -> f64 {
+            if a == b {
+                return if red.rate { f64::NAN } else if red.absolute { 0.0 } else { v(b) };
+            }
+            if red.absolute {
+                (a + 1..=b).map(|i| (v(i) - v(i - 1)).abs()).sum()
+            } else {
+                v(b) - v(a)
+            }
+        };
+        let per_second = |x: f64| match time {
+            Some(t) if red.rate => x / elapsed(t, a, b),
+            _ => x,
+        };
+
+        let scalar = |v: &dyn Fn(usize) -> f64| -> f64 {
+            if !red.rate && stop - start == 1 {
+                // A single row's own (cumulative) value, or 0 if absolute.
+                return if red.absolute { 0.0 } else { v(start) };
+            }
+            per_second(reduce_scalar(v))
+        };
+
+        Ok(match q {
+            FieldQuantity::U => scalar(&|m| self.warps[[m, 0]]),
+            FieldQuantity::V => scalar(&|m| self.warps[[m, 1]]),
+            FieldQuantity::EpXx => scalar(&|m| self.strains[[m, 0]]),
+            FieldQuantity::EpYy => scalar(&|m| self.strains[[m, 1]]),
+            FieldQuantity::EpXy => scalar(&|m| self.strains[[m, 5]]),
+            FieldQuantity::EpVol => scalar(&|m| self.vol_strains[m]),
+            FieldQuantity::R if !red.rate => scalar(&|m| self.warps[[m, 0]].hypot(self.warps[[m, 1]])),
+            FieldQuantity::R => {
+                // Speed: magnitude of the displacement change.
+                let du = |i: usize, j: usize| {
+                    (self.warps[[j, 0]] - self.warps[[i, 0]]).hypot(self.warps[[j, 1]] - self.warps[[i, 1]])
+                };
+                if a == b {
+                    f64::NAN
+                } else if red.absolute {
+                    per_second((a + 1..=b).map(|i| du(i - 1, i)).sum())
+                } else {
+                    per_second(du(a, b))
+                }
+            }
+            FieldQuantity::Ep1 | FieldQuantity::Ep2 | FieldQuantity::GammaMax | FieldQuantity::ThetaP => {
+                let c = match q {
+                    FieldQuantity::Ep1 => 0,
+                    FieldQuantity::Ep2 => 1,
+                    FieldQuantity::GammaMax => 2,
+                    _ => 3,
+                };
+                if !red.rate {
+                    let ps = principal()?;
+                    scalar(&|m| ps[[m, c]])
+                } else {
+                    // Principal value/angle of the strain-rate tensor.
+                    let of_delta = |i: usize, j: usize| {
+                        let d = |col: usize| self.strains[[j, col]] - self.strains[[i, col]];
+                        let (ep1, ep2, theta) = principal_2x2(d(0), d(1), d(5));
+                        [ep1, ep2, ep1 - ep2, theta][c]
+                    };
+                    if c == 3 {
+                        if red.absolute {
+                            return Err(Error::InvalidInput(
+                                "theta_p is an angle: absolute=True has no meaning for its rate".to_string(),
+                            ));
+                        }
+                        if a == b { f64::NAN } else { of_delta(a, b) }
+                    } else if a == b {
+                        f64::NAN
+                    } else if red.absolute {
+                        per_second((a + 1..=b).map(|i| of_delta(i - 1, i).abs()).sum())
+                    } else {
+                        per_second(of_delta(a, b))
+                    }
+                }
+            }
+            FieldQuantity::GammaMaxGrad => {
+                let g = self.gamma_max_grad.as_ref().ok_or_else(|| Error::InvalidInput(
+                    "gamma_max_grad is not available -- it requires solving via \
+                     Field.solve() with strain_method left as meshless (the default)"
+                        .to_string(),
+                ))?;
+                // Each component reduced separately, then the magnitude.
+                scalar(&|m| g[[m, 0]]).hypot(scalar(&|m| g[[m, 1]]))
+            }
+        })
+    }
 }
 
 impl FieldSolution {
@@ -637,65 +803,21 @@ impl FieldSolution {
         self.particles.first().map_or(0, |p| p.coordinates.nrows())
     }
 
+    /// The `[start, stop)` rows `red` reduces over.
+    pub fn contour_range(&self, red: &ContourReduction) -> Result<(usize, usize), Error> {
+        red.range(self.inc_no(), &self.reference_update_register)
+    }
+
     /// One reduced value of `q` per particle — see [`ContourReduction`].
     ///
-    /// `GammaMaxGrad` reduces each gradient component separately and returns
-    /// the magnitude of the result. Errors if `q` needs a stored array this
-    /// solution lacks (`principal_strains` on pre-v2 files, `gamma_max_grad`
-    /// unless solved meshless via `Field::solve`).
+    /// Errors if `q` needs a stored array this solution lacks
+    /// (`principal_strains` on pre-v2 files, `gamma_max_grad` unless solved
+    /// meshless via `Field::solve`), or if `red.rate` and the solution has
+    /// no `time`.
     pub fn contour_values(&self, q: FieldQuantity, red: &ContourReduction) -> Result<Array1<f64>, Error> {
-        let (start, stop) = red.range(self.inc_no())?;
-        let mut out = Array1::<f64>::zeros(self.particles.len());
-        let mut buf = Vec::with_capacity(stop - start);
-        for (i, p) in self.particles.iter().enumerate() {
-            let col = |a: &Array2<f64>, c: usize, buf: &mut Vec<f64>| {
-                buf.clear();
-                buf.extend((start..stop).map(|m| a[[m, c]]));
-            };
-            match q {
-                FieldQuantity::U => col(&p.warps, 0, &mut buf),
-                FieldQuantity::V => col(&p.warps, 1, &mut buf),
-                FieldQuantity::R => {
-                    buf.clear();
-                    buf.extend((start..stop).map(|m| p.warps[[m, 0]].hypot(p.warps[[m, 1]])));
-                }
-                FieldQuantity::EpXx => col(&p.strains, 0, &mut buf),
-                FieldQuantity::EpYy => col(&p.strains, 1, &mut buf),
-                FieldQuantity::EpXy => col(&p.strains, 5, &mut buf),
-                FieldQuantity::EpVol => {
-                    buf.clear();
-                    buf.extend((start..stop).map(|m| p.vol_strains[m]));
-                }
-                FieldQuantity::Ep1 | FieldQuantity::Ep2 | FieldQuantity::GammaMax | FieldQuantity::ThetaP => {
-                    let ps = p.principal_strains.as_ref().ok_or_else(|| Error::InvalidInput(
-                        "principal_strains is not available on this solution (it predates \
-                         this field -- re-solve to populate it)".to_string(),
-                    ))?;
-                    let c = match q {
-                        FieldQuantity::Ep1 => 0,
-                        FieldQuantity::Ep2 => 1,
-                        FieldQuantity::GammaMax => 2,
-                        _ => 3,
-                    };
-                    col(ps, c, &mut buf);
-                }
-                FieldQuantity::GammaMaxGrad => {
-                    let g = p.gamma_max_grad.as_ref().ok_or_else(|| Error::InvalidInput(
-                        "gamma_max_grad is not available -- it requires solving via \
-                         Field.solve() with strain_method left as meshless (the default)"
-                            .to_string(),
-                    ))?;
-                    col(g, 0, &mut buf);
-                    let gx = red.reduce(&buf);
-                    col(g, 1, &mut buf);
-                    let gy = red.reduce(&buf);
-                    out[i] = gx.hypot(gy);
-                    continue;
-                }
-            }
-            out[i] = red.reduce(&buf);
-        }
-        Ok(out)
+        let range = self.contour_range(red)?;
+        let time = if red.rate { Some(require_time(self.time.as_ref(), self.inc_no())?) } else { None };
+        self.particles.iter().map(|p| p.reduce(q, red, range, time)).collect()
     }
 
     /// Particle positions to draw a contour at, `(N, 2)`: the initial
@@ -705,7 +827,7 @@ impl FieldSolution {
         if !deformed {
             return Ok(self.initial_coordinates.clone());
         }
-        let (_, stop) = red.range(self.inc_no())?;
+        let (_, stop) = self.contour_range(red)?;
         let mut out = Array2::<f64>::zeros((self.particles.len(), 2));
         for (i, p) in self.particles.iter().enumerate() {
             out[[i, 0]] = p.coordinates[[stop - 1, 0]];
@@ -819,7 +941,7 @@ mod tests {
             seed: None,
             template_shape: None,
             template_sizes: None,
-            zonal_masking: None,
+            time: None,
         }
     }
 
@@ -841,6 +963,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         })
     }
 
@@ -1130,6 +1254,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         });
         (sol, paths)
     }
@@ -1163,6 +1289,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         });
         assert!(Field::new(seq, FieldDistribution::FromSequence, true, 1.0).is_err());
     }
@@ -1405,13 +1533,12 @@ mod tests {
             seed: None,
             template_shape: None,
             template_sizes: None,
-            zonal_masking: None,
+            time: None,
         };
         let seq = make_seq(vec![mesh_sol], vec![false]);
         let mut field = make_field_from_seq(seq, true);
         let params = MeshlessParams {
             radius: 10.0, quality_gate: None, min_neighbours: 3, max_iterations: 5, tukey_c: 4.685,
-            zone_aware: false,
         };
         field.solve(0.0, true, None, StrainMethod::Meshless(params)).unwrap();
         let sol = field.solution().unwrap();
@@ -1488,6 +1615,7 @@ mod tests {
             calibrated: false,
             config: None,
             gamma_max_grad: Some(grad),
+            time: None,
         })
     }
 
@@ -1504,34 +1632,130 @@ mod tests {
             depth: 1.0,
             track: true,
             region,
+            time: None,
         }
     }
 
-    fn red(window: Option<(usize, usize)>, dt: Option<f64>, absolute: bool) -> ContourReduction {
-        ContourReduction { window, dt, absolute }
+    fn red(window: Option<(usize, usize)>, rate: bool, absolute: bool) -> ContourReduction {
+        ContourReduction { window, rate, absolute, ..Default::default() }
+    }
+
+    fn timed(mut sol: FieldSolution, time: &[f64]) -> FieldSolution {
+        sol.time = Some(time.to_vec());
+        sol
     }
 
     #[test]
     fn contour_reduction_matches_python_reduce_series() {
         let sol = field_sol(vec![series_particle(&[0.0, 2.0, 1.0, 4.0], [0.0, 0.0])], None);
         let v = |r: ContourReduction| sol.contour_values(FieldQuantity::U, &r).unwrap()[0];
-        assert_eq!(v(red(None, None, false)), 4.0, "last - first");
-        assert_eq!(v(red(None, None, true)), 2.0 + 1.0 + 3.0, "sum |diff|");
-        assert_eq!(v(red(Some((1, 3)), None, false)), -1.0, "window is half-open");
-        assert_eq!(v(red(Some((1, 2)), None, false)), 2.0, "single value -> value");
-        assert_eq!(v(red(Some((1, 2)), None, true)), 0.0, "single value, absolute -> 0");
-        assert!((v(red(None, Some(0.5), false)) - 4.0 / (4.0 * 0.5)).abs() < 1e-15, "mean rate");
-        assert!((v(red(None, Some(0.5), true)) - 2.0).abs() < 1e-15, "dt ignores absolute");
-        assert_eq!(v(red(Some((2, 3)), Some(0.5), false)), 0.0, "single value rate -> 0");
+        assert_eq!(v(red(None, false, false)), 4.0, "last - first");
+        assert_eq!(v(red(None, false, true)), 2.0 + 1.0 + 3.0, "sum |diff|");
+        assert_eq!(v(red(Some((1, 3)), false, false)), -1.0, "window is half-open");
+        assert_eq!(v(red(Some((1, 2)), false, false)), 2.0, "single value -> value");
+        assert_eq!(v(red(Some((1, 2)), false, true)), 0.0, "single value, absolute -> 0");
         for bad in [(2, 2), (3, 1), (0, 5)] {
-            assert!(sol.contour_values(FieldQuantity::U, &red(Some(bad), None, false)).is_err(), "{bad:?}");
+            assert!(sol.contour_values(FieldQuantity::U, &red(Some(bad), false, false)).is_err(), "{bad:?}");
         }
+    }
+
+    /// Rates divide by the elapsed time between the window's first and last
+    /// rows — `n - 1` intervals for `n` rows (the old `dt` reduction divided
+    /// by `n * dt`, under-reporting every rate) — and handle irregular times.
+    #[test]
+    fn contour_rate_uses_elapsed_time() {
+        let sol = timed(
+            field_sol(vec![series_particle(&[0.0, 2.0, 1.0, 4.0], [0.0, 0.0])], None),
+            &[0.0, 0.5, 2.5, 3.0],
+        );
+        let v = |r: ContourReduction| sol.contour_values(FieldQuantity::U, &r).unwrap()[0];
+        assert!((v(red(None, true, false)) - 4.0 / 3.0).abs() < 1e-15, "whole series");
+        // One interval, rows 0 -> 1: (2 - 0) / 0.5, not / (2 * 0.5).
+        assert!((v(red(Some((0, 2)), true, false)) - 4.0).abs() < 1e-15, "one interval");
+        assert!((v(red(Some((1, 3)), true, false)) - (-0.5)).abs() < 1e-15, "irregular step");
+        assert!((v(red(None, true, true)) - 6.0 / 3.0).abs() < 1e-15, "absolute rate");
+        assert!((v(red(Some((3, 4)), true, false)) - 4.0 / 3.0).abs() < 1e-15, "single row: since row 0");
+        assert!(v(red(Some((0, 1)), true, false)).is_nan(), "row 0 has no elapsed time");
+        // No stored time -> error.
+        let untimed = field_sol(vec![series_particle(&[0.0, 1.0], [0.0, 0.0])], None);
+        assert!(untimed.contour_values(FieldQuantity::U, &red(None, true, false)).is_err());
+        // Zero time step -> NaN, not inf.
+        let flat = timed(field_sol(vec![series_particle(&[0.0, 1.0], [0.0, 0.0])], None), &[1.0, 1.0]);
+        assert!(flat.contour_values(FieldQuantity::U, &red(None, true, false)).unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn contour_increment_leapfrog_and_sequential() {
+        // Reference updated at pair 2 (row 2 becomes the reference for row 3).
+        let mut sol = timed(
+            field_sol(vec![series_particle(&[0.0, 2.0, 3.0, 7.0, 8.0], [0.0, 0.0])], None),
+            &[0.0, 1.0, 2.0, 4.0, 8.0],
+        );
+        sol.reference_update_register = vec![2];
+        let inc = |k, mode, rate| {
+            let r = ContourReduction { increment: Some(k), mode, rate, ..Default::default() };
+            sol.contour_values(FieldQuantity::U, &r).unwrap()[0]
+        };
+        use IncrementMode::{Leapfrog, Sequential};
+        assert_eq!(inc(2, Sequential, false), 1.0);
+        assert_eq!(inc(2, Leapfrog, false), 3.0, "row 2's reference is row 0");
+        assert_eq!(inc(3, Leapfrog, false), 4.0, "row 3's reference is row 2");
+        assert_eq!(inc(4, Leapfrog, false), 5.0, "row 4's reference is still row 2");
+        assert_eq!(inc(4, Sequential, false), 1.0);
+        assert!((inc(4, Leapfrog, true) - 5.0 / 6.0).abs() < 1e-15);
+        assert!((inc(4, Sequential, true) - 1.0 / 4.0).abs() < 1e-15);
+        assert_eq!(sol.contour_range(&ContourReduction { increment: Some(4), ..Default::default() }).unwrap(), (2, 5));
+        for bad in [0, 5] {
+            let r = ContourReduction { increment: Some(bad), ..Default::default() };
+            assert!(sol.contour_values(FieldQuantity::U, &r).is_err(), "{bad}");
+        }
+        let both = ContourReduction { increment: Some(1), window: Some((0, 2)), ..Default::default() };
+        assert!(sol.contour_values(FieldQuantity::U, &both).is_err());
+    }
+
+    /// Under a rate, principal quantities come from the strain-rate tensor
+    /// `Δε / Δt`, and R is the speed `|Δu| / Δt`.
+    #[test]
+    fn contour_rate_principal_from_rate_tensor() {
+        // Row 1: pure eps_xx = 1. Row 2: adds eps_yy = 1, so Δε (1 -> 2) is
+        // uniaxial in y while the principal-strain *change* would be zero.
+        let mut p = (*series_particle(&[0.0, 1.0, 1.0], [0.0, 0.0])).clone();
+        p.strains[[2, 1]] = 1.0;
+        p.principal_strains = Some(crate::particle::principal_strains(&p.strains));
+        p.warps[[2, 1]] = 4.0;
+        let sol = timed(field_sol(vec![Arc::new(p)], None), &[0.0, 1.0, 3.0]);
+        let r = ContourReduction { window: Some((1, 3)), rate: true, ..Default::default() };
+        let v = |q| sol.contour_values(q, &r).unwrap()[0];
+        assert!((v(FieldQuantity::Ep1) - 0.5).abs() < 1e-15, "Δε_yy / Δt");
+        assert!(v(FieldQuantity::Ep2).abs() < 1e-15);
+        assert!((v(FieldQuantity::GammaMax) - 0.5).abs() < 1e-15);
+        assert!((v(FieldQuantity::ThetaP).abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-12, "angle, not divided");
+        // Non-rate: change of the principal series (gamma_max 1 -> 0).
+        let d = ContourReduction { window: Some((1, 3)), ..Default::default() };
+        assert!((sol.contour_values(FieldQuantity::GammaMax, &d).unwrap()[0] + 1.0).abs() < 1e-15);
+        // R: Δ(u, v) = (0, 3) over 2 s.
+        assert!((v(FieldQuantity::R) - 1.5).abs() < 1e-15);
+        let abs_theta = ContourReduction { absolute: true, ..r };
+        assert!(sol.contour_values(FieldQuantity::ThetaP, &abs_theta).is_err());
+    }
+
+    #[test]
+    fn series_increments_modes() {
+        let mut p = (*series_particle(&[0.0, 2.0, 3.0, 7.0], [0.0, 0.0])).clone();
+        p.reference_update_register = vec![2];
+        p.time = Some(vec![0.0, 1.0, 2.0, 4.0]);
+        let q = SeriesQuantity::Warp(0);
+        assert_eq!(p.series_increments(q, IncrementMode::Sequential, false).unwrap().to_vec(), vec![2.0, 1.0, 4.0]);
+        assert_eq!(p.series_increments(q, IncrementMode::Leapfrog, false).unwrap().to_vec(), vec![2.0, 3.0, 4.0]);
+        assert_eq!(p.series_increments(q, IncrementMode::Leapfrog, true).unwrap().to_vec(), vec![2.0, 1.5, 2.0]);
+        p.time = None;
+        assert!(p.series_increments(q, IncrementMode::Sequential, true).is_err());
     }
 
     #[test]
     fn contour_values_quantities() {
         let sol = field_sol(vec![series_particle(&[0.0, 3.0], [0.0, 0.0])], None);
-        let all = red(None, None, false);
+        let all = red(None, false, false);
         let v = |q| sol.contour_values(q, &all).unwrap()[0];
         assert_eq!(v(FieldQuantity::U), 3.0);
         assert_eq!(v(FieldQuantity::V), 3.0);
@@ -1567,7 +1791,7 @@ mod tests {
         assert_eq!((r[[0, 0]], r[[0, 1]]), (5.0, 7.0));
         let d = sol.contour_coordinates(true, &ContourReduction::default()).unwrap();
         assert_eq!((d[[0, 0]], d[[0, 1]]), (7.0, 7.0), "last increment");
-        let d = sol.contour_coordinates(true, &red(Some((0, 2)), None, false)).unwrap();
+        let d = sol.contour_coordinates(true, &red(Some((0, 2)), false, false)).unwrap();
         assert_eq!((d[[0, 0]], d[[0, 1]]), (6.0, 7.0), "window end is exclusive");
     }
 

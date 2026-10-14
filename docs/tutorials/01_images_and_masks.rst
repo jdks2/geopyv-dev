@@ -23,6 +23,16 @@ contrasting surface (e.g. a membrane or structure). In general:
 - Speckle diameter — pixel size : **d/p > 4**
 - Coverage ≈ **40–60%** of the surface
 - Avoid repeated patterns (lattices, gratings, etc. cause false matches)
+- Subset radius — speckle diameter : **R/d ≳ 4**
+
+The last point matters when choosing the camera resolution and the speckle size together.
+Neighbouring pixels within one speckle carry much the same information, so a subset holds
+roughly one independent sample per speckle-sized area, not one per pixel. At R ≈ 4d a circular
+subset holds about 20 such samples, which is enough texture for a reliable match. It is also
+enough to judge whether the subset's motion is more complex than it can fit. Smaller subsets
+still solve, but that judgement weakens quickly. Larger subsets average the deformation over a
+wider area. So plan the imaging so that the subset size you want to use, set by the detail you
+need to resolve, satisfies R/d ≳ 4.
 
 Why validate against a known deformation?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

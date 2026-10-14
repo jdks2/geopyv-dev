@@ -102,22 +102,6 @@ def solved_mesh(ref_img, tar_img):
 
 
 @pytest.fixture(scope="module")
-def solved_zonal_mesh(ref_img, tar_img):
-    tmpl = make_circle_template(20)
-    boundary = np.array(
-        [[150.0, 150.0], [250.0, 150.0], [250.0, 250.0], [150.0, 250.0]],
-        dtype=np.float64,
-    )
-    mesh = Mesh(boundary, target_nodes=15, f_img=ref_img, g_img=tar_img,
-                size=(20.0, 40.0))
-    mesh.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
-               solver_options={"masking": "zonal",
-                               "zonal": {"k": 1.0,
-                                         "meshless_params": MeshlessParams(radius=15.0)}})
-    return mesh
-
-
-@pytest.fixture(scope="module")
 def solved_particle(solved_mesh):
     coords, vols = field_distribute_particles(solved_mesh.nodes, solved_mesh.elements)
     p = Particle(source=solved_mesh, coordinate=[float(coords[0, 0]), float(coords[0, 1])])
@@ -264,59 +248,17 @@ class TestInspectMesh:
 
 
 # ===========================================================================
-# TestInspectMeshZonal -- zonal-masking inspection
-# (geopyv_dev_fresh/zonal_masking_inspection_plan.md)
+# ===========================================================================
+# Template metadata (subset_idx crops)
 # ===========================================================================
 
-class TestInspectMeshZonal:
-    def test_record_present_after_zonal_solve(self, solved_zonal_mesh):
-        rec = solved_zonal_mesh.zonal_masking
-        assert rec is not None
-        n = len(np.asarray(solved_zonal_mesh.nodes))
-        assert len(np.asarray(rec.node_gamma_max)) == n
-        assert len(np.asarray(rec.node_gamma_max_grad)) == n
-        assert len(np.asarray(rec.node_boundary)) == n
-        assert np.all(np.asarray(rec.node_gamma_max_grad) >= 0.0)  # a magnitude
-        assert len(np.asarray(rec.node_pre_px)) == n
-        assert np.asarray(rec.zone_image).ndim == 2
-        assert abs(rec.grad_cutoff
-                   - (rec.grad_median + rec.k * 1.4826 * rec.grad_mad)) < 1e-9
-
-    def test_record_absent_after_plain_solve(self, solved_mesh):
-        assert solved_mesh.zonal_masking is None
+class TestMeshTemplateMetadata:
+    def test_template_recorded_after_solve(self, solved_mesh):
         assert solved_mesh.template_shape == "circle"
         assert np.all(np.asarray(solved_mesh.template_sizes) == 20)
 
-    def test_zones_true_raises_on_plain_mesh(self, solved_mesh):
-        with pytest.raises(RuntimeError, match="zonal"):
-            inspect_mesh(solved_mesh, zones=True, show=False)
-
-    def test_zones_true_returns_fig(self, solved_zonal_mesh):
-        fig, ax = inspect_mesh(solved_zonal_mesh, zones=True, show=False)
-        assert isinstance(fig, Figure) and isinstance(ax, Axes)
-        # reference image + zone overlay
-        assert len(ax.images) == 2
-
-    def test_zones_with_subset_idx_draws_footprint(self, solved_zonal_mesh):
-        fig, ax = inspect_mesh(solved_zonal_mesh, zones=True, subset_idx=1, show=False)
-        assert len(ax.collections) > 0
-
-    def test_subset_idx_crop_captions_zone_stats(self, solved_zonal_mesh):
-        fig, ax = inspect_mesh(solved_zonal_mesh, subset_idx=1, show=False)
-        texts = [c.get_text() for c in ax.get_children() if hasattr(c, "get_text")]
-        assert any("zone" in t and "px" in t for t in texts)
-
-    def test_footprint_free_fn_kept_plus_cut_is_full_template(self):
-        from geopyv_dev import _geopyv_dev as _core
-        zi = np.ones((60, 60), np.uint8)
-        zi[:, 30:] = 2
-        fp = _core.zoned_subset_footprint(zi, [30.0, 30.0], "circle", 10)
-        kept, cut = np.asarray(fp["coords_kept"]), np.asarray(fp["coords_cut"])
-        # circle(10) has 317 pixels; split cleanly by the vertical zone edge
-        assert len(kept) + len(cut) == 317
-        assert len(kept) > 0 and len(cut) > 0
-        # kept pixels are all on the node's own (right) side
-        assert kept[:, 0].min() >= 30.0
+    def test_no_zonal_record_any_more(self, solved_mesh):
+        assert not hasattr(solved_mesh._inner, "zonal_masking")
 
 
 # ===========================================================================
@@ -483,12 +425,12 @@ class TestContourField:
         assert len(fig.axes) == 2
 
     def test_colorbar_label_accumulated(self, solved_field):
-        fig, ax = contour_field(solved_field, "u", dt=None, show=False)
+        fig, ax = contour_field(solved_field, "u", show=False)
         label = fig.axes[-1].get_ylabel()
         assert "/s" not in label
 
     def test_colorbar_label_rate(self, solved_field):
-        fig, ax = contour_field(solved_field, "u", dt=0.1, show=False)
+        fig, ax = contour_field(solved_field, "u", rate=True, show=False)
         label = fig.axes[-1].get_ylabel()
         assert "/s" in label
 
@@ -561,18 +503,14 @@ class TestContourFieldGammaMaxGrad:
 # used before that move, kept here verbatim as the parity reference.
 # ===========================================================================
 
-def _legacy_reduce_series(v, dt, absolute):
+def _legacy_reduce_series(v, absolute):
     v = np.atleast_1d(v)
-    if dt is None:
-        if absolute:
-            return float(np.sum(np.abs(np.diff(v)))) if len(v) > 1 else 0.0
-        return float(v[-1] - v[0]) if len(v) > 1 else float(v[-1])
-    if len(v) > 1:
-        return float((v[-1] - v[0]) / (len(v) * dt))
-    return 0.0
+    if absolute:
+        return float(np.sum(np.abs(np.diff(v)))) if len(v) > 1 else 0.0
+    return float(v[-1] - v[0]) if len(v) > 1 else float(v[-1])
 
 
-def _legacy_contour_values(field, quantity, window, dt, absolute):
+def _legacy_contour_values(field, quantity, window, absolute):
     strain_col = {"ep_xx": 0, "ep_yy": 1, "ep_xy": 5}
     principal_col = {"ep1": 0, "ep2": 1, "gamma_max": 2, "theta_p": 3}
     if window is not None:
@@ -586,8 +524,8 @@ def _legacy_contour_values(field, quantity, window, dt, absolute):
     for p in field.particles:
         if quantity == "gamma_max_grad":
             grad = np.asarray(p.gamma_max_grad)
-            gx = _legacy_reduce_series(grad[w, 0], dt, absolute)
-            gy = _legacy_reduce_series(grad[w, 1], dt, absolute)
+            gx = _legacy_reduce_series(grad[w, 0], absolute)
+            gy = _legacy_reduce_series(grad[w, 1], absolute)
             values.append(float(np.hypot(gx, gy)))
             continue
         warps = np.asarray(p.warps)
@@ -604,7 +542,7 @@ def _legacy_contour_values(field, quantity, window, dt, absolute):
             v = np.asarray(p.vol_strains)[w]
         else:
             v = np.asarray(p.principal_strains)[w, principal_col[quantity]]
-        values.append(_legacy_reduce_series(v, dt, absolute))
+        values.append(_legacy_reduce_series(v, absolute))
     return np.array(values)
 
 
@@ -614,15 +552,20 @@ _ALL_FIELD_QUANTITIES = ("u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol",
 
 class TestContourFieldCore:
     @pytest.mark.parametrize("window", [None, [0, 1], [1, 2], [0, 2], [None, None], -1, 0, slice(0, 2)])
-    @pytest.mark.parametrize("dt,absolute", [(None, False), (None, True), (0.1, False)])
-    def test_core_values_match_legacy_numpy(self, solved_field_meshless, window, dt, absolute):
+    @pytest.mark.parametrize("absolute", [False, True])
+    def test_core_values_match_legacy_numpy(self, solved_field_meshless, window, absolute):
         from geopyv_dev.plots import _resolve_window
         field = solved_field_meshless
         w = _resolve_window(window, field.inc_no)
         for q in _ALL_FIELD_QUANTITIES:
-            core = np.asarray(field.contour_values(q, window=w, dt=dt, absolute=absolute))
-            legacy = _legacy_contour_values(field, q, window, dt, absolute)
+            core = np.asarray(field.contour_values(q, window=w, absolute=absolute))
+            legacy = _legacy_contour_values(field, q, window, absolute)
             np.testing.assert_allclose(core, legacy, rtol=1e-12, atol=1e-15, err_msg=q)
+
+    def test_rate_without_time_raises(self, solved_field_meshless):
+        assert solved_field_meshless.time is None
+        with pytest.raises(ValueError, match="time"):
+            contour_field(solved_field_meshless, "u", rate=True, show=False)
 
     def test_region_stored_and_triangles_inside_it(self, solved_field_meshless):
         boundary, exclusions = solved_field_meshless.region
@@ -725,53 +668,48 @@ class TestUnsolvedGuards:
 
 
 # ===========================================================================
-# TestMeshSolveAdaptive
-#
-# method="adaptive" -- the zonal-masking orchestration (Stages 1, 2, 6, 7 of
-# geopyv_dev_fresh/zonal_masking_plan.md): plain ICGN, a meshless Field at
-# the mesh's own nodes, a robust-threshold zone classification rasterised
-# via nearest-node lookup, then a second ICGN pass with that zone applied
-# internally. These are orchestration/guard-rail tests only -- the zone-mask
-# mechanism itself (subset_at's min-pixel guard, and a real solve producing
-# a genuine difference from plain ICGN) is covered by src/mesh.rs's own unit
-# tests (subset_at_zone_mask_min_pixel_guard_falls_back_when_cut_too_aggressive,
-# full_solve_with_zone_mask_differs_from_plain_solve).
+# Removed options: zonal masking and method="adaptive" now raise
 # ===========================================================================
 
-class TestMeshSolveAdaptive:
-    def test_runs_and_produces_a_solved_mesh(self, unsolved_mesh):
-        tmpl = make_circle_template(20)
-        unsolved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
-                             method="adaptive")
+class TestRemovedZonalOptions:
+    def test_method_adaptive_raises(self, solved_mesh):
+        with pytest.raises(ValueError, match="adaptive"):
+            solved_mesh.solve(make_circle_template(20), seed_coord=[200.0, 200.0],
+                              method="adaptive")
+
+    @pytest.mark.parametrize("kw", ["adaptive_k", "adaptive_meshless_params"])
+    def test_adaptive_kwargs_raise(self, solved_mesh, kw):
+        with pytest.raises(ValueError, match="adaptive"):
+            solved_mesh.solve(make_circle_template(20), seed_coord=[200.0, 200.0], **{kw: 1.0})
+
+    def test_masking_zonal_raises(self, solved_mesh):
+        with pytest.raises(ValueError, match="zonal masking has been removed"):
+            solved_mesh.solve(make_circle_template(20), seed_coord=[200.0, 200.0],
+                              solver_options={"masking": "zonal"})
+
+    def test_zonal_subdict_raises(self, solved_mesh):
+        with pytest.raises(ValueError, match="zonal masking has been removed"):
+            solved_mesh.solve(make_circle_template(20), seed_coord=[200.0, 200.0],
+                              solver_options={"zonal": {"k": 3.0}})
+
+    def test_binding_masking_zonal_raises(self, unsolved_mesh):
+        with pytest.raises(ValueError, match="removed"):
+            unsolved_mesh._inner.solve(make_circle_template(20), [200.0, 200.0], masking="zonal")
+
+    @pytest.mark.parametrize("kw", ["zonal_k", "zone_mask"])
+    def test_binding_zonal_kwargs_gone(self, unsolved_mesh, kw):
+        with pytest.raises(TypeError, match=kw):
+            unsolved_mesh._inner.solve(make_circle_template(20), [200.0, 200.0], **{kw: 1.0})
+
+    def test_meshless_params_zone_aware_gone(self):
+        with pytest.raises(TypeError, match="zone_aware"):
+            MeshlessParams(radius=15.0, zone_aware=True)
+
+    def test_masking_uniform_still_accepted(self, unsolved_mesh):
+        unsolved_mesh.solve(make_circle_template(20), seed_coord=[200.0, 200.0],
+                            max_iterations=20, solver_options={"masking": "uniform"})
         assert unsolved_mesh.solved
-        assert len(np.asarray(unsolved_mesh.c_zncc)) == len(np.asarray(unsolved_mesh.nodes))
 
-    def test_zone_mask_kwarg_rejected_directly(self, solved_mesh):
-        # zone_mask is internal to masking="zonal" -- not a parameter at all.
-        tmpl = make_circle_template(20)
-        with pytest.raises(TypeError, match="zone_mask"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0],
-                               zone_mask=np.zeros((10, 10), dtype=np.uint8))
-
-    def test_zone_mask_kwarg_rejected_even_with_method_adaptive(self, solved_mesh):
-        tmpl = make_circle_template(20)
-        with pytest.raises(TypeError, match="zone_mask"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], method="adaptive",
-                               zone_mask=np.zeros((10, 10), dtype=np.uint8))
-
-    def test_adaptive_kwarg_rejected_without_method_adaptive(self, solved_mesh):
-        tmpl = make_circle_template(20)
-        with pytest.raises(ValueError, match="adaptive_k"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], adaptive_k=3.0)
-
-    def test_adaptive_scheme_kwarg_rejected(self, solved_mesh):
-        tmpl = make_circle_template(20)
-        # There is no classification "scheme" any more -- masking="zonal"
-        # always defines zones from the |∇γ| ridges (gradient watershed).
-        # adaptive_scheme= is no longer a recognised adaptive_* kwarg.
-        with pytest.raises(ValueError, match="adaptive_scheme"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], method="adaptive",
-                               adaptive_scheme="three_zone")
 
 
 class TestSolverOptionsSurface:
@@ -792,54 +730,12 @@ class TestSolverOptionsSurface:
                                  solver="fgan")
         assert unsolved_mesh.solved
 
-    def test_raw_zonal_kwargs_rejected_without_zonal_masking(self, unsolved_mesh):
-        # Every zonal_* binding kwarg belongs to masking="zonal" alone.
-        tmpl = make_circle_template(20)
-        with pytest.raises(ValueError, match="zonal_k"):
-            unsolved_mesh._inner.solve(tmpl, [200.0, 200.0], zonal_k=3.0)
-
     def test_method_kernel_sense_deprecated(self, unsolved_mesh):
         tmpl = make_circle_template(20)
         with pytest.warns(DeprecationWarning, match="method"):
             unsolved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
                                  method="icgn")
         assert unsolved_mesh.solved
-
-    def test_solver_options_zonal_equivalent_to_deprecated_method_adaptive(
-            self, ref_img, tar_img):
-        tmpl = make_circle_template(20)
-        boundary = np.array([[50.0, 50.0], [350.0, 50.0], [350.0, 350.0], [50.0, 350.0]])
-        m_new = Mesh(boundary, target_nodes=40, f_img=ref_img, g_img=tar_img)
-        m_old = Mesh(boundary, target_nodes=40, f_img=ref_img, g_img=tar_img)
-        m_new.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
-                    solver_options={"masking": "zonal"})
-        with pytest.warns(DeprecationWarning, match="adaptive"):
-            m_old.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
-                        method="adaptive")
-        assert m_new.solved and m_old.solved
-        np.testing.assert_array_equal(np.asarray(m_new.nodes), np.asarray(m_old.nodes))
-        np.testing.assert_allclose(np.asarray(m_new.c_zncc), np.asarray(m_old.c_zncc))
-
-    def test_zonal_k_tunable_via_solver_options(self, ref_img, tar_img):
-        tmpl = make_circle_template(20)
-        boundary = np.array([[50.0, 50.0], [350.0, 50.0], [350.0, 350.0], [50.0, 350.0]])
-        m = Mesh(boundary, target_nodes=40, f_img=ref_img, g_img=tar_img)
-        m.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
-                solver_options={"masking": "zonal", "zonal": {"k": 10.0}})
-        assert m.solved
-
-    def test_min_pixel_fraction_no_longer_configurable(self, solved_mesh):
-        tmpl = make_circle_template(20)
-        with pytest.raises(ValueError, match="adaptive_min_pixel_fraction"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], method="adaptive",
-                               adaptive_min_pixel_fraction=0.5)
-
-    def test_min_pixel_fraction_not_a_zonal_subdict_key(self, solved_mesh):
-        tmpl = make_circle_template(20)
-        with pytest.raises(ValueError, match="min_pixel_fraction"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0],
-                               solver_options={"masking": "zonal",
-                                               "zonal": {"min_pixel_fraction": 0.5}})
 
     def test_topology_adaptive_not_implemented(self, solved_mesh):
         tmpl = make_circle_template(20)
@@ -903,35 +799,22 @@ class TestSolverOptionsSurface:
 
     def test_subdict_for_inactive_axis_raises(self, solved_mesh):
         tmpl = make_circle_template(20)
-        with pytest.raises(ValueError, match="zonal"):
+        with pytest.raises(ValueError, match="layer_rg"):
             solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0],
-                               solver_options={"masking": "uniform", "zonal": {"k": 3.0}})
+                               solver_options={"preconditioning": "RG",
+                                               "layer_rg": {"batch_factor": 3}})
 
     def test_unknown_subdict_key_raises(self, solved_mesh):
         tmpl = make_circle_template(20)
         with pytest.raises(ValueError, match="bogus"):
             solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0],
-                               solver_options={"masking": "zonal", "zonal": {"bogus": 1}})
-
-    @pytest.mark.parametrize("bad", [0, -1, 2.0, "3", True])
-    def test_zonal_iterations_bad_value_raises(self, solved_mesh, bad):
-        tmpl = make_circle_template(20)
-        with pytest.raises(ValueError, match="iterations"):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0],
-                               solver_options={"masking": "zonal",
-                                               "zonal": {"iterations": bad}})
-
-    def test_zonal_iterations_accepted(self, unsolved_mesh):
-        tmpl = make_circle_template(20)
-        unsolved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], max_iterations=20,
-                            solver_options={"masking": "zonal",
-                                            "zonal": {"iterations": 3}})
-        assert unsolved_mesh.solved
+                               solver_options={"preconditioning": "layer-RG",
+                                               "layer_rg": {"bogus": 1}})
 
     def test_solver_options_not_a_dict_raises(self, solved_mesh):
         tmpl = make_circle_template(20)
         with pytest.raises(TypeError):
-            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], solver_options="zonal")
+            solved_mesh.solve(tmpl, seed_coord=[200.0, 200.0], solver_options="uniform")
 
     # Sequence-level solver=/solver_options= coverage (needs a real on-disk
     # image directory, not the in-memory ref_img/tar_img fixtures this module

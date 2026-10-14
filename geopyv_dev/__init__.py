@@ -47,6 +47,15 @@ from .wrappers import (
 # Auto-wrap helpers
 # ---------------------------------------------------------------------------
 
+
+def _report_time_source(inner):
+    """Say once, at construction, when times were read from file names, so a
+    wrong match is visible."""
+    source = inner.time_source
+    if source.startswith("filename"):
+        print(f"geopyv: image times read from the file names ({source[len('filename ('):-1]})")
+
+
 def _wrap(raw):
     if isinstance(raw, _core.Subset):
         return Subset._new_from_inner(raw)
@@ -100,27 +109,28 @@ def load(path):
 
 _SOLVER_OPTION_AXES = {
     "topology": {"uniform", "adaptive"},
-    "masking": {"uniform", "zonal"},
+    "masking": {"uniform"},
     "preconditioning": {"RG", "layer-RG"},
 }
 _SOLVER_OPTION_DEFAULTS = {"topology": "uniform", "masking": "uniform", "preconditioning": "RG"}
-_SOLVER_OPTION_SUBDICTS = {"zonal", "layer_rg"}
+_SOLVER_OPTION_SUBDICTS = {"layer_rg"}
 # (axis, value) -> (subdict key, subdict allowed keys) -- which sub-dict, if
 # any, is legal only when that axis is at that non-default value.
-_ZONAL_KEYS = {"k", "smoothing_sigma", "meshless_params", "iterations", "zone_map"}
-# Sequence.solve: no zone_map -- one caller-supplied map has no sensible
-# meaning across a sequence of increments.
-_ZONAL_KEYS_SEQUENCE = _ZONAL_KEYS - {"zone_map"}
 _SUBDICT_FOR_AXIS_VALUE = {
-    ("masking", "zonal"): ("zonal", _ZONAL_KEYS),
     ("preconditioning", "layer-RG"): ("layer_rg", {"max_workers", "batch_factor", "root_rel_eps"}),
 }
+_ZONAL_REMOVED = (
+    "zonal masking has been removed; solver_options['masking'] accepts only 'uniform'"
+)
+_ADAPTIVE_UNAVAILABLE = (
+    "method='adaptive' (and the adaptive_* kwargs) is not available: it was an alias "
+    "for zonal masking, which has been removed"
+)
 # (axis, value) accepted by the schema (_SOLVER_OPTION_AXES) but not yet
 # implemented anywhere -- rejected here, before _inner.solve() is ever
 # entered, so a value is never simultaneously "documented as valid" and
 # "silently broken." Shrinks by one entry each time the corresponding plan
-# lands (see solver_options_restructure.md §7) -- masking="zonal" already
-# dropped out (Stage B, src/mesh.rs::solve_zonal_masking_impl).
+# lands (see solver_options_restructure.md §7).
 _NOT_YET_IMPLEMENTED = {
     ("topology", "adaptive"),        # geopyv_dev_fresh/to_do.md Step 3
     # preconditioning="layer-RG": landed (src/mesh.rs::expand_parallel /
@@ -128,10 +138,10 @@ _NOT_YET_IMPLEMENTED = {
 }
 
 
-def _validate_solver_options(solver_options, zonal_keys=_ZONAL_KEYS):
+def _validate_solver_options(solver_options):
     """Validate + normalise a `solver_options` dict per
     solver_options_restructure.md §6. Returns
-    (topology, masking, preconditioning, zonal_opts, layer_rg_opts) --
+    (topology, masking, preconditioning, layer_rg_opts) --
     every axis filled with its default if absent, every sub-dict {} if
     absent. Raises ValueError for any unrecognised key/value or a sub-dict
     supplied for an axis not at the value it belongs to; NotImplementedError
@@ -140,6 +150,8 @@ def _validate_solver_options(solver_options, zonal_keys=_ZONAL_KEYS):
         solver_options = {}
     if not isinstance(solver_options, dict):
         raise TypeError(f"solver_options must be a dict, got {type(solver_options).__name__}")
+    if solver_options.get("masking") == "zonal" or "zonal" in solver_options:
+        raise ValueError(_ZONAL_REMOVED)
 
     allowed_top = set(_SOLVER_OPTION_AXES) | _SOLVER_OPTION_SUBDICTS
     unknown_top = set(solver_options) - allowed_top
@@ -158,7 +170,7 @@ def _validate_solver_options(solver_options, zonal_keys=_ZONAL_KEYS):
             )
         axis_values[axis] = value
 
-    sub_opts = {"zonal": {}, "layer_rg": {}}
+    sub_opts = {"layer_rg": {}}
     for (axis, active_value), (sub_key, sub_allowed_keys) in _SUBDICT_FOR_AXIS_VALUE.items():
         present = sub_key in solver_options
         active = axis_values[axis] == active_value
@@ -167,8 +179,6 @@ def _validate_solver_options(solver_options, zonal_keys=_ZONAL_KEYS):
                 f"solver_options[{sub_key!r}] was given but solver_options[{axis!r}] "
                 f"is {axis_values[axis]!r} (needs to be {active_value!r} for it to apply)"
             )
-        if sub_key == "zonal":
-            sub_allowed_keys = zonal_keys
         sub = dict(solver_options.get(sub_key, {}))
         unknown_sub = set(sub) - sub_allowed_keys
         if unknown_sub:
@@ -185,14 +195,8 @@ def _validate_solver_options(solver_options, zonal_keys=_ZONAL_KEYS):
                 "geopyv_dev_fresh/solver_options_restructure.md §7 for what's landed."
             )
 
-    it = sub_opts["zonal"].get("iterations", 1)
-    if not (isinstance(it, int) and not isinstance(it, bool) and it >= 1):
-        raise ValueError(
-            f"solver_options['zonal']['iterations'] must be an int >= 1, got {it!r}"
-        )
-
     return (axis_values["topology"], axis_values["masking"], axis_values["preconditioning"],
-            sub_opts["zonal"], sub_opts["layer_rg"])
+            sub_opts["layer_rg"])
 
 
 def _resolve_solver(explicit_solver, kwargs, deprecated_name):
@@ -241,17 +245,10 @@ def _checked_solver(solver):
     return algo
 
 
-def _zonal_kwargs(zonal_opts):
-    """`solver_options["zonal"]` -> the binding's flat ``zonal_*`` kwargs,
-    passing only keys the caller actually gave (defaults live in Rust,
-    `ZonalConfig::default()`)."""
-    out = {}
-    for key in ("k", "smoothing_sigma", "meshless_params", "iterations"):
-        if zonal_opts.get(key) is not None:
-            out[f"zonal_{key}"] = zonal_opts[key]
-    if zonal_opts.get("zone_map") is not None:
-        out["zonal_zone_map"] = np.ascontiguousarray(zonal_opts["zone_map"], dtype=np.uint8)
-    return out
+def _reject_adaptive(kwargs):
+    """``method="adaptive"`` / ``adaptive_*`` kwargs: no longer available."""
+    if kwargs.get("method") == "adaptive" or any(k.startswith("adaptive_") for k in kwargs):
+        raise ValueError(_ADAPTIVE_UNAVAILABLE)
 
 
 def _layer_rg_kwargs(layer_rg_opts):
@@ -267,10 +264,21 @@ def _layer_rg_kwargs(layer_rg_opts):
 # ---------------------------------------------------------------------------
 
 class Subset:
-    """Reference subset for DIC. Wraps PySubset with inspect/convergence."""
+    """Reference subset for DIC. Wraps PySubset with inspect/convergence.
 
-    def __init__(self, coord, local_mask, f_img, g_img, subset_order=1):
-        self._inner = _core.Subset(coord, local_mask, f_img, g_img, subset_order=subset_order)
+    ``time`` (seconds): a number is the increment between consecutive images;
+    a sequence gives each image's time (``(f_time, g_time)``). ``None`` (default) reads a
+    timestamp from the image file names when every name carries one
+    (date-time, unix epoch or time of day; a bare frame counter is never taken
+    as a time). Stored as ``.time`` (source in ``.time_source``); plot rates
+    (``rate=True``) need it.
+    """
+
+    def __init__(self, coord, local_mask, f_img, g_img, subset_order=1, time=None):
+        self._inner = _core.Subset(coord, local_mask, f_img, g_img, subset_order=subset_order,
+                                   time=time)
+        if time is None:
+            _report_time_source(self._inner)
 
     @classmethod
     def _new_from_inner(cls, inner):
@@ -324,15 +332,26 @@ class Subset:
 
 
 class Mesh:
-    """DIC mesh. solve() mutates in place and returns None."""
+    """DIC mesh. solve() mutates in place and returns None.
+
+    ``time`` (seconds): a number is the increment between consecutive images;
+    a sequence gives each image's time (``(f_time, g_time)``). ``None`` (default) reads a
+    timestamp from the image file names when every name carries one
+    (date-time, unix epoch or time of day; a bare frame counter is never taken
+    as a time). Stored as ``.time`` (source in ``.time_source``); plot rates
+    (``rate=True``) need it.
+    """
 
     def __init__(self, boundary, target_nodes, f_img, g_img,
-                 size=(1, 1000), exclusions=None, exclusions_hard=None, mesh_order=2):
+                 size=(1, 1000), exclusions=None, exclusions_hard=None, mesh_order=2,
+                 time=None):
         self._inner = _core.Mesh(
             boundary, target_nodes, f_img, g_img,
             size=size, exclusions=exclusions, exclusions_hard=exclusions_hard,
-            mesh_order=mesh_order,
+            mesh_order=mesh_order, time=time,
         )
+        if time is None:
+            _report_time_source(self._inner)
 
     @classmethod
     def _new_from_inner(cls, inner):
@@ -345,15 +364,6 @@ class Mesh:
 
     def __repr__(self):
         return repr(self._inner)
-
-    _ADAPTIVE_KWARG_PREFIX = "adaptive_"
-    # Old flat adaptive_* kwarg -> new solver_options["zonal"] key, for the
-    # method="adaptive" deprecation shim (solver_options_restructure.md §5).
-    # adaptive_min_pixel_fraction deliberately has no entry -- see below.
-    _ADAPTIVE_KWARG_MAP = {
-        "adaptive_k": "k",
-        "adaptive_meshless_params": "meshless_params",
-    }
 
     def solve(self, local_mask, seed_coord, seed_warp=None, solver=None,
               solver_options=None, **kwargs):
@@ -378,53 +388,9 @@ class Mesh:
             - ``topology`` : ``"uniform"`` (default) or ``"adaptive"``
               (mesh-relocation pipeline -- not yet implemented, raises
               ``NotImplementedError``; see `geopyv_dev_fresh/to_do.md` Step 3).
-            - ``masking`` : ``"uniform"`` (default) or ``"zonal"`` -- a
-              two-pass pipeline, implemented entirely in Rust core
-              (``Mesh::solve_zonal_masking_impl``, ``src/mesh.rs``) --
-              this Python layer only translates kwargs, it does not
-              orchestrate: (1) an ordinary ``solver="icgn"`` solve; (2) a
-              ``Field`` built at the mesh's own node positions, solved
-              meshlessly (Rust-to-Rust, no PyO3 round-trip), for each
-              node's shear strain ``gamma_max``; (3) rasterise ``gamma_max``
-              to a dense image (meshless nearest-node), Gaussian-smooth it,
-              take its Sobel magnitude ``|∇γ|``; the connected low-``|∇γ|``
-              regions are the deformation regimes and the ``|∇γ|`` ridges
-              are the interfaces -- a marker-controlled watershed of
-              ``|∇γ|`` from the regime cores lays the zone boundary on the
-              ridge crest (``src/geometry/rasterize.rs``); (4) a second
-              ``solver="icgn"`` solve, same node positions and seed, with
-              that zone label applied internally as a per-subset exclusion
-              mask. ``self`` ends up holding pass 2's solution (or pass
-              1's, if pass 2 fails -- the masking refinement never makes
-              an already-solvable mesh unsolvable). `Sequence.solve` gets
-              this "for free" too -- its per-pair loop calls the same
-              ``Mesh::solve`` unchanged. Sub-options via
-              ``solver_options["zonal"]`` (only read when
-              ``masking == "zonal"``):
-
-              - ``k`` (float, default 2.0) -- robust-threshold multiplier
-                for the ``|∇γ|`` ridge cut-off
-                (``median + k*1.4826*MAD`` over the smoothed ``|∇γ|`` image).
-              - ``smoothing_sigma`` (float, default ``None``) -- Gaussian σ
-                (pixels) applied to the dense ``gamma_max`` image before the
-                Sobel step; ``None`` ⇒ the mesh's own node spacing.
-              - ``meshless_params`` (MeshlessParams, default ``None``) --
-                params for the Stage-2 field solve.
-              - ``iterations`` (int, default 1) -- classifier refit passes;
-                ``>1`` re-solves the Stage-2 field ``zone_aware`` seeded by
-                the current map and reclassifies until the partition
-                converges.
-              - ``zone_map`` ((H, W) uint8 array, default ``None``) -- a
-                caller-supplied whole-image zone-label grid. When given, the
-                classifier is skipped entirely and this grid drives the
-                per-subset masking directly (``iterations`` is then
-                ignored). Use it to mask from a partition already known from
-                specimen geometry rather than one detected from the strain
-                field. Reserve label ``0`` for "no zone".
-
-              (The pass-2 minimum-pixel-fraction guard is a fixed internal
-              safety constant, not configurable here -- see
-              `solver_options_restructure.md` §3.)
+            - ``masking`` : ``"uniform"`` (default, and the only option --
+              zonal masking has been removed; ``"zonal"`` raises
+              ``ValueError``).
             - ``preconditioning`` : ``"RG"`` (default) or ``"layer-RG"``
               (layer-parallel RG frontier traversal; agrees with ``"RG"``
               within Tier C and is deterministic -- see
@@ -432,73 +398,19 @@ class Mesh:
               ``solver_options["layer_rg"]``: ``batch_factor``,
               ``root_rel_eps``, ``max_workers``.
 
-        **Deprecated:** ``method="adaptive"`` (with ``adaptive_*`` kwargs)
-        is a deprecated alias for ``solver_options={"masking": "zonal",
-        "zonal": {...}}`` -- emits ``DeprecationWarning`` and forwards for
-        one release; see `solver_options_restructure.md` §5's mapping
-        table. ``adaptive_min_pixel_fraction`` specifically has no new
-        home (it's no longer configurable at all) and raises ``ValueError``
-        if passed, regardless of value."""
-        if kwargs.get("method") == "adaptive":
-            return self._solve_adaptive_deprecated_shim(
-                local_mask, seed_coord, seed_warp, solver, solver_options, kwargs,
-            )
-
-        stray_adaptive = {k for k in kwargs if k.startswith(self._ADAPTIVE_KWARG_PREFIX)}
-        if stray_adaptive:
-            raise ValueError(
-                f"{sorted(stray_adaptive)!r} are old adaptive_* kwargs (see "
-                "solver_options_restructure.md §5) -- only meaningful together with "
-                "the deprecated method='adaptive'. Use "
-                "solver_options={'masking': 'zonal', 'zonal': {...}} instead."
-            )
-
+        ``method="adaptive"`` (and the ``adaptive_*`` kwargs) is not
+        available and raises ``ValueError``."""
+        _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
-        topology, masking, preconditioning, zonal_opts, layer_rg_opts = \
+        topology, masking, preconditioning, layer_rg_opts = \
             _validate_solver_options(solver_options)
         # topology has no implemented non-default value yet (rejected inside
         # _validate_solver_options) -- only "uniform" ever reaches here.
         self._inner.solve(
             local_mask, seed_coord, seed_warp=seed_warp,
             method=resolved_solver, preconditioning=preconditioning, masking=masking,
-            **(_zonal_kwargs(zonal_opts) if masking == "zonal" else {}),
             **_layer_rg_kwargs(layer_rg_opts), **kwargs,
         )
-
-    def _solve_adaptive_deprecated_shim(self, local_mask, seed_coord, seed_warp,
-                                         solver, solver_options, kwargs):
-        """`method="adaptive"` -> `solver_options={"masking": "zonal", ...}`
-        forwarding shim -- solver_options_restructure.md §5."""
-        warnings.warn(
-            "method='adaptive' is deprecated, use solver_options={'masking': 'zonal', "
-            "...} instead. See geopyv_dev_fresh/solver_options_restructure.md.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        if solver_options is not None:
-            raise ValueError(
-                "solver_options= cannot be combined with the deprecated method='adaptive'."
-            )
-        kwargs.pop("method")
-
-        present = {k for k in kwargs if k.startswith(self._ADAPTIVE_KWARG_PREFIX)}
-        if "adaptive_min_pixel_fraction" in present:
-            raise ValueError(
-                "adaptive_min_pixel_fraction is no longer configurable (it is a fixed "
-                "internal safety constant, not a tuning knob) -- remove this kwarg. "
-                "See geopyv_dev_fresh/solver_options_restructure.md §5."
-            )
-        unrecognised = present - set(self._ADAPTIVE_KWARG_MAP)
-        if unrecognised:
-            raise ValueError(
-                f"{sorted(unrecognised)!r} only apply to method='adaptive' "
-                "(and are not recognised adaptive_* kwargs)."
-            )
-        zonal = {new_key: kwargs.pop(old_key) for old_key, new_key in self._ADAPTIVE_KWARG_MAP.items()
-                 if old_key in kwargs}
-
-        return self.solve(local_mask, seed_coord, seed_warp=seed_warp, solver=solver,
-                           solver_options={"masking": "zonal", "zonal": zonal}, **kwargs)
 
     def save(self, path):
         """Save the solved mesh to a .pyv file."""
@@ -509,12 +421,7 @@ class Mesh:
 
         ``subset_idx=i`` highlights one node; when the solve recorded its
         subset template (schema ``0x07`` on) the plot becomes a crop of that
-        node's template, and for a ``solver_options={"masking": "zonal"}``
-        solve the zone-removed template pixels are shaded and the pre/post
-        pixel counts, ``|∇γ|`` and any minimum-pixel-guard fallback are
-        captioned. ``zones=True`` overlays the whole-image zone-label map
-        from a zonal solve (raises if the mesh was not solved that way).
-        ``show_areas=True`` draws node-area discs. See
+        node's template. ``show_areas=True`` draws node-area discs. See
         ``geopyv_dev.plots.inspect_mesh``.
         """
         return inspect_mesh(self._inner, **kwargs)
@@ -527,14 +434,24 @@ class Mesh:
 
 
 class Sequence:
-    """Multi-pair DIC sequence. solve() mutates in place and returns None."""
+    """Multi-pair DIC sequence. solve() mutates in place and returns None.
+
+    ``time`` (seconds): a number is the increment between consecutive images;
+    a sequence gives each image's time (one per image, in sorted order). ``None`` (default) reads a
+    timestamp from the image file names when every name carries one
+    (date-time, unix epoch or time of day; a bare frame counter is never taken
+    as a time). Stored as ``.time`` (source in ``.time_source``); plot rates
+    (``rate=True``) need it.
+    """
 
     def __init__(self, image_dir, boundary, target_nodes,
-                 size=(1.0, 1000.0), exclusions=None, mesh_order=2):
+                 size=(1.0, 1000.0), exclusions=None, mesh_order=2, time=None):
         self._inner = _core.Sequence(
             image_dir, boundary, target_nodes,
-            size=size, exclusions=exclusions, mesh_order=mesh_order,
+            size=size, exclusions=exclusions, mesh_order=mesh_order, time=time,
         )
+        if time is None:
+            _report_time_source(self._inner)
 
     @classmethod
     def _new_from_inner(cls, inner):
@@ -560,37 +477,16 @@ class Sequence:
         solver_options : dict, optional
             Same three axes as `Mesh.solve` -- see that method's docstring
             and `geopyv_dev_fresh/solver_options_restructure.md`.
-            ``solver_options={"masking": "zonal"}`` now works here too
-            (Stage B, `src/mesh.rs::Mesh::solve_zonal_masking_impl`) --
-            forwarded straight through to every pair's `Mesh.solve`
-            unchanged; `Sequence::solve`'s own per-pair Rust loop needed no
-            structural change to support it (it already called
-            `mesh.solve` once per pair), so it composes correctly with the
-            existing reference-update/override retry machinery. The
-            ``"zonal"`` sub-dict takes the same keys as on `Mesh.solve`
-            except ``zone_map`` (one caller-supplied map has no sensible
-            meaning across a sequence of increments).
+            ``masking`` accepts only ``"uniform"`` (zonal masking has been
+            removed).
 
-        **Deprecated:** ``method="adaptive"`` -- forwards to
-        ``solver_options={"masking": "zonal"}`` with the usual
-        ``DeprecationWarning``."""
-        if kwargs.get("method") == "adaptive":
-            warnings.warn(
-                "method='adaptive' is deprecated, use solver_options={'masking': "
-                "'zonal'} instead. See geopyv_dev_fresh/solver_options_restructure.md.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            kwargs.pop("method")
-            solver_options = solver_options if solver_options is not None else {}
-            solver_options = {**solver_options, "masking": "zonal"}
-
+        ``method="adaptive"`` is not available and raises ``ValueError``."""
+        _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
-        topology, masking, preconditioning, zonal_opts, layer_rg_opts = \
-            _validate_solver_options(solver_options, zonal_keys=_ZONAL_KEYS_SEQUENCE)
+        topology, masking, preconditioning, layer_rg_opts = \
+            _validate_solver_options(solver_options)
         self._inner.solve(
             *args, method=resolved_solver, preconditioning=preconditioning, masking=masking,
-            **(_zonal_kwargs(zonal_opts) if masking == "zonal" else {}),
             **_layer_rg_kwargs(layer_rg_opts), **kwargs,
         )
 
@@ -635,6 +531,8 @@ class Sequence:
         return convergence_sequence(self, mesh_idx=mesh_idx, quantity=quantity, **kwargs)
 
     def contour(self, quantity, mesh_idx, **kwargs):
+        """See ``geopyv_dev.plots.contour_sequence`` -- ``mode=`` (``"leapfrog"``
+        / ``"sequential"``) and ``rate=`` apply to ``u``/``v``/``R``."""
         return contour_sequence(self, mesh_idx=mesh_idx, quantity=quantity, **kwargs)
 
     def save(self, path):

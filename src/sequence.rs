@@ -34,7 +34,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ndarray::Axis;
+use ndarray::{Array2, Axis};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -42,10 +42,11 @@ use crate::{
     image::Image,
     io::{load as io_load, save as io_save, GeopyvObject},
     mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig},
-    particle::{Particle, ParticleSource},
+    particle::{element_locator, warp_increment, Particle, ParticleSource},
     masks::LocalMask,
     progress::{SolveProgress, TerminalProgress},
     subset::Subset,
+    timing::{resolve_times, sort_by_filename_time, IncrementMode, TimeInput, TimeSource},
     Error,
 };
 
@@ -55,6 +56,42 @@ use crate::{
 
 /// Extract the last contiguous run of decimal digits from a string and return
 /// it as a `u64`.  Returns 0 if no digits are found.
+/// `mesh`'s displacement field at `points` `(N, 2)` (reference
+/// coordinates), via its element shape functions — the same element lookup
+/// and interpolation as a mesh-method [`Particle`] increment.
+pub fn interpolate_displacements(mesh: &MeshSolution, points: &Array2<f64>) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((points.nrows(), 2));
+    let ncols = mesh.elements.ncols();
+    for i in 0..points.nrows() {
+        let coord = [points[[i, 0]], points[[i, 1]]];
+        let (tri, _) = element_locator(coord, &mesh.nodes, &mesh.elements, &mesh.centroids);
+        let elem = mesh.elements.row(tri);
+        let mut e_nodes = Array2::<f64>::zeros((ncols, 2));
+        let mut e_disps = Array2::<f64>::zeros((ncols, 2));
+        for (k, &ni) in elem.iter().enumerate() {
+            for j in 0..2 {
+                e_nodes[[k, j]] = mesh.nodes[[ni, j]];
+                e_disps[[k, j]] = mesh.displacements[[ni, j]];
+            }
+        }
+        let w = warp_increment(coord, e_nodes.view(), e_disps.view(), mesh.mesh_order);
+        out[[i, 0]] = w[0];
+        out[[i, 1]] = w[1];
+    }
+    out
+}
+
+/// The row (image index) that row `row`'s increment was measured from —
+/// the reference image of pair `row - 1` — given the pair indices at which
+/// the reference was updated (`reference_update_register`). Row 0 is its
+/// own reference.
+pub fn reference_row(register: &[usize], row: usize) -> usize {
+    if row == 0 {
+        return 0;
+    }
+    register.iter().copied().filter(|&m| m < row).max().unwrap_or(0)
+}
+
 fn last_number_in_name(s: &str) -> u64 {
     s.split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
@@ -171,6 +208,12 @@ pub struct SequenceSolution {
     /// Image border (pixels) for B-spline precomputation, used to produce this solution.
     #[serde(default)]
     pub border: usize,
+    /// Time of each image in the sequence, seconds — see [`crate::timing`].
+    /// Image `k` is Field/Particle row `k`.
+    #[serde(default)]
+    pub time: Option<Vec<f64>>,
+    #[serde(default)]
+    pub time_source: TimeSource,
 }
 
 /// Minimal static placeholder region — used where a full boundary/exclusion
@@ -194,11 +237,9 @@ impl SequenceSolution {
     /// Wrap a single solved [`MeshSolution`] as a degenerate one-pair
     /// `SequenceSolution` — the shim `Field::new` needs to treat "a solved
     /// `Mesh`" as "a solved `Sequence` of one pair" so the same strain-path
-    /// machinery serves both. Extracted from `python/src/py_field.rs`'s
-    /// `PyField::new` (behaviour-preserving refactor — same fields, same
-    /// values) so `Mesh::solve_zonal_masking_impl` can build the identical
-    /// wrapper Rust-to-Rust, with no PyO3 round-trip.
+    /// machinery serves both.
     pub fn from_mesh_solution(mesh_sol: Arc<MeshSolution>) -> Self {
+        let time = mesh_sol.time;
         SequenceSolution {
             mesh_order: mesh_sol.mesh_order,
             first_f_img_path: Some(mesh_sol.f_img_path.clone()),
@@ -212,7 +253,67 @@ impl SequenceSolution {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: time.map(|(f, g)| vec![f, g]),
+            time_source: if time.is_some() { TimeSource::Given } else { TimeSource::None },
         }
+    }
+
+    /// Image index of pair `m`'s reference image. Pair `m`'s target is
+    /// always image `m + 1` (the target advances by one per solved pair),
+    /// and a reference update at pair `m` moves the reference to image `m`.
+    pub fn reference_index(&self, m: usize) -> usize {
+        let register: Vec<usize> = self.reference_updates.iter().enumerate()
+            .filter(|(_, u)| **u).map(|(i, _)| i).collect();
+        reference_row(&register, m + 1)
+    }
+
+    /// Pair `m`'s nodal displacement increment and its time step, at pair
+    /// `m`'s own nodes (reference coordinates):
+    ///
+    /// - [`IncrementMode::Leapfrog`]: from pair `m`'s reference image —
+    ///   its displacements as solved; `Δt = g_time - f_time`.
+    /// - [`IncrementMode::Sequential`]: from the previous target (image `m`).
+    ///   If the reference was updated at `m` (or `m == 0`) that is the
+    ///   reference itself; otherwise pairs `m - 1` and `m` share a reference
+    ///   and the increment is `u_m(X) - u_{m-1}(X)`, with `u_{m-1}` taken
+    ///   node-for-node when the meshes coincide (sync mode) or interpolated
+    ///   with pair `m - 1`'s element shape functions otherwise.
+    ///   `Δt = t_{m+1} - t_m`.
+    ///
+    /// Returns the mesh (for its nodes/elements), the `(N, 2)` increment and
+    /// `Δt` (`None` without times).
+    pub fn increment_displacements(&self, m: usize, mode: IncrementMode) -> Result<(Arc<MeshSolution>, Array2<f64>, Option<f64>), Error> {
+        if m >= self.n_meshes() {
+            return Err(Error::InvalidInput(format!(
+                "mesh index {m} out of range for {} meshes", self.n_meshes()
+            )));
+        }
+        let mesh = self.load_mesh_at(m)?;
+        let from_reference = mode == IncrementMode::Leapfrog
+            || m == 0
+            || self.reference_updates.get(m).copied().unwrap_or(false);
+        if from_reference {
+            let disp = mesh.displacements.clone();
+            let dt = mesh.dt();
+            return Ok((mesh, disp, dt));
+        }
+        let prev = self.load_mesh_at(m - 1)?;
+        let prev_disp = if prev.nodes == mesh.nodes {
+            prev.displacements.clone()
+        } else {
+            interpolate_displacements(&prev, &mesh.nodes)
+        };
+        let disp = &mesh.displacements - &prev_disp;
+        let dt = match (prev.time, mesh.time) {
+            (Some((_, g0)), Some((_, g1))) => Some(g1 - g0),
+            _ => None,
+        };
+        Ok((mesh, disp, dt))
+    }
+
+    /// The first `n_rows` image times (Field/Particle row `k` is image `k`).
+    pub fn row_times(&self, n_rows: usize) -> Option<Vec<f64>> {
+        self.time.as_ref().filter(|t| t.len() >= n_rows).map(|t| t[..n_rows].to_vec())
     }
 
     /// Number of mesh pairs, regardless of storage mode.
@@ -255,6 +356,9 @@ pub struct Sequence {
     pub image_paths: Vec<PathBuf>,
     /// Mesh generation configuration shared across all pairs.
     pub mesh_cfg: SequenceMeshConfig,
+    /// Time of each image, seconds; `None` until [`Sequence::set_time`].
+    pub time: Option<Vec<f64>>,
+    pub time_source: TimeSource,
     solution: Option<SequenceSolution>,
 }
 
@@ -288,7 +392,7 @@ impl Sequence {
                 "target_nodes must be >= 1".to_string(),
             ));
         }
-        Ok(Sequence { image_paths, mesh_cfg, solution: None })
+        Ok(Sequence { image_paths, mesh_cfg, time: None, time_source: TimeSource::None, solution: None })
     }
 
     /// Reconstruct a `Sequence` shell from a saved [`SequenceSolution`].
@@ -301,7 +405,22 @@ impl Sequence {
         mesh_cfg: SequenceMeshConfig,
         sol: SequenceSolution,
     ) -> Self {
-        Sequence { image_paths, mesh_cfg, solution: Some(sol) }
+        Sequence {
+            image_paths,
+            mesh_cfg,
+            time: sol.time.clone(),
+            time_source: sol.time_source.clone(),
+            solution: Some(sol),
+        }
+    }
+
+    /// Set each image's time from `time=` (`None`: parse the image file
+    /// names) — see [`crate::timing`].
+    pub fn set_time(&mut self, input: Option<&TimeInput>) -> Result<(), Error> {
+        let (time, source) = resolve_times(&self.image_paths, input)?;
+        self.time = time;
+        self.time_source = source;
+        Ok(())
     }
 
     /// Number of image pairs (= number of meshes to solve).
@@ -324,8 +443,10 @@ impl Sequence {
     /// Construct a `Sequence` by scanning a directory for image files.
     ///
     /// All `*.jpg`, `*.jpeg`, and `*.png` files (case-insensitive) found in
-    /// `dir` are collected and sorted by the last run of digits in their file
-    /// stem (e.g. `frame_003.jpg` → key 3).  At least 2 images are required.
+    /// `dir` are collected and sorted chronologically if their stems carry a
+    /// timestamp (see [`crate::timing`]), otherwise by the last run of digits
+    /// in their file stem (e.g. `frame_003.jpg` → key 3).  At least 2 images
+    /// are required.
     pub fn from_dir(dir: &Path, mesh_cfg: SequenceMeshConfig) -> Result<Self, Error> {
         let entries = std::fs::read_dir(dir)
             .map_err(|e| Error::FileNotFound(format!("{}: {e}", dir.display())))?;
@@ -342,12 +463,14 @@ impl Sequence {
             })
             .collect();
 
-        paths.sort_by_key(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(last_number_in_name)
-                .unwrap_or(0)
-        });
+        if !sort_by_filename_time(&mut paths) {
+            paths.sort_by_key(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(last_number_in_name)
+                    .unwrap_or(0)
+            });
+        }
 
         Sequence::new(paths, mesh_cfg)
     }
@@ -455,6 +578,8 @@ impl Sequence {
                 )?,
             };
 
+            mesh.time = self.time.as_ref().map(|t| (t[f_index], t[g_index]));
+
             // Override: relax tolerance to 0 and bypass the post-corrections
             // quality gate (mirrors `mesh.py`'s `self._override` bypass for
             // status-3 "subset decorrelation"). Convergence still isn't
@@ -528,6 +653,8 @@ impl Sequence {
                             exclusion_regions,
                             options: Some(cfg.options.clone()),
                             border: cfg.border,
+                            time: self.time.clone(),
+                            time_source: self.time_source.clone(),
                         });
                         return Ok(());
                     }
@@ -642,6 +769,8 @@ impl Sequence {
             exclusion_regions,
             options: Some(cfg.options.clone()),
             border: cfg.border,
+            time: self.time.clone(),
+            time_source: self.time_source.clone(),
         });
         Ok(())
     }
@@ -932,7 +1061,7 @@ mod tests {
             seed: None,
             template_shape: None,
             template_sizes: None,
-            zonal_masking: None,
+            time: None,
         }
     }
 
@@ -1094,7 +1223,109 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         }
+    }
+
+    /// A sequence of unit-square meshes with uniform `u` per pair, image
+    /// times `image_time`, and the given reference updates.
+    fn timed_sequence(us: &[f64], image_time: &[f64], reference_updates: Vec<bool>) -> SequenceSolution {
+        let mut sol = make_sequence_solution_in_memory(us.len());
+        let register: Vec<usize> = reference_updates.iter().enumerate().filter(|(_, u)| **u).map(|(i, _)| i).collect();
+        sol.mesh_solutions = us
+            .iter()
+            .enumerate()
+            .map(|(m, &u)| {
+                let mut ms = unit_square_solution(u, 0.0);
+                ms.time = Some((image_time[reference_row(&register, m + 1)], image_time[m + 1]));
+                Arc::new(ms)
+            })
+            .collect();
+        sol.reference_updates = reference_updates;
+        sol.time = Some(image_time.to_vec());
+        sol
+    }
+
+    #[test]
+    fn test_reference_index_from_updates() {
+        let mut sol = make_sequence_solution_in_memory(4);
+        sol.reference_updates = vec![false, false, true, false];
+        let refs: Vec<usize> = (0..4).map(|m| sol.reference_index(m)).collect();
+        assert_eq!(refs, vec![0, 0, 2, 2]);
+        sol.reference_updates = vec![false, true, true, true]; // sequential mode
+        let refs: Vec<usize> = (0..4).map(|m| sol.reference_index(m)).collect();
+        assert_eq!(refs, vec![0, 1, 2, 3]);
+        assert_eq!(reference_row(&[], 0), 0);
+    }
+
+    #[test]
+    fn test_increment_displacements_leapfrog_vs_sequential() {
+        let sol = timed_sequence(&[0.1, 0.3, 0.6], &[0.0, 1.0, 3.0, 4.0], vec![false; 3]);
+        let inc = |m, mode| {
+            let (_, d, dt) = sol.increment_displacements(m, mode).unwrap();
+            (d[[0, 0]], dt.unwrap())
+        };
+        let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12;
+        assert!(close(inc(2, IncrementMode::Leapfrog), (0.6, 4.0)));
+        assert!(close(inc(2, IncrementMode::Sequential), (0.3, 1.0)));
+        assert!(close(inc(1, IncrementMode::Sequential), (0.2, 2.0)));
+        assert!(close(inc(0, IncrementMode::Sequential), (0.1, 1.0)));
+        assert!(sol.increment_displacements(3, IncrementMode::Leapfrog).is_err());
+
+        // Reference moved to image 2 at pair 2: its displacement already is
+        // the sequential increment.
+        let sol = timed_sequence(&[0.1, 0.3, 0.05], &[0.0, 1.0, 3.0, 4.0], vec![false, false, true]);
+        assert!(close(inc_of(&sol, 2, IncrementMode::Sequential), (0.05, 1.0)));
+        assert!(close(inc_of(&sol, 2, IncrementMode::Leapfrog), (0.05, 1.0)));
+    }
+
+    fn inc_of(sol: &SequenceSolution, m: usize, mode: IncrementMode) -> (f64, f64) {
+        let (_, d, dt) = sol.increment_displacements(m, mode).unwrap();
+        (d[[0, 0]], dt.unwrap())
+    }
+
+    /// Meshes that differ (no sync): the previous pair's field is
+    /// interpolated onto this pair's nodes — exact for a linear field.
+    #[test]
+    fn test_increment_displacements_interpolates_between_meshes() {
+        let mut sol = timed_sequence(&[0.0, 0.0], &[0.0, 1.0, 2.0], vec![false; 2]);
+        let mut prev = (*sol.mesh_solutions[0]).clone();
+        prev.nodes = array![[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]];
+        prev.centroids = crate::mesh::compute_centroids(&prev.nodes, &prev.elements);
+        prev.displacements = prev.nodes.map(|x| 0.1 * x);
+        let mut cur = (*sol.mesh_solutions[1]).clone();
+        cur.nodes = array![[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [1.5, 1.5]];
+        cur.centroids = crate::mesh::compute_centroids(&cur.nodes, &cur.elements);
+        cur.displacements = cur.nodes.map(|x| 0.3 * x);
+        sol.mesh_solutions = vec![Arc::new(prev), Arc::new(cur.clone())];
+        let (_, d, dt) = sol.increment_displacements(1, IncrementMode::Sequential).unwrap();
+        let expected = cur.nodes.map(|x| 0.2 * x);
+        assert!(d.iter().zip(expected.iter()).all(|(a, b)| (a - b).abs() < 1e-12), "{d:?}");
+        assert_eq!(dt, Some(1.0));
+    }
+
+    /// `from_dir` orders timestamped files by time (the last-number sort
+    /// would key `..._09.500` on 500), and `set_time` reads those times.
+    #[test]
+    fn test_from_dir_sorts_timestamped_names() {
+        let dir = std::env::temp_dir().join("geopyv_test_from_dir_timestamps");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["img_2026-10-14_12-00-10.png", "img_2026-10-14_12-00-09.500.png", "img_2026-10-14_12-00-11.png"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let mut seq = Sequence::from_dir(&dir, dummy_mesh_cfg()).unwrap();
+        let names: Vec<String> = seq.image_paths.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["img_2026-10-14_12-00-09.500.png", "img_2026-10-14_12-00-10.png", "img_2026-10-14_12-00-11.png"]);
+        assert!(seq.time.is_none(), "set_time not yet called");
+        seq.set_time(None).unwrap();
+        assert_eq!(seq.time, Some(vec![0.0, 0.5, 1.5]));
+        assert_eq!(seq.time_source, TimeSource::Filename("date-time".into()));
+        seq.set_time(Some(&TimeInput::Increment(0.1))).unwrap();
+        assert_eq!(seq.time_source, TimeSource::Given);
+        assert!(seq.set_time(Some(&TimeInput::Times(vec![0.0, 1.0]))).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1118,6 +1349,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         };
         assert_eq!(sol.n_meshes(), 2);
     }
@@ -1156,6 +1389,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         };
 
         let loaded = sol.load_mesh_at(0).unwrap();
@@ -1185,6 +1420,8 @@ mod tests {
             exclusion_regions: vec![],
             options: None,
             border: 0,
+            time: None,
+            time_source: Default::default(),
         };
         assert!(sol.load_mesh_at(0).is_err());
 

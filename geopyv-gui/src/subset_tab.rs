@@ -1351,6 +1351,8 @@ fn run_solve(
             return;
         }
     };
+    // Pair times from the image file names, when they carry a timestamp.
+    let _ = subset.set_time(None);
 
     if cancel.load(Ordering::Relaxed) {
         if let Ok(mut s) = state.lock() { s.running = false; }
