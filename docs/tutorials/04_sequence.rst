@@ -298,6 +298,18 @@ Save and reload
    sequence.save("data/sequence.pyv")
    sequence_loaded = gp.load("data/sequence.pyv")
 
+Adaptive masking
+------------------
+
+``sequence.solve(..., solver_options={"masking": "adaptive"})`` applies adaptive
+masking (:doc:`03_mesh`) to every pair. The **first two images are taken as a still
+pair**: recording should start before anything moves (small rigid camera movement
+is fine). That first pair is solved plainly and only supplies the camera noise; every
+later pair is screened against it, including after a reference update. Each pair's
+``mesh_solution_at(i).seams`` holds its record, and ``sequence.contour(...)`` /
+``sequence.inspect(...)`` take the same adaptive quantities and options as a
+``Mesh``. In the GUI, **Masking: Adaptive** in the Solver section does the same.
+
 Key takeaways
 --------------
 

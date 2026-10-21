@@ -124,10 +124,10 @@ Linear vs quadratic elements
    * - ``mesh_order``
      - Nodes per element
      - Warp params per node
-   * - 1
+   * - 1 (default)
      - 3 (vertices)
      - 6 (affine)
-   * - 2 (default)
+   * - 2
      - 6 (vertices + mid-sides)
      - 12 (quadratic)
 
@@ -239,6 +239,90 @@ per-node array is there, both by direct indexing and located visually on the mes
    # Subset.convergence() — a Mesh has many nodes, each with its own history)
    mesh.convergence(quantity="C_ZNCC")
 
+Adaptive masking
+------------------
+
+A subset fits one warp to the whole disc: a stretch, shear and shift (order 1) or
+also a bend (order 2). Where the disc straddles the edge of a shear band, no single
+warp fits both sides, and the measurement is smeared across the edge. With
+``solver_options={"masking": "adaptive"}``, ``Mesh.solve`` finds those subsets and
+corrects them:
+
+1. **Plain solve.** Every node is solved at order 1, exactly as above.
+2. **Screen.** Each node's warp predicts where its neighbours should have moved. If
+   a neighbour lands further from that prediction than camera noise alone allows
+   (and by more than 0.01 px of under-fit), both nodes are flagged. A node then
+   stays flagged only if at least a third of its neighbours are flagged, and an
+   unflagged node is added if at least two-thirds are, until nothing changes.
+3. **Tests.** On each node sent on, three scores ask whether the leftover after the
+   fit looks like a bend across the whole disc, or like a kink or step along one
+   line.
+4. **Correct.** A clear edge is **cut**: the far side of the line is masked (with a
+   3 px gap) and the subset re-solved; a second look may cut again (a narrow band)
+   or add a bend. A bend is re-solved at **order 2**. If the line passes within 5 px
+   of the centre, the node and its subset are first **jolted** that far away from it
+   (along the edge for a node on the boundary or an exclusion; never at a corner)
+   and tested again.
+
+.. image:: /_static/img/adaptive_neighbour_check.png
+   :alt: Two panels. Node A's arrow and B's displacement predicted from A's warp,
+         ending in a tolerance circle. Left: B's measured arrow ends inside the
+         circle. Right: a band lies between A and B, and B's measured arrow ends
+         far outside the circle, so both nodes go on to the tests.
+   :width: 640px
+   :align: center
+
+.. image:: /_static/img/adaptive_flow.png
+   :alt: Flow diagram of adaptive masking for one node: plain solve, screen, tests,
+         then cut (after a jolt if the line is within 5 px of the centre), order 2,
+         or nothing, and a second pass on a cut subset.
+   :width: 520px
+   :align: center
+
+**Where the noise comes from.** The screen's tolerance is set by camera noise, so it
+needs a measure of it:
+
+- **A still pair** (recommended): the reference image and one taken just before
+  anything moved. Small rigid camera movement between them is fine. Solve that pair
+  plainly and hand it to the moving mesh:
+
+  .. code-block:: python
+
+     still = gp.Mesh(boundary, target_nodes=8000, f_img=f_img, g_img=gp.Image(filepath="still.png"))
+     still.solve(local_mask, seed_coord)
+
+     mesh = gp.Mesh(boundary, target_nodes=8000, f_img=f_img, g_img=g_img, noise=still)
+     mesh.solve(local_mask, seed_coord, solver_options={"masking": "adaptive"})
+
+- **No still pair:** the noise is estimated from a small patch around the seed point,
+  which is assumed to move only rigidly. Choose the seed accordingly.
+
+A ``Sequence`` always uses its first two images as the still pair (see
+:doc:`04_sequence`).
+
+.. note::
+   Adaptive masking needs **lossless images** (PNG, TIFF or BMP): JPEG compression
+   changes between two images of moving texture and looks like under-fit. It solves
+   at ``subset_order=1`` and applies order 2 node by node; asking for
+   ``subset_order=2`` gives a warning and uses 1. ``mesh.p`` then has 12 columns,
+   with zeros in the bend terms wherever a node stayed at order 1.
+
+**What it did.** ``mesh.seams`` holds the record: the plain warps and node
+positions, which nodes were flagged and sent on, each node's action (``"nothing"``,
+``"order2"``, ``"cut"``, ``"cutorder2"``, ``"cut2"``) and its scores. The plots:
+
+.. code-block:: python
+
+   mesh.inspect(seams="actions", sent=True)  # what was done where, cut lines, jolts
+   mesh.inspect(seams="scores")              # edge vs bending score, alarm and margin lines
+   mesh.inspect(subset_idx=i)                # one node: its cut line(s) and masked side
+   mesh.contour("noise")                     # each node's noise level (px)
+   mesh.contour("still_mismatch")            # frame 0-1 neighbour mismatch (px; still pair only)
+   mesh.contour("correction")                # how far the correction moved u (px)
+
+``still_mismatch`` is the check that the still frame really was still: it should
+look like noise everywhere.
+
 Building, solving, and inspecting a mesh in the GUI
 --------------------------------------------------------
 
@@ -252,6 +336,9 @@ Building, solving, and inspecting a mesh in the GUI
    format was found, if any.
 3. In **Mesh Generation**, set target nodes, element size bounds, and mesh order.
 4. In **Solver**, choose ICGN/FAGN, subset order, and the tolerance/iteration limits.
+   **Masking: Adaptive** turns on adaptive masking (the order is then fixed at 1);
+   **Noise** picks a still frame from the image list, or leaves the noise to be
+   estimated near the seed.
 5. In **Define Region**, pick a drawing mode (Rectangular / Circular / Free), then
    click **Boundary ▶** and draw the region of interest on the image viewer;
    optionally click **Exclusion ▶** to add holes, and **Seed ▶** to place the seed
@@ -263,5 +350,9 @@ Building, solving, and inspecting a mesh in the GUI
    radios switch the overlay — the same information as ``mesh.contour(...)``
    above. Under **Displacements**, **Rate (velocity, px/s)** divides by the
    pair's Δt (shown underneath); it is greyed out when the mesh has no times.
+   After an adaptive solve, the metadata adds the noise source and how many nodes
+   were sent on, cut, bent and jolted; **Quality** adds **Noise**, **Frame 0–1** and
+   **Correction**, and **Show adaptive actions and cuts** draws each node's action
+   and cut lines over the plot.
 
 **Next:** :doc:`04_sequence` — extending to a full image sequence with ``Sequence``.

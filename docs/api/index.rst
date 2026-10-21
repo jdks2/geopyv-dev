@@ -54,6 +54,27 @@ Single-point and full-field DIC — see :doc:`../tutorials/02_subset`,
 .. autoclass:: geopyv_dev.Sequence
    :members:
 
+Adaptive masking results
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+After ``solve(..., solver_options={"masking": "adaptive"})`` (see
+:doc:`../tutorials/03_mesh`):
+
+- ``Subset.seams`` — dict: ``plain_coord``, ``plain_p``, ``jolt`` (shift, or
+  ``None``), ``action``, ``lines`` (cut lines: ``kind``, ``theta``, ``c``, ``T``),
+  ``gap``, ``passes`` (scores and decision per pass), ``h``, ``levels``, ``flags``.
+  ``None`` after a uniform solve.
+- ``Mesh.seams`` (and each ``Sequence`` pair's ``mesh_solution_at(i).seams``) —
+  dict of per-node arrays: ``plain_nodes``, ``plain_p``, ``flagged``, ``sent``,
+  ``noise_scale``, ``still_mismatch`` (``None`` without a still pair), ``action``,
+  ``records`` (each node's ``Subset.seams`` record, or ``None``), plus
+  ``noise_source``, ``rounds`` and ``h``.
+- ``Mesh(..., noise=still_mesh)`` — the solved still pair whose residuals set the
+  noise; without it the noise is estimated near the seed.
+- Plots: ``Mesh.contour`` quantities ``"noise"``, ``"still_mismatch"``,
+  ``"correction"``; ``Mesh.inspect(seams="actions" | "scores", sent=...)``;
+  ``Subset.inspect(seams=True)``.
+
 Tracking
 --------
 

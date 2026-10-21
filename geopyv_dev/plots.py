@@ -47,7 +47,7 @@ def _require_solved(obj):
 
 
 def inspect_subset(subset, ax=None, show=True, block=True, save=False,
-                    residual=False, colorbar=True, **kwargs):
+                    residual=False, colorbar=True, seams=False, **kwargs):
     """Visualise a solved ``Subset``.
 
     ``residual=True`` shows the converged per-pixel zero-normalised image
@@ -58,6 +58,10 @@ def inspect_subset(subset, ax=None, show=True, block=True, save=False,
     of: a spatially coherent patch of large residual within an otherwise
     quiet subset is the signature the "partial masking" follow-up work
     (`mds/...` -- see the plan) would cluster on.
+
+    A subset solved with ``solver_options={"masking": "adaptive"}`` shows its
+    cut line(s) in red and the masked side in grey; ``seams=True`` adds each
+    pass's scores against their alarm levels and the decision.
     """
     coord = subset.coord
     f_coords = np.asarray(subset.f_coords)
@@ -154,14 +158,102 @@ def inspect_subset(subset, ax=None, show=True, block=True, save=False,
         fig, ax = plt.subplots()
     else:
         fig = ax.get_figure()
-    ax.imshow(display, **imshow_kwargs)
-    ax.text(0.5, -0.05,
-            f"Size: {template_size} px; \u03c3_s = {sigma_intensity:.2f}; SSSIG = {sssig:.2E}",
-            transform=ax.transAxes, ha="center")
+    rec = getattr(subset, "seams", None)
+    if seams and rec is None:
+        _seams_of(subset)
+    r = template_size
+    cx, cy = float(coord[0]), float(coord[1])
+    ax.imshow(display, extent=[cx - r - 0.5, cx + r + 0.5, cy + r + 0.5, cy - r - 0.5], **imshow_kwargs)
+    _draw_seam_overlay(ax, rec, coord, template_size)
+    caption = f"Size: {template_size} px; \u03c3_s = {sigma_intensity:.2f}; SSSIG = {sssig:.2E}"
+    if seams:
+        caption += "\n" + f"action: {rec['action']}" + "\n" + _seam_score_text(rec)
+    ax.text(0.5, -0.05, caption, transform=ax.transAxes, ha="center", va="top")
     ax.set_axis_off()
     plt.tight_layout()
     _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
+
+
+# ---------------------------------------------------------------------------
+# Adaptive masking (seams) helpers
+# ---------------------------------------------------------------------------
+
+# Action -> (label, colour); "unsent" is a node the screen did not send on.
+_SEAM_ACTIONS = {
+    "unsent": ("not sent on", "#c8c8c8"),
+    "nothing": ("tested, left", "#4a6fa5"),
+    "order2": ("order 2", "#2a9d8f"),
+    "cut": ("cut", "#e76f51"),
+    "cutorder2": ("cut + order 2", "#9b5de5"),
+    "cut2": ("two cuts", "#d62828"),
+}
+
+
+def _seams_of(obj):
+    seams = getattr(obj, "seams", None)
+    if seams is None:
+        raise ValueError(f"{type(obj).__name__} was not solved with "
+                         "solver_options={'masking': 'adaptive'}")
+    return seams
+
+
+def _seam_segment(centre, theta, c, half):
+    """End points of the line x cos(theta) + y sin(theta) = c (offsets from
+    ``centre``), ``half`` px either side of its closest point to the centre."""
+    n = np.array([np.cos(theta), np.sin(theta)])
+    t = np.array([-n[1], n[0]])
+    mid = np.asarray(centre, float) + c * n
+    return mid - half * t, mid + half * t
+
+
+def _draw_seam_overlay(ax, rec, centre, size):
+    """Cut lines (red) and the masked side (grey) of one subset's seam record
+    on a crop centred on ``centre`` (absolute coordinates)."""
+    if rec is None or not rec["lines"]:
+        return
+    r = int(size)
+    xs = np.arange(-r, r + 1)
+    X, Y = np.meshgrid(xs, xs)
+    masked = np.zeros(X.shape, bool)
+    for line in rec["lines"]:
+        s_ = np.cos(line["theta"]) * X + np.sin(line["theta"]) * Y
+        c = line["c"]
+        keep = s_ < c - rec["gap"] if c > 0 else s_ > c + rec["gap"]
+        masked |= ~keep
+    masked &= X ** 2 + Y ** 2 <= r ** 2
+    overlay = np.zeros(X.shape + (4,))
+    overlay[masked] = (0.6, 0.6, 0.6, 0.75)
+    cx, cy = float(centre[0]), float(centre[1])
+    ax.imshow(overlay, extent=[cx - r - 0.5, cx + r + 0.5, cy + r + 0.5, cy - r - 0.5], zorder=5)
+    for line in rec["lines"]:
+        a, b = _seam_segment(centre, line["theta"], line["c"], r)
+        ax.plot([a[0], b[0]], [a[1], b[1]], color="#d62828", lw=1.5, zorder=7)
+
+
+_STAGE_NAMES = {"pass1": "pass 1", "pass1jolted": "pass 1 after jolt", "pass2": "pass 2 (cut)"}
+
+
+def _seam_score_text(rec):
+    """One line per pass: the three scores against their alarm levels."""
+    rows = []
+    for ps in rec["passes"]:
+        lv = rec["levels"]["pass2" if ps["stage"] == "pass2" else "pass1"]
+        th = ps["hinge"]["T"] if ps["hinge"] else 0.0
+        tj = ps["jump"]["T"] if ps["jump"] else 0.0
+        rows.append(f"{_STAGE_NAMES.get(ps['stage'], ps['stage'])}: bend {ps['T_bend']:.0f}/{lv['bend']:.0f}, "
+                    f"hinge {th:.0f}/{lv['hinge']:.0f}, jump {tj:.0f}/{lv['jump']:.0f} "
+                    f"-> {ps['decision'].replace('_', ' ')}")
+    return "\n".join(rows)
+
+
+def _picked_pass1(rec, lv):
+    """(T_edge, T_bend) of the pass-1 decision (after any jolt)."""
+    ps = [p for p in rec["passes"] if p["stage"] != "pass2"][-1]
+    th = ps["hinge"]["T"] if ps["hinge"] else 0.0
+    tj = ps["jump"]["T"] if ps["jump"] else 0.0
+    te = tj if tj / lv["jump"] > th / lv["hinge"] else th
+    return te, ps["T_bend"]
 
 
 def _load_img_gs(img_path):
@@ -210,14 +302,28 @@ def _render_template_crop(ax, img_gs, coord, size, shape):
 
 
 def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None,
-                 show=True, block=True, save=False, **kwargs):
+                 show=True, block=True, save=False, seams=None, sent=False, **kwargs):
     """Render the mesh over its reference image.
 
     ``subset_idx`` : int, optional
         Highlight one node. When the mesh records its subset template
         (every solve from schema ``0x07`` on) the plot becomes a crop of
-        that node's subset template (like ``subset.inspect()``).
+        that node's subset template (like ``subset.inspect()``), with its cut
+        line(s) and masked side after an adaptive solve.
+    ``seams`` : {"actions", "scores"}, optional
+        After ``solver_options={"masking": "adaptive"}``. ``"actions"``: nodes
+        coloured by what was done (left, order 2, cut, cut + order 2, two
+        cuts), cut lines in red, jolted nodes linked to where they started;
+        ``sent=True`` also rings the nodes the screen sent on. ``"scores"``:
+        edge score against bending score for every node sent on, with the
+        alarm and margin lines.
     """
+    if seams is not None:
+        if seams == "actions":
+            return _inspect_mesh_actions(mesh, sent, ax, show, block, save, **kwargs)
+        if seams == "scores":
+            return _inspect_mesh_scores(mesh, ax, show, block, save, **kwargs)
+        raise ValueError(f"seams must be 'actions' or 'scores', got {seams!r}")
     nodes = np.asarray(mesh.nodes)
     elements = np.asarray(mesh.elements)
     f_img_path = getattr(mesh, 'f_img_path', None)
@@ -241,6 +347,10 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None,
         img_gs = _load_img_gs(f_img_path)
         caption = f"Subset {subset_idx}: {tmpl_shape} r={size}"
         _render_template_crop(ax, img_gs, coord, size, str(tmpl_shape))
+        rec = (getattr(mesh, "seams", None) or {}).get("records", [None] * len(nodes))[subset_idx]
+        _draw_seam_overlay(ax, rec, coord, size)
+        if rec is not None:
+            caption += f"; action: {rec['action']}"
         ax.text(0.5, -0.06, caption, transform=ax.transAxes, ha="center")
         plt.tight_layout()
         _show_save_close(fig, show, block, save, owned=owned)
@@ -277,6 +387,103 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None,
         node = nodes[subset_idx]
         ax.scatter([node[0]], [node[1]], color='red', s=60, zorder=10)
 
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def _seam_action_per_node(sm):
+    act = np.array(["unsent"] * len(sm["sent"]), dtype=object)
+    for i, a in enumerate(sm["action"]):
+        if a is not None:
+            act[i] = a
+    return act
+
+
+def _inspect_mesh_actions(mesh, sent, ax, show, block, save, **kwargs):
+    _require_solved(mesh)
+    sm = _seams_of(mesh)
+    nodes = np.asarray(mesh.nodes)
+    plain = np.asarray(sm["plain_nodes"])
+    elements = np.asarray(mesh.elements)
+    act = _seam_action_per_node(sm)
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+    _imshow_or_blank(ax, getattr(mesh, "f_img_path", None), alpha=0.6)
+    t = nodes[elements[:, :3]]
+    ax.add_collection(LineCollection(np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]]),
+                                     colors="k", linewidths=0.1, alpha=0.3))
+    for key, (label, colour) in _SEAM_ACTIONS.items():
+        m = act == key
+        if m.any():
+            ax.scatter(nodes[m, 0], nodes[m, 1], s=2 if key == "unsent" else 6, color=colour,
+                       label=f"{label} ({int(m.sum())})", zorder=4 if key == "unsent" else 6, lw=0)
+    if sent:
+        m = np.asarray(sm["sent"])
+        ax.scatter(nodes[m, 0], nodes[m, 1], s=24, facecolors="none", edgecolors="k", lw=0.4,
+                   label=f"sent on ({int(m.sum())})", zorder=5)
+    size = int(np.asarray(mesh.template_sizes)[0]) if getattr(mesh, "template_sizes", None) is not None else 10
+    segs = []
+    for i, rec in enumerate(sm["records"]):
+        if rec is not None:
+            for line in rec["lines"]:
+                segs.append(_seam_segment(nodes[i], line["theta"], line["c"], 0.5 * size))
+    if segs:
+        ax.add_collection(LineCollection(segs, colors="#d62828", linewidths=0.8, zorder=7))
+    moved = np.hypot(*(nodes - plain).T) > 0
+    if moved.any():
+        ax.add_collection(LineCollection(np.stack([plain[moved], nodes[moved]], axis=1),
+                                         colors="k", linewidths=0.8, zorder=8))
+        ax.scatter(plain[moved, 0], plain[moved, 1], s=10, facecolors="none", edgecolors="k",
+                   lw=0.6, zorder=8, label=f"jolted from ({int(moved.sum())})")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=7, markerscale=2, frameon=False)
+    ax.set_title(f"Noise: {sm['noise_source']}", fontsize=9)
+    ax.set_axis_off()
+    plt.tight_layout()
+    _show_save_close(fig, show, block, save, owned=owned)
+    return fig, ax
+
+
+def _inspect_mesh_scores(mesh, ax, show, block, save, **kwargs):
+    _require_solved(mesh)
+    sm = _seams_of(mesh)
+    recs = [(i, r) for i, r in enumerate(sm["records"]) if r is not None and r["passes"]]
+    owned = ax is None
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = ax.get_figure()
+    if not recs:
+        ax.text(0.5, 0.5, "no node was sent on", ha="center", transform=ax.transAxes)
+    else:
+        lv = recs[0][1]["levels"]["pass1"]
+        te, tb, acts = [], [], []
+        for _, r in recs:
+            e, b = _picked_pass1(r, lv)
+            te.append(max(e, 1e-1))
+            tb.append(max(b, 1e-1))
+            acts.append(r["action"])
+        te, tb, acts = np.array(te), np.array(tb), np.array(acts)
+        for key, (label, colour) in _SEAM_ACTIONS.items():
+            m = acts == key
+            if m.any():
+                ax.scatter(tb[m], te[m], s=6, color=colour, label=f"{label} ({int(m.sum())})", lw=0)
+        lo = 0.5 * min(te.min(), tb.min(), lv["bend"])
+        hi = 2.0 * max(te.max(), tb.max(), lv["edge"] + lv["margin"])
+        x = np.geomspace(lo, hi, 200)
+        ax.axhline(lv["edge"], color="k", ls="--", lw=0.8, label="edge alarm")
+        ax.axvline(lv["bend"], color="k", ls=":", lw=0.8, label="bending alarm")
+        ax.plot(x, x + lv["margin"], color="#d62828", lw=0.8, label="cut margin")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_xlabel(r"Bending score, $T_{bend}$ (-)")
+        ax.set_ylabel(r"Edge score, $T_{edge}$ (-)")
+        ax.legend(fontsize=7, markerscale=2, framealpha=0.8)
     plt.tight_layout()
     _show_save_close(fig, show, block, save, owned=owned)
     return fig, ax
@@ -426,6 +633,23 @@ def convergence_sequence(sequence, mesh_idx=None, subset_idx=None, quantity="C_Z
         return fig, ax
 
 
+# Adaptive-masking quantities for ``Mesh.contour``.
+_SEAM_QUANTITIES = ("noise", "still_mismatch", "correction")
+
+
+def _seam_quantity(mesh, quantity):
+    sm = _seams_of(mesh)
+    if quantity == "noise":
+        return np.asarray(sm["noise_scale"])
+    if quantity == "still_mismatch":
+        if sm["still_mismatch"] is None:
+            raise ValueError("still_mismatch needs a still pair (Mesh(..., noise=...) or a "
+                             f"Sequence); this mesh used {sm['noise_source']}")
+        return np.asarray(sm["still_mismatch"])
+    d = np.asarray(mesh.displacements) - np.asarray(sm["plain_p"])[:, :2]
+    return np.hypot(d[:, 0], d[:, 1])
+
+
 def contour_mesh(mesh, quantity, rate=False, **kwargs):
     """Contour a solved mesh. ``rate=True`` plots ``u``/``v``/``R`` as
     velocities: displacement / (``g_time - f_time``), in px/s."""
@@ -437,7 +661,7 @@ def contour_mesh(mesh, quantity, rate=False, **kwargs):
 def _contour_mesh(mesh, quantity, displacements, dt, rate, ax=None, show=True, block=True,
                   save=False, mesh_overlay=False, calibration=None, **kwargs):
     _require_solved(mesh)
-    valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R"}
+    valid = {"C_ZNCC", "iterations", "norm", "u", "v", "R", *_SEAM_QUANTITIES}
     if quantity not in valid:
         raise ValueError(f"quantity must be one of {sorted(valid)!r}, got {quantity!r}")
     if calibration is not None and quantity not in {"u", "v", "R"}:
@@ -469,6 +693,9 @@ def _contour_mesh(mesh, quantity, displacements, dt, rate, ax=None, show=True, b
         "u": f"u ({unit})",
         "v": f"v ({unit})",
         "R": f"R ({unit})",
+        "noise": "Mismatch noise (px)",
+        "still_mismatch": "Frame 0\u20131 mismatch (px)",
+        "correction": "Change from the plain solve (px)",
     }
     if quantity == "C_ZNCC":
         values = np.asarray(mesh.c_zncc)
@@ -482,6 +709,8 @@ def _contour_mesh(mesh, quantity, displacements, dt, rate, ax=None, show=True, b
         values = displacements[:, 1]
     elif quantity == "R":
         values = np.sqrt(displacements[:, 0]**2 + displacements[:, 1]**2)
+    else:
+        values = _seam_quantity(mesh, quantity)
 
     owned = ax is None
     if ax is None:

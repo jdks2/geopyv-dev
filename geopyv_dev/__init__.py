@@ -470,7 +470,10 @@ class Mesh:
 
         ``subset_idx=i`` highlights one node; when the solve recorded its
         subset template (schema ``0x07`` on) the plot becomes a crop of that
-        node's template. ``show_areas=True`` draws node-area discs. See
+        node's template. ``show_areas=True`` draws node-area discs. After
+        an adaptive solve, ``seams="actions"`` maps what was done at each
+        node (``sent=True`` rings the nodes the screen sent on) and
+        ``seams="scores"`` plots edge against bending score. See
         ``geopyv_dev.plots.inspect_mesh``.
         """
         return inspect_mesh(self._inner, **kwargs)
@@ -479,6 +482,12 @@ class Mesh:
         return convergence_mesh(self._inner, quantity, **kwargs)
 
     def contour(self, quantity, **kwargs):
+        """Contour a node quantity: ``"C_ZNCC"``, ``"iterations"``, ``"norm"``,
+        ``"u"``, ``"v"``, ``"R"``; after an adaptive solve also ``"noise"``
+        (each node's mismatch noise, px), ``"still_mismatch"`` (frame 0-1
+        neighbour mismatch, px; needs a still pair) and ``"correction"``
+        (how far the correction moved the displacement from the plain
+        solve, px). See ``geopyv_dev.plots.contour_mesh``."""
         return contour_mesh(self._inner, quantity, **kwargs)
 
 

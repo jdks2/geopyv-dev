@@ -96,6 +96,25 @@ def test_seed_patch_noise_without_still_pair(frames):
     assert 1.0 < sigma < 3.5, src          # images carry ~2 grey levels
 
 
+def test_plot_errors_without_adaptive_solve(frames):
+    import matplotlib
+    matplotlib.use("Agg")
+    _, p = frames
+    m = _mesh(p[0], p[2])
+    _solve(m, "uniform")
+    for q in ("noise", "still_mismatch", "correction"):
+        with pytest.raises(ValueError, match="adaptive"):
+            m.contour(q, show=False)
+    with pytest.raises(ValueError, match="adaptive"):
+        m.inspect(seams="actions", show=False)
+    m2 = _mesh(p[0], p[2])
+    _solve(m2)                       # seed-patch noise: no still pair
+    with pytest.raises(ValueError, match="still pair"):
+        m2.contour("still_mismatch", show=False)
+    m2.contour("noise", show=False)
+    m2.inspect(seams="scores", show=False)
+
+
 def test_subset_adaptive_and_order_two_rebuilt(frames):
     _, p = frames
     f, g = gp.Image(filepath=p[0]), gp.Image(filepath=p[2])
@@ -107,6 +126,9 @@ def test_subset_adaptive_and_order_two_rebuilt(frames):
     with pytest.warns(UserWarning, match="subset_order=1"):
         s.solve(max_norm=1e-5, tolerance=0.0, solver_options={"masking": "adaptive"})
     assert s.seams is not None
+    import matplotlib
+    matplotlib.use("Agg")
+    s.inspect(seams=True, show=False)
     with pytest.raises(ValueError):
         s.solve(solver_options={"preconditioning": "RG"})
 
@@ -120,3 +142,48 @@ def test_sequence_uses_frames_zero_one_for_noise(frames):
     assert len(ms) == 2
     assert ms[0].seams is None                      # the still pair: noise only
     assert ms[1].seams["noise_source"] == "still pair"
+
+
+# ---------------------------------------------------------------------------
+# Golden test on full-size band images (images/adaptive): frame 0, a still
+# frame 1 (same speckles, fresh noise of 2 grey levels), and frame 2 with a
+# 10-speckle-wide horizontal shear band. The flagged and sent node sets were
+# checked against the sandbox reference (screen_all.pkl, wd10 low noise) and
+# match exactly. A ~1e-13 px run-to-run wobble in the plain solve can flip a
+# handful of borderline cut/leave decisions, so action counts get a margin.
+# ---------------------------------------------------------------------------
+
+import os
+
+_IMG = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../images/adaptive"))
+_GOLDEN = os.path.join(os.path.dirname(__file__), "data", "adaptive_wd10_golden.npz")
+
+
+@pytest.mark.skipif(not os.path.isdir(_IMG), reason="images/adaptive not present")
+def test_golden_band_sequence():
+    import matplotlib
+    matplotlib.use("Agg")
+    gold = np.load(_GOLDEN)
+    boundary = np.array([[301.0, 301.0], [1701.0, 301.0], [1701.0, 1701.0], [301.0, 1701.0]])
+    seq = gp.Sequence(_IMG, gp.PathRegion(nodes=boundary, hard=False), 8000, time=1.0)
+    seq.solve(local_mask=gp.Mask(mask_type="local", shape="circle", size=40), seed_coord=[1651.0, 1651.0],
+              tolerance=0.75, solver_options={"masking": "adaptive"})
+    mesh = seq.mesh_solutions[1]
+    s = mesh.seams
+    assert len(s["sent"]) == int(gold["n"])
+    assert np.array_equal(np.flatnonzero(s["flagged"]), gold["flagged"])
+    assert np.array_equal(np.flatnonzero(s["sent"]), gold["sent"])
+    assert s["rounds"] == int(gold["rounds"])
+    counts = {k: 0 for k in gold["action_names"]}
+    for a in s["action"]:
+        if a is not None:
+            counts[a] = counts.get(a, 0) + 1
+    for k, want in zip(gold["action_names"], gold["action_counts"]):
+        assert abs(counts[k] - int(want)) <= 5, (k, counts[k], int(want))
+    # The plots run on a real adaptive solve.
+    for q in ("noise", "still_mismatch", "correction"):
+        mesh.contour(q, show=False)
+    mesh.inspect(seams="actions", sent=True, show=False)
+    mesh.inspect(seams="scores", show=False)
+    k = int(np.flatnonzero([a == "cut" for a in s["action"]])[0])
+    mesh.inspect(subset_idx=k, show=False)

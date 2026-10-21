@@ -7,7 +7,8 @@ use ndarray::Array2;
 
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig};
+use geopyv_dev::mesh::{Masking, Mesh, MeshSolution, SeedConfig, SolveConfig};
+use geopyv_dev::screen::{NoiseSource, StillPair};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::masks::{LocalMask, MaskShape};
 
@@ -76,6 +77,10 @@ pub enum MeshPlotType {
     CZncc,
     Iterations,
     Norms,
+    // Adaptive masking
+    Noise,
+    StillMismatch,
+    Correction,
 }
 
 impl MeshPlotType {
@@ -87,6 +92,9 @@ impl MeshPlotType {
             MeshPlotType::CZncc => "C_ZNCC",
             MeshPlotType::Iterations => "Iterations",
             MeshPlotType::Norms => "Norms",
+            MeshPlotType::Noise => "Mismatch noise (px)",
+            MeshPlotType::StillMismatch => "Frame 0\u{2013}1 mismatch (px)",
+            MeshPlotType::Correction => "Change from plain solve (px)",
         }
     }
 }
@@ -127,6 +135,9 @@ pub struct NewMeshForm {
     pub template_size_error: Option<String>,
     pub gen_cfg: MeshGenConfig,
     pub solver: SolverConfig,
+    /// Adaptive masking: image index of the still frame paired with the
+    /// reference; `None`: estimate the noise from a patch around the seed.
+    pub still_idx: Option<usize>,
     pub draw: crate::draw::DrawState,
     pub time: crate::time_input::TimeInputForm,
     pub form_error: Option<String>,
@@ -144,6 +155,7 @@ impl Default for NewMeshForm {
             template_size_error: None,
             gen_cfg: MeshGenConfig::default(),
             solver: SolverConfig::default(),
+            still_idx: None,
             draw: crate::draw::DrawState::new(),
             time: Default::default(),
             form_error: None,
@@ -192,6 +204,8 @@ pub struct MeshViewState {
     pub range_max: f64,
     pub show_wireframe: bool,
     pub show_node_indices: bool,
+    /// Adaptive masking: draw actions and cut lines over the contour.
+    pub show_seams: bool,
     /// Plot displacements as velocities (÷ the pair's Δt).
     pub rate: bool,
     // Cached per-node scalar values (invalidated when plot_type or rate changes).
@@ -214,6 +228,7 @@ impl MeshViewState {
             range_max: 1.0,
             show_wireframe: false,
             show_node_indices: false,
+            show_seams: false,
             rate: false,
             nodal_cache: None,
         }
@@ -268,6 +283,10 @@ pub struct MeshSpawnParams {
     pub max_iterations: usize,
     pub zncc_tol: f64,
     pub time: Option<geopyv_dev::timing::TimeInput>,
+    pub masking: Masking,
+    /// Adaptive masking: frame 1 of a still pair with the reference image
+    /// (no mechanical movement); `None` estimates the noise near the seed.
+    pub still_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +522,9 @@ impl MeshTabState {
                     &coord,
                 );
 
+                if self.view.show_seams {
+                    render_seam_overlay(&painter, sol, &coord);
+                }
                 render_colorbar(&painter, viewer_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate));
             }
         }
@@ -629,6 +651,7 @@ impl MeshTabState {
             meta_row(ui, "Below 0.75", &n_below.to_string());
         }
         meta_row(ui, "Seed node", &sol.seed_node.to_string());
+        seam_summary(ui, sol);
 
         ui.add_space(6.0);
         ui.separator();
@@ -654,7 +677,8 @@ impl MeshTabState {
                 .selected(self.view.active_pane == MeshViewPane::Quality)).clicked()
             {
                 self.view.active_pane = MeshViewPane::Quality;
-                if !matches!(self.view.plot_type, MeshPlotType::CZncc | MeshPlotType::Iterations | MeshPlotType::Norms) {
+                if !matches!(self.view.plot_type, MeshPlotType::CZncc | MeshPlotType::Iterations | MeshPlotType::Norms
+                    | MeshPlotType::Noise | MeshPlotType::StillMismatch | MeshPlotType::Correction) {
                     self.view.plot_type = MeshPlotType::CZncc;
                     self.view.nodal_cache = None;
                 }
@@ -687,6 +711,14 @@ impl MeshTabState {
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::Iterations, "Iterations");
                     ui.radio_value(&mut self.view.plot_type, MeshPlotType::Norms, "Norms");
                 });
+                if let Some(sol) = self.view.solution.as_ref() {
+                    if sol.seams.is_some() {
+                        ui.label(egui::RichText::new("Adaptive masking:").size(14.0).color(ui.visuals().weak_text_color()));
+                        let mut plot = self.view.plot_type;
+                        seam_plot_radios(ui, &mut plot, sol);
+                        self.view.plot_type = plot;
+                    }
+                }
             }
         }
 
@@ -787,6 +819,9 @@ impl MeshTabState {
         ui.add_space(4.0);
         ui.checkbox(&mut self.view.show_wireframe, "Show wireframe");
         ui.checkbox(&mut self.view.show_node_indices, "Show node indices");
+        if self.view.solution.as_ref().is_some_and(|s| s.seams.is_some()) {
+            ui.checkbox(&mut self.view.show_seams, "Show adaptive actions and cuts");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1076,11 +1111,17 @@ impl MeshTabState {
                             .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut s.order, SubsetOrder::First, "1");
-                        ui.radio_value(&mut s.order, SubsetOrder::Second, "2");
-                    });
+                    ui.add_enabled_ui(s.masking == Masking::Uniform, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut s.order, SubsetOrder::First, "1");
+                            ui.radio_value(&mut s.order, SubsetOrder::Second, "2");
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text("Adaptive masking solves at order 1 and applies order 2 node by node");
                     ui.end_row();
+
+                    crate::subset_tab::masking_row(ui, s);
 
                     ui.label(
                         egui::RichText::new("Max norm:")
@@ -1144,6 +1185,38 @@ impl MeshTabState {
                         .color(ui.visuals().error_fg_color),
                 );
             }
+        }
+
+        if form.solver.masking == Masking::Adaptive {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Noise:").size(16.0).color(ui.visuals().weak_text_color()));
+                let label = form
+                    .still_idx
+                    .and_then(|i| images.get(i))
+                    .and_then(|p| p.file_name())
+                    .map(|n| format!("still frame: {}", n.to_string_lossy()))
+                    .unwrap_or_else(|| "estimate near the seed".to_string());
+                egui::ComboBox::from_id_salt("mesh_still")
+                    .selected_text(label)
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut form.still_idx, None, "estimate near the seed");
+                        for (i, p) in images.iter().enumerate() {
+                            if Some(i) == form.ref_idx || Some(i) == form.target_idx {
+                                continue;
+                            }
+                            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            ui.selectable_value(&mut form.still_idx, Some(i), format!("still frame: {name}"));
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "A frame taken with the reference before anything moved (rigid motion is fine). \
+                         Its residuals measure the camera noise. Without one, the noise is estimated \
+                         from a small patch around the seed point, assumed to move only rigidly.",
+                    );
+            });
         }
 
         ui.add_space(6.0);
@@ -1286,6 +1359,10 @@ impl MeshTabState {
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
                     time: form.time.input().ok().flatten(),
+                    masking: form.solver.masking,
+                    still_path: (form.solver.masking == Masking::Adaptive)
+                        .then(|| form.still_idx.map(|i| images[i].clone()))
+                        .flatten(),
                 });
                 form.form_error = None;
             }
@@ -1467,6 +1544,7 @@ fn run_solve(
             SolveMethod::Fagn => LibSolveMethod::Fagn,
         },
         override_active: false,
+        masking: params.masking,
         ..Default::default()
     };
     let seed_warp = vec![0.0f64; 6 * p_len];
@@ -1475,6 +1553,48 @@ fn run_solve(
         warp: seed_warp,
         tolerance: SeedConfig::DEFAULT_TOLERANCE,
     };
+
+    // Adaptive masking with a still frame: solve the still pair (reference →
+    // still frame) plainly on the same geometry; its residuals give the noise.
+    if let Some(still_path) = &params.still_path {
+        set_progress(&state, 0.6, "Solving the still pair\u{2026}");
+        let still_img = match Image::from_file(still_path, geopyv_dev::image::DEFAULT_BORDER) {
+            Ok(img) => Arc::new(img),
+            Err(e) => {
+                set_error(&state, format!("Still image error: {e}"));
+                return;
+            }
+        };
+        let still_mesh = Mesh::new(
+            boundary_arr.view(), true, &exclusion_views, &excl_hard,
+            (params.size_lower, params.size_upper), params.target_nodes, params.mesh_order,
+            Arc::clone(&ref_img), Arc::clone(&still_img),
+        );
+        let mut still_mesh = match still_mesh {
+            Ok(m) => m,
+            Err(e) => {
+                set_error(&state, format!("Still-pair mesh error: {e}"));
+                return;
+            }
+        };
+        let still_cfg = SolveConfig { masking: Masking::Uniform, ..cfg.clone() };
+        let progress = crate::progress::GuiProgress::new(|f, msg| set_progress(&state, f, msg), &cancel, 0.6, 0.65);
+        match still_mesh.solve(&local_mask, &seed_cfg, &still_cfg, Some(&progress)) {
+            Ok(()) => mesh.set_noise(Some(StillPair {
+                solution: Arc::clone(still_mesh.solution().expect("solved")),
+                f_img: Arc::clone(&ref_img),
+                g_img: still_img,
+            })),
+            Err(geopyv_dev::Error::Cancelled) => {
+                if let Ok(mut s) = state.lock() { s.running = false; }
+                return;
+            }
+            Err(e) => {
+                set_error(&state, format!("Still-pair solve error: {e}"));
+                return;
+            }
+        }
+    }
 
     let progress = crate::progress::GuiProgress::new(|f, msg| set_progress(&state, f, msg), &cancel, 0.65, 1.0);
     match mesh.solve(&local_mask, &seed_cfg, &cfg, Some(&progress)) {
@@ -1509,7 +1629,94 @@ pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType, rate: bool) 
         MeshPlotType::CZncc => sol.c_zncc.to_vec(),
         MeshPlotType::Iterations => sol.iterations.iter().map(|&v| v as f64).collect(),
         MeshPlotType::Norms => sol.norms.to_vec(),
+        MeshPlotType::Noise | MeshPlotType::StillMismatch | MeshPlotType::Correction => {
+            seam_values(sol, plot).unwrap_or_else(|| vec![f64::NAN; sol.nodes.nrows()])
+        }
         _ => displacement_values(&sol.displacements, plot, rate.then(|| sol.dt().unwrap_or(f64::NAN))),
+    }
+}
+
+/// Per-node adaptive-masking values (`None` if the solve was not adaptive, or
+/// for the frame 0–1 mismatch without a still pair).
+pub fn seam_values(sol: &MeshSolution, plot: MeshPlotType) -> Option<Vec<f64>> {
+    let sm = sol.seams.as_ref()?;
+    match plot {
+        MeshPlotType::Noise => Some(sm.noise_scale.to_vec()),
+        MeshPlotType::StillMismatch => sm.still_mismatch.as_ref().map(|a| a.to_vec()),
+        MeshPlotType::Correction => Some(
+            (0..sol.nodes.nrows())
+                .map(|i| {
+                    (sol.displacements[[i, 0]] - sm.plain_p[[i, 0]])
+                        .hypot(sol.displacements[[i, 1]] - sm.plain_p[[i, 1]])
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Radio buttons for the adaptive-masking plots available on `sol`.
+pub fn seam_plot_radios(ui: &mut egui::Ui, plot: &mut MeshPlotType, sol: &MeshSolution) {
+    let Some(sm) = sol.seams.as_ref() else { return };
+    ui.horizontal_wrapped(|ui| {
+        ui.radio_value(plot, MeshPlotType::Noise, "Noise");
+        ui.add_enabled_ui(sm.still_mismatch.is_some(), |ui| {
+            ui.radio_value(plot, MeshPlotType::StillMismatch, "Frame 0\u{2013}1");
+        })
+        .response
+        .on_disabled_hover_text("Needs a still pair");
+        ui.radio_value(plot, MeshPlotType::Correction, "Correction");
+    });
+}
+
+/// Summary rows for an adaptive solve.
+pub fn seam_summary(ui: &mut egui::Ui, sol: &MeshSolution) {
+    let Some(sm) = sol.seams.as_ref() else { return };
+    let src = match sm.noise_source {
+        NoiseSource::StillPair => "still pair".to_string(),
+        NoiseSource::SeedPatch { sigma } => format!("seed patch ({sigma:.2} grey)"),
+        NoiseSource::Default { sigma } => format!("default ({sigma} grey)"),
+    };
+    meta_row(ui, "Noise", &src);
+    meta_row(ui, "Flagged", &sm.flagged.iter().filter(|&&v| v).count().to_string());
+    meta_row(ui, "Sent on", &sm.sent.iter().filter(|&&v| v).count().to_string());
+    let count = |a: geopyv_dev::seam::SeamAction| {
+        sm.records.iter().filter(|r| r.as_ref().is_some_and(|r| r.action == a)).count()
+    };
+    use geopyv_dev::seam::SeamAction as A;
+    meta_row(ui, "Cut", &(count(A::Cut) + count(A::Cut2) + count(A::CutOrder2)).to_string());
+    meta_row(ui, "Order 2", &(count(A::Order2) + count(A::CutOrder2)).to_string());
+    meta_row(
+        ui,
+        "Jolted",
+        &sm.records.iter().filter(|r| r.as_ref().is_some_and(|r| r.jolt.is_some())).count().to_string(),
+    );
+}
+
+/// Cut lines (red) and nodes coloured by action, over the mesh.
+pub fn render_seam_overlay(painter: &egui::Painter, sol: &MeshSolution, coord: &ImageCoord) {
+    use geopyv_dev::seam::SeamAction as A;
+    let Some(sm) = sol.seams.as_ref() else { return };
+    let half = sol.template_sizes.as_ref().map_or(10.0, |t| 0.5 * t[0] as f64);
+    let line = egui::Stroke::new(1.5, egui::Color32::from_rgb(214, 40, 40));
+    for (i, rec) in sm.records.iter().enumerate() {
+        let Some(rec) = rec else { continue };
+        let (x, y) = (sol.nodes[[i, 0]], sol.nodes[[i, 1]]);
+        let colour = match rec.action {
+            A::Nothing => egui::Color32::from_rgb(74, 111, 165),
+            A::Order2 => egui::Color32::from_rgb(42, 157, 143),
+            A::Cut => egui::Color32::from_rgb(231, 111, 81),
+            A::CutOrder2 => egui::Color32::from_rgb(155, 93, 229),
+            A::Cut2 => egui::Color32::from_rgb(214, 40, 40),
+        };
+        painter.circle_filled(coord.to_screen(egui::pos2(x as f32, y as f32)), 2.5, colour);
+        for l in &rec.lines {
+            let (n0, n1) = (l.theta.cos(), l.theta.sin());
+            let (mx, my) = (x + l.c * n0, y + l.c * n1);
+            let a = coord.to_screen(egui::pos2((mx + half * n1) as f32, (my - half * n0) as f32));
+            let b = coord.to_screen(egui::pos2((mx - half * n1) as f32, (my + half * n0) as f32));
+            painter.line_segment([a, b], line);
+        }
     }
 }
 
