@@ -451,6 +451,9 @@ impl SubsetTabState {
                                     egui::Color32::from_rgba_unmultiplied(255, 200, 0, 200),
                                 );
 
+                                // Adaptive masking: cut line(s) and the masked side.
+                                paint_seam_cuts(ui.painter(), sol, &coord);
+
                                 // In Displacement mode, also draw filled original + deformed.
                                 if self.view.active_plot == SubsetPlotMode::Displacement {
                                     let alpha =
@@ -1441,6 +1444,55 @@ fn run_solve(
 // ---------------------------------------------------------------------------
 // Deformed template overlay
 // ---------------------------------------------------------------------------
+
+/// Cut lines (red chords) and the masked part of the disc (grey) of a subset
+/// corrected by adaptive masking. Each cut masks a circular segment: the side
+/// of `x cos θ + y sin θ = c` away from the centre, less the gap.
+fn paint_seam_cuts(painter: &egui::Painter, sol: &SubsetSolution, coord: &ImageCoord) {
+    let Some(rec) = sol.seams.as_ref() else { return };
+    let (cx, cy) = (sol.coord[0], sol.coord[1]);
+    let r = sol.mask.size as f64;
+    let to_screen = |dx: f64, dy: f64| coord.to_screen(egui::pos2((cx + dx) as f32, (cy + dy) as f32));
+    for l in &rec.lines {
+        let (n0, n1) = (l.theta.cos(), l.theta.sin());
+        // Masked: s >= b when the centre is on the low side (c > 0), else s <= b.
+        let (b, sign) = if l.c > 0.0 { (l.c - rec.gap, 1.0) } else { (l.c + rec.gap, -1.0) };
+        if b.abs() < r {
+            let h = (r * r - b * b).sqrt();
+            let a0 = (-n1 * h + n0 * b, n0 * h + n1 * b);
+            let a1 = (n1 * h + n0 * b, -n0 * h + n1 * b);
+            let mut pts = vec![to_screen(a1.0, a1.1)];
+            const N: usize = 96;
+            for k in 0..=N {
+                let t = 2.0 * std::f64::consts::PI * k as f64 / N as f64;
+                let (dx, dy) = (r * t.cos(), r * t.sin());
+                if sign * (dx * n0 + dy * n1 - b) > 0.0 {
+                    pts.push(to_screen(dx, dy));
+                }
+            }
+            pts.push(to_screen(a0.0, a0.1));
+            // Order the segment's points by angle so the polygon is convex.
+            let centre = to_screen(n0 * (b + sign * 0.5 * (r - b.abs())), n1 * (b + sign * 0.5 * (r - b.abs())));
+            pts.sort_by(|p, q| {
+                let ap = (p.y - centre.y).atan2(p.x - centre.x);
+                let aq = (q.y - centre.y).atan2(q.x - centre.x);
+                ap.partial_cmp(&aq).unwrap()
+            });
+            painter.add(egui::Shape::convex_polygon(
+                pts,
+                egui::Color32::from_rgba_unmultiplied(150, 150, 150, 170),
+                egui::Stroke::NONE,
+            ));
+        }
+        if l.c.abs() < r {
+            let h = (r * r - l.c * l.c).sqrt();
+            painter.line_segment(
+                [to_screen(-n1 * h + n0 * l.c, n0 * h + n1 * l.c), to_screen(n1 * h + n0 * l.c, -n0 * h + n1 * l.c)],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(214, 40, 40)),
+            );
+        }
+    }
+}
 
 fn paint_deformed_template(
     painter: &egui::Painter,
