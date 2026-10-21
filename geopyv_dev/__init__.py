@@ -293,7 +293,7 @@ class Subset:
         return repr(self._inner)
 
     def solve(self, p_0=None, solver=None,
-              max_norm=1e-3, max_iterations=50, tolerance=0.75, **extra_kwargs):
+              max_norm=1e-3, max_iterations=50, tolerance=0.75, seams=False, **extra_kwargs):
         """Run the DIC solver. Mutates the object in place; returns None
         (read the result back via ``.p``, ``.c_zncc``, etc.).
 
@@ -311,10 +311,16 @@ class Subset:
             Iteration limit. Default 50.
         tolerance : float, optional
             Minimum acceptable C_ZNCC for solved=True. Default 0.75.
+        seams : bool, optional
+            After the plain solve, look for a band edge or bending the
+            order-1 warp misses and correct for it (move the subset off a
+            line through its centre, cut along the line, or re-solve at order
+            2). Order-1 subsets and lossless images only. The plain solve is
+            kept in ``.seams``. Default False.
         """
         algo = _checked_solver(_resolve_solver(solver, extra_kwargs, "algorithm"))
         kwargs = dict(p_0=p_0, max_norm=max_norm,
-                      max_iterations=max_iterations, tolerance=tolerance)
+                      max_iterations=max_iterations, tolerance=tolerance, seams=seams)
         if algo == "fagn":
             self._inner.solve_fagn(**kwargs)
         else:

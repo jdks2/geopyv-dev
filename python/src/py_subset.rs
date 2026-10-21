@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use numpy::{IntoPyArray, PyArray1, PyArray2};
+use pyo3::types::{PyDict, PyList};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -12,6 +13,7 @@ use geopyv_dev::{
     io::{self as gp_io, GeopyvObject},
     subset::{Subset, SubsetSolution, SolveResult},
     masks::{LocalMask, MaskShape},
+    seam::{EdgeKind, PassLevels, SeamConfig, SeamDecision, SeamLine, SeamPass, SeamRecord},
 };
 
 use crate::{
@@ -33,6 +35,8 @@ pub struct PySubset {
 
     // Python object handles (not in Rust core).
     local_mask: Option<Py<PyMask>>,
+    /// Global (image) mask the subset was built with, if any.
+    global_mask: Option<Py<PyMask>>,
     pub(crate) f_img: Option<Py<PyImage>>,
     pub(crate) g_img: Option<Py<PyImage>>,
 }
@@ -46,9 +50,16 @@ impl PySubset {
     pub(crate) fn from_solution(py: Python<'_>, sol: SubsetSolution) -> PyResult<Self> {
         let order = (sol.result.p.len() / 6).max(1);
 
-        // Reconstruct LocalMask from template summary.
-        let local_mask = LocalMask::new(sol.mask.shape.clone(), sol.mask.size).map_err(Error::from)?;
-        let py_mask: Py<PyMask> = Py::new(py, PyMask::from_local(local_mask.clone()))?;
+        // Reconstruct LocalMask from template summary; the subset itself uses
+        // the template with any seam cuts reapplied.
+        let template = LocalMask::new(sol.mask.shape.clone(), sol.mask.size).map_err(Error::from)?;
+        let py_mask: Py<PyMask> = Py::new(py, PyMask::from_local(template.clone()))?;
+        let mut local_mask = template;
+        if let Some(rec) = &sol.seams {
+            for l in &rec.lines {
+                local_mask.cut_half_plane(l.theta, l.c, rec.gap);
+            }
+        }
 
         // Attempt to load reference image.
         let py_f_img: Option<Py<PyImage>> =
@@ -87,6 +98,7 @@ impl PySubset {
         Ok(PySubset {
             inner,
             local_mask: Some(py_mask),
+            global_mask: None,
             f_img: py_f_img,
             g_img: py_g_img,
         })
@@ -110,6 +122,23 @@ impl PySubset {
             sol.target_image = PathBuf::from(g_img_path);
         }
         Ok(sol)
+    }
+
+    /// The full template this subset was built from.
+    fn template_mask(&self, py: Python<'_>) -> PyResult<LocalMask> {
+        let lm = self.local_mask.as_ref().ok_or_else(|| PyRuntimeError::new_err("Subset has no local mask"))?;
+        let r = lm.bind(py).borrow();
+        Ok(r.local_mask_ref()?.clone())
+    }
+
+    /// Seam investigation and correction of the plain order-1 solve, at the
+    /// package's settings (see `geopyv_dev::seam`).
+    fn correct_seams(&mut self, py: Python<'_>) -> PyResult<()> {
+        let lm = self.template_mask(py)?;
+        let gm_guard = self.global_mask.as_ref().map(|gm| gm.bind(py).borrow());
+        let gm_view = gm_guard.as_ref().and_then(|g| g.global_view());
+        self.inner.solve_seams(&lm, gm_view, None, &SeamConfig::default()).map_err(Error::from)?;
+        Ok(())
     }
 
     /// The underlying `SolveResult`, if solved.
@@ -172,6 +201,7 @@ impl PySubset {
         Ok(PySubset {
             inner,
             local_mask: Some(lm_py),
+            global_mask,
             f_img: Some(f_img_py),
             g_img: Some(g_img_py),
         })
@@ -182,32 +212,42 @@ impl PySubset {
     // -----------------------------------------------------------------------
 
     /// Inverse Compositional Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, seams = false))]
     fn solve_icgn(
         &mut self,
+        py: Python<'_>,
         p_0: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
         tolerance: f64,
+        seams: bool,
     ) -> PyResult<()> {
         self.inner
             .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
+        if seams {
+            self.correct_seams(py)?;
+        }
         Ok(())
     }
 
     /// Forward Additive Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, seams = false))]
     fn solve_fagn(
         &mut self,
+        py: Python<'_>,
         p_0: Option<Vec<f64>>,
         max_norm: f64,
         max_iterations: usize,
         tolerance: f64,
+        seams: bool,
     ) -> PyResult<()> {
         self.inner
             .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
+        if seams {
+            self.correct_seams(py)?;
+        }
         Ok(())
     }
 
@@ -385,6 +425,19 @@ impl PySubset {
     // __repr__
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Seam record
+    // -----------------------------------------------------------------------
+
+    /// Seam record as a dict, or `None` for a plain solve.
+    #[getter]
+    fn seams<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match self.inner.solution().and_then(|s| s.seams.as_ref()) {
+            Some(rec) => Ok(Some(record_dict(py, rec)?)),
+            None => Ok(None),
+        }
+    }
+
     fn __repr__(&self) -> String {
         let shape_str = match &self.inner.mask.shape {
             MaskShape::Circle => "circle",
@@ -426,4 +479,79 @@ impl PySubset {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySubset>()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Seam records as Python dicts
+// ---------------------------------------------------------------------------
+
+fn kind_str(k: EdgeKind) -> &'static str {
+    match k {
+        EdgeKind::Hinge => "hinge",
+        EdgeKind::Jump => "jump",
+    }
+}
+
+fn line_dict<'py>(py: Python<'py>, l: &SeamLine) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("kind", kind_str(l.kind))?;
+    d.set_item("theta", l.theta)?;
+    d.set_item("c", l.c)?;
+    d.set_item("T", l.t)?;
+    Ok(d)
+}
+
+fn decision_str(d: SeamDecision) -> &'static str {
+    match d {
+        SeamDecision::Nothing => "nothing",
+        SeamDecision::Order2 => "order2",
+        SeamDecision::Cut(EdgeKind::Hinge) => "cut_hinge",
+        SeamDecision::Cut(EdgeKind::Jump) => "cut_jump",
+    }
+}
+
+fn pass_dict<'py>(py: Python<'py>, p: &SeamPass) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("stage", format!("{:?}", p.stage).to_lowercase())?;
+    d.set_item("T_bend", p.t_bend)?;
+    d.set_item("hinge", p.hinge.as_ref().map(|l| line_dict(py, l)).transpose()?)?;
+    d.set_item("jump", p.jump.as_ref().map(|l| line_dict(py, l)).transpose()?)?;
+    d.set_item("decision", decision_str(p.decision))?;
+    Ok(d)
+}
+
+fn levels_dict<'py>(py: Python<'py>, lv: &PassLevels) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("bend", lv.bend)?;
+    d.set_item("hinge", lv.hinge)?;
+    d.set_item("jump", lv.jump)?;
+    d.set_item("edge", lv.edge)?;
+    d.set_item("margin", lv.margin)?;
+    Ok(d)
+}
+
+fn record_dict<'py>(py: Python<'py>, r: &SeamRecord) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("plain_coord", r.plain_coord)?;
+    d.set_item("plain_p", r.plain_p.clone())?;
+    d.set_item("jolt", r.jolt)?;
+    d.set_item("action", format!("{:?}", r.action).to_lowercase())?;
+    let lines = PyList::empty_bound(py);
+    for l in &r.lines {
+        lines.append(line_dict(py, l)?)?;
+    }
+    d.set_item("lines", lines)?;
+    d.set_item("gap", r.gap)?;
+    let passes = PyList::empty_bound(py);
+    for p in &r.passes {
+        passes.append(pass_dict(py, p)?)?;
+    }
+    d.set_item("passes", passes)?;
+    d.set_item("h", r.h)?;
+    let lv = PyDict::new_bound(py);
+    lv.set_item("pass1", levels_dict(py, &r.levels.pass1)?)?;
+    lv.set_item("pass2", levels_dict(py, &r.levels.pass2)?)?;
+    d.set_item("levels", lv)?;
+    d.set_item("flags", r.flags.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>())?;
+    Ok(d)
 }

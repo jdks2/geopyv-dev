@@ -38,7 +38,7 @@ use ndarray::{Array1, Array2, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, timing::{resolve_pair_time, TimeInput, TimeSource}, Error};
+use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, seam::SeamRecord, timing::{resolve_pair_time, TimeInput, TimeSource}, Error};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -132,6 +132,10 @@ pub struct SubsetSolution {
     /// `(f_time, g_time)` of the image pair, seconds — see [`crate::timing`].
     #[serde(default)]
     pub time: Option<(f64, f64)>,
+    /// Seam investigation and correction record — see
+    /// [`Subset::solve_seams`]. `None` for a plain solve.
+    #[serde(default)]
+    pub seams: Option<SeamRecord>,
 }
 
 /// Output of a DIC solve ([`Subset::solve_icgn`] / [`Subset::solve_fagn`]).
@@ -1113,6 +1117,7 @@ impl Subset {
             sssig: self.sssig,
             delta_f: self.delta_f,
             time: self.time,
+            seams: None,
         }
     }
 
