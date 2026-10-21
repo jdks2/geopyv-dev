@@ -279,7 +279,8 @@ Selecting and solving a subset in the GUI
 3. Choose a template shape (circle/square) and size, and a solver
    configuration (ICGN/FAGN, order 1/2, max norm, max iterations, ZNCC
    tolerance), and **Masking: Uniform/Adaptive**. After an adaptive solve the
-   results list the action taken, any jolt and any flags.
+   results list the action taken, any jolt and any flags, and the viewer draws
+   the cut line(s) in red with the masked side shaded grey.
 4. Click on the reference image in the viewer to place the subset centre.
 5. Click **Run** to solve.
 6. Once solved, switch between the **Displacement**, **Inspect**, and
