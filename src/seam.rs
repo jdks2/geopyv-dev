@@ -174,6 +174,9 @@ pub enum SeamFlag {
     PlainNotConverged,
     /// The jolted subset could not be built or solved; the cut was made in place.
     JoltFailed,
+    /// The node may not move that way (a geometry-defining boundary node, or
+    /// the move would distort an element); the cut was made in place.
+    JoltBlocked,
     /// The cut subset could not be solved; the plain solve is kept.
     CutFailed,
     /// The order-2 re-solve did not converge; the previous solve is kept.
@@ -214,7 +217,7 @@ const LOSSLESS: [&str; 4] = ["png", "tif", "tiff", "bmp"];
 /// Refuse lossy image files: JPEG's 8×8 block compression differs between two
 /// images of moving texture and the tests read it as under-fit (context.md
 /// key observation 3). Images built from arrays have no file and pass.
-fn require_lossless(img: &Image) -> Result<(), Error> {
+pub(crate) fn require_lossless(img: &Image) -> Result<(), Error> {
     if let Some(path) = &img.filepath {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         if !LOSSLESS.contains(&ext.as_str()) {
@@ -397,7 +400,7 @@ fn f_ppf(p: f64, d1: f64, d2: f64) -> f64 {
 
 /// Pixel offsets, scaled reference gradients `∇f / δ_f` and the converged
 /// zero-normalised residual of one solved order-1 subset.
-struct SeamData {
+pub(crate) struct SeamData {
     x: Vec<f64>,
     y: Vec<f64>,
     fx: Vec<f64>,
@@ -479,7 +482,7 @@ impl SeamData {
 
 /// LU with partial pivoting (as LAPACK `gesv`). `None` only for an exactly
 /// singular matrix, as `np.linalg.solve` raises only then.
-fn lu_factor(mut a: Vec<f64>, m: usize) -> Option<(Vec<f64>, Vec<usize>)> {
+pub(crate) fn lu_factor(mut a: Vec<f64>, m: usize) -> Option<(Vec<f64>, Vec<usize>)> {
     let mut piv: Vec<usize> = (0..m).collect();
     for k in 0..m {
         let mut p = k;
@@ -511,7 +514,7 @@ fn lu_factor(mut a: Vec<f64>, m: usize) -> Option<(Vec<f64>, Vec<usize>)> {
     Some((a, piv))
 }
 
-fn lu_solve(lu: &(Vec<f64>, Vec<usize>), m: usize, b: &[f64]) -> Vec<f64> {
+pub(crate) fn lu_solve(lu: &(Vec<f64>, Vec<usize>), m: usize, b: &[f64]) -> Vec<f64> {
     let (a, piv) = lu;
     let mut x: Vec<f64> = (0..m).map(|i| b[piv[i]]).collect();
     for i in 0..m {
@@ -528,7 +531,7 @@ fn lu_solve(lu: &(Vec<f64>, Vec<usize>), m: usize, b: &[f64]) -> Vec<f64> {
     x
 }
 
-fn solve_dense(a: Vec<f64>, m: usize, b: &[f64]) -> Option<Vec<f64>> {
+pub(crate) fn solve_dense(a: Vec<f64>, m: usize, b: &[f64]) -> Option<Vec<f64>> {
     lu_factor(a, m).map(|lu| lu_solve(&lu, m, b))
 }
 
@@ -1021,31 +1024,35 @@ fn robust_t(d: &SeamData, z: &[Vec<f64>], h: f64) -> f64 {
 }
 
 /// Separable "same"-size convolution with a symmetric 1-D kernel (zero outside).
-fn gauss_conv(im: &[f64], width: usize, height: usize, w: &[f64], rr: isize) -> Vec<f64> {
+pub(crate) fn gauss_conv(im: &[f64], width: usize, height: usize, w: &[f64], rr: isize) -> Vec<f64> {
+    let rr = rr as usize;
+    // Rows: each output pixel sums only the taps that land inside the row;
+    // all-zero rows are skipped.
     let mut tmp = vec![0.0; width * height];
     for y in 0..height {
-        for x in 0..width {
-            let mut s = 0.0;
-            for t in -rr..=rr {
-                let xx = x as isize + t;
-                if xx >= 0 && (xx as usize) < width {
-                    s += w[(t + rr) as usize] * im[y * width + xx as usize];
-                }
-            }
-            tmp[y * width + x] = s;
+        let row = &im[y * width..(y + 1) * width];
+        if row.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        let out = &mut tmp[y * width..(y + 1) * width];
+        for (x, o) in out.iter_mut().enumerate() {
+            let lo = x.saturating_sub(rr);
+            let hi = (x + rr).min(width - 1);
+            *o = (lo..=hi).map(|xx| w[xx + rr - x] * row[xx]).sum();
         }
     }
+    // Columns, as whole-row multiply-adds.
     let mut out = vec![0.0; width * height];
     for y in 0..height {
-        for x in 0..width {
-            let mut s = 0.0;
-            for t in -rr..=rr {
-                let yy = y as isize + t;
-                if yy >= 0 && (yy as usize) < height {
-                    s += w[(t + rr) as usize] * tmp[yy as usize * width + x];
-                }
+        let lo = y.saturating_sub(rr);
+        let hi = (y + rr).min(height - 1);
+        let (o, _) = out[y * width..].split_at_mut(width);
+        for yy in lo..=hi {
+            let k = w[yy + rr - y];
+            let r = &tmp[yy * width..(yy + 1) * width];
+            for (ov, rv) in o.iter_mut().zip(r) {
+                *ov += k * rv;
             }
-            out[y * width + x] = s;
         }
     }
     out
@@ -1183,7 +1190,7 @@ impl Builder<'_> {
 }
 
 /// Order-1 warp `p = [u, v, u_x, v_x, u_y, v_y]` carried to a point shifted by `d`.
-fn shift_warp(p: &[f64], d: [f64; 2]) -> Vec<f64> {
+pub(crate) fn shift_warp(p: &[f64], d: [f64; 2]) -> Vec<f64> {
     let mut q = p.to_vec();
     q[0] += p[2] * d[0] + p[4] * d[1];
     q[1] += p[3] * d[0] + p[5] * d[1];
@@ -1239,6 +1246,21 @@ impl Subset {
         h: Option<f64>,
         cfg: &SeamConfig,
     ) -> Result<(), Error> {
+        self.solve_seams_with(local_mask, global_mask, h, cfg, &|away, dist| Some([away[0] * dist, away[1] * dist]))
+    }
+
+    /// [`Subset::solve_seams`] with a rule for the jolt: given the unit
+    /// direction away from the cut line and the distance the line must gain,
+    /// `jolt` returns the shift to apply, or `None` if the subset may not move
+    /// (a mesh constrains boundary nodes this way).
+    pub(crate) fn solve_seams_with<'a>(
+        &mut self,
+        local_mask: &'a LocalMask,
+        global_mask: Option<ArrayView2<'a, u8>>,
+        h: Option<f64>,
+        cfg: &SeamConfig,
+        jolt: &(dyn Fn([f64; 2], f64) -> Option<[f64; 2]> + Sync),
+    ) -> Result<(), Error> {
         self.check_seam_inputs()?;
         let h = match h {
             Some(h) => h,
@@ -1281,18 +1303,23 @@ impl Subset {
             if line.c.abs() < cfg.c_min {
                 let (ct, st) = (line.theta.cos(), line.theta.sin());
                 let dist = cfg.c_min - line.c.abs();
+                // Away from the line: the centre (s = 0) lies on the kept side.
                 let sign = if line.c > 0.0 { -1.0 } else { 1.0 };
-                let shift = [sign * dist * ct, sign * dist * st];
-                let coord = [self.coord[0] + shift[0], self.coord[1] + shift[1]];
-                let p0 = shift_warp(&plain.result.p, shift);
-                match b.solve(coord, &[], cfg.gap, 1, &p0) {
-                    Some(s) => {
-                        pass = investigate_pass(&s, h, &levels.pass1, SeamStage::Pass1Jolted)?;
-                        rec.passes.push(pass);
-                        rec.jolt = Some(shift);
-                        base = Some(s);
+                match jolt([sign * ct, sign * st], dist) {
+                    None => rec.flags.push(SeamFlag::JoltBlocked),
+                    Some(shift) => {
+                        let coord = [self.coord[0] + shift[0], self.coord[1] + shift[1]];
+                        let p0 = shift_warp(&plain.result.p, shift);
+                        match b.solve(coord, &[], cfg.gap, 1, &p0) {
+                            Some(s) => {
+                                pass = investigate_pass(&s, h, &levels.pass1, SeamStage::Pass1Jolted)?;
+                                rec.passes.push(pass);
+                                rec.jolt = Some(shift);
+                                base = Some(s);
+                            }
+                            None => rec.flags.push(SeamFlag::JoltFailed),
+                        }
                     }
-                    None => rec.flags.push(SeamFlag::JoltFailed),
                 }
             }
         }

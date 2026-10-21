@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     geometry::{meshing, triangulation},
     image::Image,
+    screen::{self, NoiseSource, ScreenInput, StillPair},
+    seam::{self, SeamConfig, SeamRecord},
     subset::{Subset, SolveResult},
     timing::{resolve_pair_time, TimeInput, TimeSource},
     masks::{LocalMask, MaskShape},
@@ -99,6 +101,35 @@ pub struct MeshSolution {
     /// `(f_time, g_time)` of the image pair, seconds — see [`crate::timing`].
     #[serde(default)]
     pub time: Option<(f64, f64)>,
+    /// Adaptive masking record — see [`Masking::Adaptive`]. `None` for a
+    /// uniform solve.
+    #[serde(default)]
+    pub seams: Option<MeshSeams>,
+}
+
+/// What adaptive masking did to one mesh.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshSeams {
+    /// Node positions of the plain solve (before any jolt).
+    pub plain_nodes: Array2<f64>,
+    /// Warps of the plain order-1 solve, `(N, 6)`.
+    pub plain_p: Array2<f64>,
+    /// Flagged by the still-pair tolerance.
+    pub flagged: Vec<bool>,
+    /// Sent on to the seam tests (after keep ⅓ / add ⅔).
+    pub sent: Vec<bool>,
+    /// Rounds of the neighbour rule.
+    pub rounds: usize,
+    pub noise_source: NoiseSource,
+    /// Per node: typical noise of a neighbour mismatch (px).
+    pub noise_scale: Array1<f64>,
+    /// Per node: largest frame 0–1 neighbour mismatch (px); `None` without a
+    /// still pair.
+    pub still_mismatch: Option<Array1<f64>>,
+    /// Speckle correlation length of the reference image (px).
+    pub h: f64,
+    /// Per node: the seam record of a node sent on.
+    pub records: Vec<Option<SeamRecord>>,
 }
 
 impl MeshSolution {
@@ -134,6 +165,9 @@ pub struct SolveConfig {
     /// Ignored otherwise.
     #[serde(default)]
     pub layer_rg: LayerRgConfig,
+    /// Uniform (plain) or adaptive masking — see [`Masking`].
+    #[serde(default)]
+    pub masking: Masking,
 }
 
 impl Default for SolveConfig {
@@ -147,6 +181,7 @@ impl Default for SolveConfig {
             override_active: false,
             preconditioning: Preconditioning::Rg,
             layer_rg: LayerRgConfig::default(),
+            masking: Masking::Uniform,
         }
     }
 }
@@ -187,6 +222,18 @@ pub enum Preconditioning {
     #[default]
     Rg,
     LayerRg,
+}
+
+/// The `masking` axis of `solver_options`. `Adaptive`: after the plain
+/// order-1 solve, the still-pair screen picks nodes whose neighbours disagree
+/// beyond noise, and each is investigated and corrected (jolt off a line
+/// through its centre, cut, or order 2) — see [`crate::screen`] and
+/// [`crate::seam`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Masking {
+    #[default]
+    Uniform,
+    Adaptive,
 }
 
 /// Tunables for `Preconditioning::LayerRg` — see
@@ -233,6 +280,9 @@ pub struct Mesh {
     /// `(f_time, g_time)`, seconds; `None` until [`Mesh::set_time`].
     pub time: Option<(f64, f64)>,
     pub time_source: TimeSource,
+    /// Still pair (frames 0 → 1) supplying the noise for adaptive masking;
+    /// `None` estimates it from a patch around the seed node.
+    still: Option<StillPair>,
     solution: Option<Arc<MeshSolution>>,
 }
 
@@ -302,6 +352,7 @@ impl Mesh {
             g_img,
             time: None,
             time_source: TimeSource::None,
+            still: None,
             solution: None,
         })
     }
@@ -323,7 +374,22 @@ impl Mesh {
             g_img,
             time: sol.time,
             time_source: if sol.time.is_some() { TimeSource::Given } else { TimeSource::None },
+            still: None,
             solution: Some(sol),
+        }
+    }
+
+    /// Set the still pair (frames 0 → 1) whose residuals give the noise for
+    /// adaptive masking; `None` estimates it from a patch around the seed node.
+    pub fn set_noise(&mut self, still: Option<StillPair>) {
+        self.still = still;
+    }
+
+    /// Reset node positions to the plain solve's (before any jolt), so a
+    /// mesh reused from an adaptive solution starts from its own geometry.
+    pub(crate) fn reset_plain_nodes(&mut self) {
+        if let Some(seams) = self.solution.as_ref().and_then(|s| s.seams.as_ref()) {
+            self.nodes = seams.plain_nodes.clone();
         }
     }
 
@@ -578,6 +644,17 @@ impl Mesh {
         }
 
 
+        // --- Adaptive masking: screen, then investigate and correct.
+        let (p, seams_rec) = if cfg.masking == Masking::Adaptive {
+            let (p12, rec) = self.adaptive_masking(
+                masks, cfg, &adj, seed_node, quality_ok.as_slice().expect("contiguous"), &p,
+                &mut displacements, &mut c_zncc, &mut iterations, &mut norms, pb,
+            )?;
+            (p12, Some(rec))
+        } else {
+            (p, None)
+        };
+
         // --- Element areas, centroids and strains.
         let centroids = compute_centroids(&self.nodes, &self.elements);
         let areas = element_area(&self.nodes, &self.elements);
@@ -606,7 +683,9 @@ impl Mesh {
             p,
             seed_node,
             mesh_order: self.mesh_order,
-            subset_order: cfg.subset_order as u8,
+            // Adaptive masking mixes order-1 and order-2 nodes; `p` then holds
+            // 12 columns with zero quadratic terms on order-1 nodes.
+            subset_order: if seams_rec.is_some() { 2 } else { cfg.subset_order as u8 },
             iterations,
             norms,
             f_img_path,
@@ -616,8 +695,148 @@ impl Mesh {
             template_shape,
             template_sizes,
             time: self.time,
+            seams: seams_rec,
         }));
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive masking
+    // -----------------------------------------------------------------------
+
+    /// Screen the plain solve, then investigate and correct the nodes sent
+    /// on. Jolted nodes move (`self.nodes`); returns the `(N, 12)` warps and
+    /// the record. Matches the sandbox chain (`screening_summary.pdf`).
+    #[allow(clippy::too_many_arguments)]
+    fn adaptive_masking(
+        &mut self,
+        masks: &LocalMask,
+        cfg: &SolveConfig,
+        adj: &Adjacency,
+        seed_node: usize,
+        usable: &[bool],
+        p: &Array2<f64>,
+        displacements: &mut Array2<f64>,
+        c_zncc: &mut Array1<f64>,
+        iterations: &mut Array1<u32>,
+        norms: &mut Array1<f64>,
+        pb: &dyn SolveProgress,
+    ) -> Result<(Array2<f64>, MeshSeams), Error> {
+        if cfg.subset_order != 1 {
+            return Err(Error::InvalidInput("adaptive masking needs subset_order = 1".into()));
+        }
+        seam::require_lossless(&self.f_img)?;
+        seam::require_lossless(&self.g_img)?;
+        if let Some(still) = &self.still {
+            seam::require_lossless(&still.f_img)?;
+            seam::require_lossless(&still.g_img)?;
+        }
+        if pb.cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let n = self.nodes.nrows();
+        let h = seam::correlation_length(&self.f_img)?;
+        let out = screen::screen(&ScreenInput {
+            nodes: &self.nodes,
+            neighbours: &adj.full,
+            p,
+            usable,
+            local_mask: masks,
+            global_mask: self.mask.as_ref().map(|m| m.view()),
+            f_img: &self.f_img,
+            g_img: &self.g_img,
+            h,
+            still: self.still.as_ref(),
+            seed: seed_node,
+        })?;
+        if pb.cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        let boundary_nb = boundary_neighbours(&self.elements, self.mesh_order, n);
+        let incident = build_node_element_index(&self.elements, n);
+        let seam_cfg = SeamConfig::default();
+        let gm = self.mask.as_ref().map(|m| m.view());
+        let plain_nodes = self.nodes.clone();
+        let sent: Vec<usize> = (0..n).filter(|&i| out.sent[i] && usable[i]).collect();
+
+        let correct = |i: usize, nodes: &Array2<f64>, allow_jolt: bool| -> Option<Subset> {
+            let coord = [nodes[[i, 0]], nodes[[i, 1]]];
+            let mut sub = Subset::new(coord, masks, gm, Arc::clone(&self.f_img), Arc::clone(&self.g_img), 1).ok()?;
+            sub.time = self.time;
+            let p0: Vec<f64> = (0..6).map(|k| p[[i, k]]).collect();
+            match cfg.method {
+                SolveMethod::Icgn => sub.solve_icgn(Some(&p0), cfg.tolerance, cfg.max_norm, cfg.max_iterations),
+                SolveMethod::Fagn => sub.solve_fagn(Some(&p0), cfg.tolerance, cfg.max_norm, cfg.max_iterations),
+            }
+            .ok()?;
+            let jolt = |away: [f64; 2], dist: f64| {
+                if !allow_jolt {
+                    return None;
+                }
+                jolt_shift(i, away, dist, nodes, &self.elements, &boundary_nb, &incident)
+            };
+            sub.solve_seams_with(masks, gm, Some(h), &seam_cfg, &jolt).ok()?;
+            Some(sub)
+        };
+        let mut done: Vec<(usize, Option<Subset>)> =
+            sent.par_iter().map(|&i| (i, correct(i, &plain_nodes, true))).collect();
+        if pb.cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        // Apply jolts one at a time: two neighbours jolted together could
+        // still distort a shared element, so each is re-checked against the
+        // nodes as they now stand and, if refused, redone in place.
+        for (i, sub) in done.iter_mut() {
+            let Some(s) = sub.as_ref() else { continue };
+            let Some(shift) = s.solution().and_then(|x| x.seams.as_ref()).and_then(|r| r.jolt) else { continue };
+            if element_ok_after(*i, [plain_nodes[[*i, 0]] + shift[0], plain_nodes[[*i, 1]] + shift[1]],
+                                &self.nodes, &self.elements, &incident[*i]) {
+                self.nodes[[*i, 0]] = s.coord[0];
+                self.nodes[[*i, 1]] = s.coord[1];
+            } else {
+                *sub = correct(*i, &plain_nodes, false);
+            }
+        }
+
+        let mut p12 = Array2::<f64>::zeros((n, 12));
+        for i in 0..n {
+            for k in 0..6 {
+                p12[[i, k]] = p[[i, k]];
+            }
+        }
+        let mut records: Vec<Option<SeamRecord>> = vec![None; n];
+        for (i, sub) in done {
+            let Some(s) = sub else { continue };
+            let sol = s.solution().expect("solved");
+            let r = &sol.result;
+            for (k, &v) in r.p.iter().enumerate() {
+                p12[[i, k]] = v;
+            }
+            for k in r.p.len()..12 {
+                p12[[i, k]] = 0.0;
+            }
+            displacements[[i, 0]] = r.p[0];
+            displacements[[i, 1]] = r.p[1];
+            c_zncc[i] = r.c_zncc.max(0.0);
+            iterations[i] = r.iterations as u32;
+            norms[i] = r.history.last().map(|h| h.1).unwrap_or(0.0);
+            records[i] = sol.seams.clone();
+        }
+        let plain_p = Array2::from_shape_fn((n, 6), |(i, k)| p[[i, k]]);
+        Ok((p12, MeshSeams {
+            plain_nodes,
+            plain_p,
+            flagged: out.flagged,
+            sent: out.sent,
+            rounds: out.rounds,
+            noise_source: out.source,
+            noise_scale: out.noise_scale,
+            still_mismatch: out.still_mismatch,
+            h,
+            records,
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -1832,6 +2051,132 @@ fn ols_solve(rows: &[Vec<f64>], y: &[f64]) -> Option<Vec<f64>> {
 }
 
 /// Store a `SolveResult` into the per-node arrays.
+/// Per node, its neighbours along the mesh boundary (outer boundary and
+/// exclusion edges): the other ends of the element sides (sub-sides for
+/// 6-node elements) that belong to one element only. Empty for interior
+/// nodes.
+fn boundary_neighbours(elements: &Array2<usize>, mesh_order: u8, n_nodes: usize) -> Vec<Vec<usize>> {
+    let sides: &[(usize, usize)] = if mesh_order == 2 {
+        // [c0, c1, c2, m01, m12, m20]
+        &[(0, 3), (3, 1), (1, 4), (4, 2), (2, 5), (5, 0)]
+    } else {
+        &[(0, 1), (1, 2), (2, 0)]
+    };
+    let mut count: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    for e in 0..elements.nrows() {
+        for &(a, b) in sides {
+            let (u, v) = (elements[[e, a]], elements[[e, b]]);
+            *count.entry((u.min(v), u.max(v))).or_insert(0) += 1;
+        }
+    }
+    let mut out = vec![Vec::new(); n_nodes];
+    for ((u, v), c) in count {
+        if c == 1 {
+            out[u].push(v);
+            out[v].push(u);
+        }
+    }
+    out
+}
+
+/// Largest turn (degrees) along the boundary at a node that still counts as
+/// lying on an edge rather than defining a corner of the geometry.
+const BOUNDARY_CORNER_DEG: f64 = 5.0;
+
+/// The shift that jolts node `i` a distance `dist` along `away`, or `None` if
+/// it may not move. Interior nodes move freely. Boundary nodes move only along
+/// their edge (straight, or the circle through them and their two boundary
+/// neighbours), so the geometry is unchanged; a node where the boundary turns
+/// by more than [`BOUNDARY_CORNER_DEG`] defines the geometry and does not move.
+/// Any move that would turn an incident element inside out, or shrink a part
+/// of it below a quarter of its area, is refused.
+fn jolt_shift(
+    i: usize,
+    away: [f64; 2],
+    dist: f64,
+    nodes: &Array2<f64>,
+    elements: &Array2<usize>,
+    boundary_nb: &[Vec<usize>],
+    incident: &[Vec<usize>],
+) -> Option<[f64; 2]> {
+    let p = [nodes[[i, 0]], nodes[[i, 1]]];
+    let shift = match boundary_nb[i].as_slice() {
+        [] => [away[0] * dist, away[1] * dist],
+        &[a, b] => {
+            let pa = [nodes[[a, 0]], nodes[[a, 1]]];
+            let pb = [nodes[[b, 0]], nodes[[b, 1]]];
+            let u = [p[0] - pa[0], p[1] - pa[1]];
+            let v = [pb[0] - p[0], pb[1] - p[1]];
+            let (lu, lv) = (u[0].hypot(u[1]), v[0].hypot(v[1]));
+            let cos = ((u[0] * v[0] + u[1] * v[1]) / (lu * lv)).clamp(-1.0, 1.0);
+            if cos.acos().to_degrees() > BOUNDARY_CORNER_DEG {
+                return None;
+            }
+            let lt = (pb[0] - pa[0]).hypot(pb[1] - pa[1]);
+            let t = [(pb[0] - pa[0]) / lt, (pb[1] - pa[1]) / lt];
+            let tn = t[0] * away[0] + t[1] * away[1];
+            if tn.abs() < 0.2 {
+                return None;
+            }
+            let s = dist / tn;
+            if s.abs() > 0.5 * lu.min(lv) {
+                return None;
+            }
+            let mut q = [p[0] + s * t[0], p[1] + s * t[1]];
+            if let Some((o, r)) = circumcircle(pa, p, pb) {
+                let d = (q[0] - o[0]).hypot(q[1] - o[1]);
+                q = [o[0] + r * (q[0] - o[0]) / d, o[1] + r * (q[1] - o[1]) / d];
+            }
+            [q[0] - p[0], q[1] - p[1]]
+        }
+        _ => return None,
+    };
+    element_ok_after(i, [p[0] + shift[0], p[1] + shift[1]], nodes, elements, &incident[i]).then_some(shift)
+}
+
+/// Centre and radius of the circle through three points, or `None` if they
+/// are (nearly) collinear.
+fn circumcircle(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Option<([f64; 2], f64)> {
+    let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
+    let scale = (b[0] - a[0]).hypot(b[1] - a[1]).max((c[0] - b[0]).hypot(c[1] - b[1]));
+    if d.abs() < 1e-9 * scale * scale {
+        return None;
+    }
+    let (a2, b2, c2) = (a[0] * a[0] + a[1] * a[1], b[0] * b[0] + b[1] * b[1], c[0] * c[0] + c[1] * c[1]);
+    let o = [
+        (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d,
+        (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d,
+    ];
+    let r = (a[0] - o[0]).hypot(a[1] - o[1]);
+    (r < 1e6 * scale).then_some((o, r))
+}
+
+/// Whether moving node `i` to `q` keeps every incident element (each of the
+/// four linear parts of a 6-node element) the same way round and at least a
+/// quarter of its area.
+fn element_ok_after(i: usize, q: [f64; 2], nodes: &Array2<f64>, elements: &Array2<usize>, incident: &[usize]) -> bool {
+    let parts: &[[usize; 3]] = if elements.ncols() == 6 {
+        &[[0, 3, 5], [3, 1, 4], [5, 4, 2], [3, 4, 5]]
+    } else {
+        &[[0, 1, 2]]
+    };
+    let pos = |k: usize, moved: bool| if moved && k == i { q } else { [nodes[[k, 0]], nodes[[k, 1]]] };
+    let area = |t: [usize; 3], moved: bool| {
+        let (a, b, c) = (pos(t[0], moved), pos(t[1], moved), pos(t[2], moved));
+        0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
+    };
+    incident.iter().all(|&e| {
+        parts.iter().all(|part| {
+            let t = part.map(|k| elements[[e, k]]);
+            if !t.contains(&i) {
+                return true;
+            }
+            let (before, after) = (area(t, false), area(t, true));
+            before * after > 0.0 && after.abs() >= 0.25 * before.abs()
+        })
+    })
+}
+
 fn store_result(
     idx: usize,
     result: &SolveResult,
@@ -1860,6 +2205,85 @@ fn store_result(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- Adaptive masking: jolt rule ----
+
+    /// A 3×3-node grid of order-1 triangles on [0, 20]², spacing 10.
+    fn jolt_grid() -> (Array2<f64>, Array2<usize>) {
+        let nodes = Array2::from_shape_fn((9, 2), |(i, c)| if c == 0 { (i % 3) as f64 * 10.0 } else { (i / 3) as f64 * 10.0 });
+        let mut el = Vec::new();
+        for r in 0..2 {
+            for c in 0..2 {
+                let a = r * 3 + c;
+                el.push([a, a + 1, a + 4]);
+                el.push([a, a + 4, a + 3]);
+            }
+        }
+        (nodes, Array2::from_shape_fn((8, 3), |(e, k)| el[e][k]))
+    }
+
+    #[test]
+    fn jolt_interior_node_moves_freely() {
+        let (nodes, el) = jolt_grid();
+        let (bnd, inc) = (boundary_neighbours(&el, 1, 9), build_node_element_index(&el, 9));
+        let s = jolt_shift(4, [0.6, 0.8], 3.0, &nodes, &el, &bnd, &inc).unwrap();
+        assert!((s[0] - 1.8).abs() < 1e-12 && (s[1] - 2.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn jolt_edge_node_slides_along_its_edge() {
+        let (nodes, el) = jolt_grid();
+        let (bnd, inc) = (boundary_neighbours(&el, 1, 9), build_node_element_index(&el, 9));
+        // node 1 = (10, 0) on the bottom edge; the line asks it to move up-right
+        let away = [std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2];
+        let s = jolt_shift(1, away, 2.0, &nodes, &el, &bnd, &inc).unwrap();
+        assert!(s[1].abs() < 1e-12, "left the edge: {s:?}");
+        // the line still gains `dist` along `away`
+        assert!((s[0] * away[0] + s[1] * away[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn jolt_corner_and_parallel_line_do_not_move() {
+        let (nodes, el) = jolt_grid();
+        let (bnd, inc) = (boundary_neighbours(&el, 1, 9), build_node_element_index(&el, 9));
+        assert!(jolt_shift(0, [0.6, 0.8], 2.0, &nodes, &el, &bnd, &inc).is_none(), "corner moved");
+        // edge node, but the line runs along the edge: no move along it gets away
+        assert!(jolt_shift(1, [0.0, 1.0], 2.0, &nodes, &el, &bnd, &inc).is_none());
+    }
+
+    #[test]
+    fn jolt_refused_if_it_would_invert_an_element() {
+        let (nodes, el) = jolt_grid();
+        let (bnd, inc) = (boundary_neighbours(&el, 1, 9), build_node_element_index(&el, 9));
+        assert!(jolt_shift(4, [1.0, 0.0], 9.0, &nodes, &el, &bnd, &inc).is_none());
+    }
+
+    #[test]
+    fn jolt_on_an_arc_stays_on_the_circle() {
+        // Three boundary nodes on a circle of radius 400 about the origin, plus
+        // an inner node to close two triangles.
+        let ang = [-0.04_f64, 0.0, 0.04];
+        let mut pts: Vec<[f64; 2]> = ang.iter().map(|a| [400.0 * a.cos(), 400.0 * a.sin()]).collect();
+        pts.push([380.0, 0.0]);
+        let nodes = Array2::from_shape_fn((4, 2), |(i, c)| pts[i][c]);
+        let el = Array2::from_shape_fn((2, 3), |(e, k)| [[0, 1, 3], [1, 2, 3]][e][k]);
+        let (bnd, inc) = (boundary_neighbours(&el, 1, 4), build_node_element_index(&el, 4));
+        let s = jolt_shift(1, [0.0, 1.0], 3.0, &nodes, &el, &bnd, &inc).unwrap();
+        let q = [400.0 + s[0], s[1]];
+        assert!((q[0].hypot(q[1]) - 400.0).abs() < 1e-9, "left the circle: {q:?}");
+        assert!(s[1] > 2.9);
+    }
+
+    #[test]
+    fn boundary_neighbours_order2_uses_sub_sides() {
+        // one 6-node element: [c0, c1, c2, m01, m12, m20]
+        let el = Array2::from_shape_vec((1, 6), vec![0, 1, 2, 3, 4, 5]).unwrap();
+        let b = boundary_neighbours(&el, 2, 6);
+        let mut m3 = b[3].clone();
+        m3.sort();
+        assert_eq!(m3, vec![0, 1]);
+        assert_eq!(b[0].len(), 2);
+    }
     use super::*;
     use ndarray::array;
 
@@ -2436,6 +2860,7 @@ mod tests {
             time: None,
             time_source: TimeSource::None,
             solution: None,
+            still: None,
         };
 
         // Seeded well clear of the y=50 discontinuity (circle(6) subsets,

@@ -212,7 +212,7 @@ impl PySubset {
     // -----------------------------------------------------------------------
 
     /// Inverse Compositional Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, seams = false))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform"))]
     fn solve_icgn(
         &mut self,
         py: Python<'_>,
@@ -220,19 +220,19 @@ impl PySubset {
         max_norm: f64,
         max_iterations: usize,
         tolerance: f64,
-        seams: bool,
+        masking: &str,
     ) -> PyResult<()> {
         self.inner
             .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
-        if seams {
+        if crate::py_mesh::check_masking(masking)? == geopyv_dev::mesh::Masking::Adaptive {
             self.correct_seams(py)?;
         }
         Ok(())
     }
 
     /// Forward Additive Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, seams = false))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform"))]
     fn solve_fagn(
         &mut self,
         py: Python<'_>,
@@ -240,12 +240,12 @@ impl PySubset {
         max_norm: f64,
         max_iterations: usize,
         tolerance: f64,
-        seams: bool,
+        masking: &str,
     ) -> PyResult<()> {
         self.inner
             .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations)
             .map_err(Error::from)?;
-        if seams {
+        if crate::py_mesh::check_masking(masking)? == geopyv_dev::mesh::Masking::Adaptive {
             self.correct_seams(py)?;
         }
         Ok(())
@@ -530,7 +530,7 @@ fn levels_dict<'py>(py: Python<'py>, lv: &PassLevels) -> PyResult<Bound<'py, PyD
     Ok(d)
 }
 
-fn record_dict<'py>(py: Python<'py>, r: &SeamRecord) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn record_dict<'py>(py: Python<'py>, r: &SeamRecord) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     d.set_item("plain_coord", r.plain_coord)?;
     d.set_item("plain_p", r.plain_p.clone())?;

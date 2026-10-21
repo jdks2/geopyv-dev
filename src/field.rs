@@ -942,6 +942,7 @@ mod tests {
             template_shape: None,
             template_sizes: None,
             time: None,
+            seams: None,
         }
     }
 
@@ -1534,6 +1535,7 @@ mod tests {
             template_shape: None,
             template_sizes: None,
             time: None,
+            seams: None,
         };
         let seq = make_seq(vec![mesh_sol], vec![false]);
         let mut field = make_field_from_seq(seq, true);

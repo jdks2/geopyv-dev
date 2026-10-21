@@ -41,7 +41,8 @@ use crate::{
     geometry::region::{Region, RegionOption},
     image::Image,
     io::{load as io_load, save as io_save, GeopyvObject},
-    mesh::{Mesh, MeshSolution, SeedConfig, SolveConfig},
+    mesh::{Masking, Mesh, MeshSolution, SeedConfig, SolveConfig},
+    screen::StillPair,
     particle::{element_locator, warp_increment, Particle, ParticleSource},
     masks::LocalMask,
     progress::{SolveProgress, TerminalProgress},
@@ -522,6 +523,10 @@ impl Sequence {
 
         // Cached previous-pair solution for sync mode.
         let mut sync_sol: Option<Arc<MeshSolution>> = None;
+        // Adaptive masking: the first pair (frames 0 → 1) is the still pair,
+        // solved plain; its residuals give every later mesh its noise.
+        let adaptive = cfg.mesh_cfg.masking == Masking::Adaptive;
+        let mut still: Option<StillPair> = None;
         // Override flag: relax tolerance for the next mesh solve.
         let mut mesh_override = false;
         // Set when the failure-fallback path below advances `f_index`; cleared
@@ -564,7 +569,11 @@ impl Sequence {
             let excl_views: Vec<_> = exclusion_regions.iter().map(|r| r.current_nodes.view()).collect();
             let excl_hard: Vec<bool> = exclusion_regions.iter().map(|r| r.hard).collect();
             let mut mesh = match (cfg.options.sync, &sync_sol) {
-                (true, Some(prev)) => Mesh::from_solution(Arc::clone(prev), Arc::clone(&f_img), Arc::clone(&g_img)),
+                (true, Some(prev)) => {
+                    let mut m = Mesh::from_solution(Arc::clone(prev), Arc::clone(&f_img), Arc::clone(&g_img));
+                    m.reset_plain_nodes();
+                    m
+                }
                 _ => Mesh::new(
                     boundary_region.current_nodes.view(),
                     boundary_region.hard,
@@ -586,7 +595,7 @@ impl Sequence {
             // relaxable this way — `tolerance: 0.0` only helps the
             // correlation half of `quality_ok`; `override_active` is what
             // actually lets a still-non-converged mesh through.
-            let pair_cfg = if mesh_override {
+            let mut pair_cfg = if mesh_override {
                 SolveConfig {
                     tolerance: 0.0,
                     override_active: true,
@@ -595,6 +604,12 @@ impl Sequence {
             } else {
                 cfg.mesh_cfg.clone()
             };
+            let still_pair = adaptive && f_index == 0 && g_index == 1;
+            if still_pair {
+                pair_cfg.masking = Masking::Uniform;
+            } else if adaptive {
+                mesh.set_noise(still.clone());
+            }
 
             let pair_seed = SeedConfig {
                 coord: seed_coord,
@@ -660,6 +675,14 @@ impl Sequence {
                     }
                 }
             };
+
+            if still_pair {
+                still = Some(StillPair {
+                    solution: Arc::clone(&mesh_sol),
+                    f_img: Arc::clone(&f_img),
+                    g_img: Arc::clone(&g_img),
+                });
+            }
 
             // --- Log override usage. ----------------------------------------
             if mesh_override {
@@ -1062,6 +1085,7 @@ mod tests {
             template_shape: None,
             template_sizes: None,
             time: None,
+            seams: None,
         }
     }
 

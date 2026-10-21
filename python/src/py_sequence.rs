@@ -105,7 +105,7 @@ impl PySequenceOptions {
 ///     Exclusion regions. Hard/soft flag is taken from each region object;
 ///     raw arrays default to soft. Default None.
 /// mesh_order : int, optional
-///     1 (linear) or 2 (quadratic). Default 2.
+///     1 (linear) or 2 (quadratic). Default 1.
 #[pyclass(name = "Sequence")]
 pub struct PySequence {
     pub(crate) inner: Sequence,
@@ -120,7 +120,7 @@ pub struct PySequence {
 impl PySequence {
     #[new]
     #[pyo3(signature = (image_dir, boundary, target_nodes,
-                         size=(1.0, 1000.0), exclusions=None, mesh_order=2, time=None))]
+                         size=(1.0, 1000.0), exclusions=None, mesh_order=1, time=None))]
     fn new(
         image_dir: &str,
         boundary: &Bound<'_, PyAny>,
@@ -167,7 +167,7 @@ impl PySequence {
     /// max_iterations : int, optional
     ///     Iteration limit per subset node. Default 50.
     /// subset_order : int, optional
-    ///     1 (affine) or 2 (quadratic). Default 2.
+    ///     1 (affine) or 2 (quadratic). Default 1.
     /// tolerance : float, optional
     ///     Minimum acceptable C_ZNCC for propagated nodes. Default 0.75.
     /// seed_tolerance : float, optional
@@ -184,10 +184,13 @@ impl PySequence {
     ///     ``"layer-RG"`` (layer-parallel; see
     ///     `geopyv_dev_fresh/layer_rg_plan.md`).
     /// masking : str, optional
-    ///     ``"uniform"`` (default), the only option: zonal masking has been
-    ///     removed. Anything else raises ``ValueError``.
+    ///     ``"uniform"`` (default) or ``"adaptive"``. Adaptive: frames 0 → 1
+    ///     are taken as a still pair (no mechanical movement); that pair is
+    ///     solved plain and its residuals give the noise for every later
+    ///     pair, whose nodes are screened, investigated and corrected.
+    ///     Needs ``subset_order=1``.
     #[pyo3(signature = (local_mask=None, seed_coord=None, seed_warp=None,
-                         max_norm=1e-5, max_iterations=50, subset_order=2,
+                         max_norm=1e-5, max_iterations=50, subset_order=1,
                          tolerance=0.75, seed_tolerance=0.9, method="icgn",
                          options=None, border=20, save=None,
                          preconditioning="RG",
@@ -246,7 +249,7 @@ impl PySequence {
             root_rel_eps: layer_rg_root_rel_eps,
             max_workers: layer_rg_max_workers,
         };
-        crate::py_mesh::check_masking(masking)?;
+        let masking = crate::py_mesh::check_masking(masking)?;
         let tmpl = local_mask
             .extract::<PyRef<'_, PyMask>>()
             .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
@@ -269,6 +272,7 @@ impl PySequence {
                 override_active: false,
                 preconditioning,
                 layer_rg,
+                masking,
                 ..Default::default()
             },
             local_mask,

@@ -23,9 +23,11 @@ use geopyv_dev::image::Image;
 use geopyv_dev::io::{save as io_save, GeopyvObject};
 use geopyv_dev::masks::MaskShape;
 use geopyv_dev::mesh::{
-    self, LayerRgConfig, Mesh, MeshSolution, Preconditioning, SeedConfig, SolveConfig,
+    self, LayerRgConfig, Masking, Mesh, MeshSeams, MeshSolution, Preconditioning, SeedConfig, SolveConfig,
     SolveMethod,
 };
+use geopyv_dev::screen::{NoiseSource, StillPair};
+use pyo3::types::{PyDict, PyList};
 
 use crate::{
     py_geometry::extract_region,
@@ -72,11 +74,16 @@ impl PyMesh {
     /// exclusions_hard : list[bool], optional
     ///     Per-exclusion hard flag. Default all ``True``.
     /// mesh_order : int, optional
-    ///     1 (linear) or 2 (quadratic). Default 2.
+    ///     1 (linear) or 2 (quadratic). Default 1.
+    /// noise : Mesh, optional
+    ///     A solved still pair (frames 0 → 1: no mechanical movement, rigid
+    ///     motion allowed) whose residuals give the noise for adaptive
+    ///     masking. Default ``None``: the noise is estimated from a small
+    ///     patch around the seed point, assumed to move only rigidly.
     #[new]
     #[pyo3(signature = (boundary, target_nodes, f_img, g_img,
                          size=(1.0, 1000.0), exclusions=None, exclusions_hard=None,
-                         mesh_order=2, time=None))]
+                         mesh_order=1, time=None, noise=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         _py: Python<'_>,
@@ -89,8 +96,17 @@ impl PyMesh {
         exclusions_hard: Option<Vec<bool>>,
         mesh_order: u8,
         time: Option<&Bound<'_, PyAny>>,
+        noise: Option<PyRef<'_, PyMesh>>,
     ) -> PyResult<Self> {
         let time = crate::utils::extract_time_input(time)?;
+        let still = noise
+            .map(|m| -> PyResult<StillPair> {
+                let solution = m.inner.solution().cloned().ok_or_else(|| {
+                    PyValueError::new_err("noise mesh has not been solved")
+                })?;
+                Ok(StillPair { solution, f_img: Arc::clone(&m.inner.f_img), g_img: Arc::clone(&m.inner.g_img) })
+            })
+            .transpose()?;
         let (boundary_nodes, boundary_hard) = extract_region(boundary)?;
         let excl_owned: Vec<Array2<f64>> = exclusions
             .unwrap_or_default()
@@ -121,6 +137,7 @@ impl PyMesh {
         )
         .map_err(Error::from)?;
         inner.set_time(time.as_ref()).map_err(Error::from)?;
+        inner.set_noise(still);
 
         Ok(PyMesh {
             inner,
@@ -144,7 +161,7 @@ impl PyMesh {
     /// max_iterations : int, optional
     ///     Iteration limit per node. Default 50.
     /// subset_order : int, optional
-    ///     1 (affine) or 2 (quadratic). Default 2.
+    ///     1 (affine) or 2 (quadratic). Default 1.
     /// tolerance : float, optional
     ///     Minimum acceptable C_ZNCC for propagated nodes. Default 0.75.
     /// seed_tolerance : float, optional
@@ -164,8 +181,10 @@ impl PyMesh {
     ///     mesh that's mostly failing. Default ``False`` (matches prior
     ///     behaviour exactly).
     /// masking : str, optional
-    ///     ``"uniform"`` (default), the only option: zonal masking has been
-    ///     removed. Anything else raises ``ValueError``.
+    ///     ``"uniform"`` (default) or ``"adaptive"``: after the plain solve,
+    ///     nodes whose neighbours disagree beyond noise are investigated
+    ///     and corrected (moved off a line through their centre, cut along
+    ///     it, or re-solved at order 2). Needs ``subset_order=1``.
     /// preconditioning : str, optional
     ///     Intra-mesh RG frontier traversal strategy -- ``"RG"`` (default,
     ///     today's serial cascade) or ``"layer-RG"`` (layer-parallel
@@ -183,7 +202,7 @@ impl PyMesh {
     ///     ``"layer-RG"`` only: cap rayon workers for this solve's parallel
     ///     rounds. Default ``None`` (global pool).
     #[pyo3(signature = (local_mask, seed_coord, seed_warp=None,
-                        max_norm=1e-5, max_iterations=50, subset_order=2,
+                        max_norm=1e-5, max_iterations=50, subset_order=1,
                         tolerance=0.75, seed_tolerance=0.9, method="icgn",
                         override_active=false,
                         preconditioning="RG",
@@ -243,7 +262,7 @@ impl PyMesh {
             root_rel_eps: layer_rg_root_rel_eps,
             max_workers: layer_rg_max_workers,
         };
-        check_masking(masking)?;
+        let masking = check_masking(masking)?;
         let cfg = SolveConfig {
             max_norm,
             max_iterations,
@@ -253,6 +272,7 @@ impl PyMesh {
             override_active,
             preconditioning,
             layer_rg,
+            masking,
         };
         self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
         Ok(())
@@ -354,6 +374,16 @@ impl PyMesh {
     #[getter]
     fn displacements<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         arc_array2(py, self.require_solved_arc()?, |s| &s.displacements)
+    }
+
+    /// Adaptive masking record (dict of per-node arrays), or ``None`` for a
+    /// uniform solve.
+    #[getter]
+    fn seams<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match self.require_solved_arc()?.seams.as_ref() {
+            Some(m) => Ok(Some(seams_dict(py, m)?)),
+            None => Ok(None),
+        }
     }
 
     /// Per-node ZNCC scores ``(N,)``.
@@ -598,6 +628,7 @@ impl PyMeshSolution {
                 template_shape: None,
                 template_sizes: None,
                 time: None,
+                seams: None,
             },
         }
     }
@@ -856,14 +887,46 @@ fn mesh_r_calc(displacement: [f64; 2]) -> f64 {
 
 /// `masking=` is kept for compatibility; `"uniform"` is its only value
 /// since zonal masking was removed.
-pub(crate) fn check_masking(masking: &str) -> PyResult<()> {
+pub(crate) fn check_masking(masking: &str) -> PyResult<Masking> {
     match masking {
-        "uniform" => Ok(()),
+        "uniform" => Ok(Masking::Uniform),
+        "adaptive" => Ok(Masking::Adaptive),
         "zonal" => Err(PyValueError::new_err(
-            "masking='zonal' has been removed; 'uniform' is the only masking option",
+            "masking='zonal' has been removed; use 'uniform' or 'adaptive'",
         )),
-        other => Err(PyValueError::new_err(format!("masking must be 'uniform', got {other:?}"))),
+        other => Err(PyValueError::new_err(format!("masking must be 'uniform' or 'adaptive', got {other:?}"))),
     }
+}
+
+/// An adaptive-masking record as a dict of per-node arrays.
+pub(crate) fn seams_dict<'py>(py: Python<'py>, m: &MeshSeams) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("plain_nodes", m.plain_nodes.clone().into_pyarray_bound(py))?;
+    d.set_item("plain_p", m.plain_p.clone().into_pyarray_bound(py))?;
+    d.set_item("flagged", Array1::from(m.flagged.clone()).into_pyarray_bound(py))?;
+    d.set_item("sent", Array1::from(m.sent.clone()).into_pyarray_bound(py))?;
+    d.set_item("rounds", m.rounds)?;
+    match m.noise_source {
+        NoiseSource::StillPair => d.set_item("noise_source", "still pair")?,
+        NoiseSource::SeedPatch { sigma } => d.set_item("noise_source", format!("seed patch ({sigma:.2} grey levels)"))?,
+        NoiseSource::Default { sigma } => d.set_item("noise_source", format!("default ({sigma} grey levels)"))?,
+    }
+    d.set_item("noise_scale", m.noise_scale.clone().into_pyarray_bound(py))?;
+    d.set_item("still_mismatch", m.still_mismatch.clone().map(|a| a.into_pyarray_bound(py)))?;
+    d.set_item("h", m.h)?;
+    let action: Vec<Option<String>> = m.records.iter()
+        .map(|r| r.as_ref().map(|r| format!("{:?}", r.action).to_lowercase()))
+        .collect();
+    d.set_item("action", action)?;
+    let records = PyList::empty_bound(py);
+    for r in &m.records {
+        match r {
+            Some(r) => records.append(crate::py_subset::record_dict(py, r)?)?,
+            None => records.append(py.None())?,
+        }
+    }
+    d.set_item("records", records)?;
+    Ok(d)
 }
 
 // ---------------------------------------------------------------------------
