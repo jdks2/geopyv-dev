@@ -1536,6 +1536,7 @@ dependencies = [
  "bincode",
  "image",
  "indicatif",
+ "libm",
  "nalgebra",
  "ndarray",
  "rand 0.8.6",

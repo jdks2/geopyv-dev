@@ -17,7 +17,7 @@
 //!          (level 3) for every version except 0x01
 //! ```
 //!
-//! New files are always written with version 0x0A (zstd + current schema).
+//! New files are always written with version 0x0B (zstd + current schema).
 //! Bytes 0x04-0x06 were used only by unreleased development builds and are
 //! deliberately rejected as unsupported.
 //!
@@ -106,10 +106,13 @@ const VERSION_ZSTD_V3: u8 = 0x08;
 /// and `FieldSolution` gain `time`. Still readable on load, but no longer
 /// written.
 const VERSION_ZSTD_V4: u8 = 0x09;
-/// zstd-compressed, schema v5 (current). Relative to v4: `MeshSolution`
-/// loses `zonal_masking` (zonal masking removed; a stored record is dropped
-/// on load). Always written by [`save`].
-const CURRENT_VERSION: u8 = 0x0A;
+/// zstd-compressed, schema v5. Relative to v4: `MeshSolution` loses
+/// `zonal_masking` (zonal masking removed; a stored record is dropped on
+/// load). Still readable on load, but no longer written.
+const VERSION_ZSTD_V5: u8 = 0x0A;
+/// zstd-compressed, schema v6 (current). Relative to v5: `SubsetSolution`
+/// gains `seams`. Always written by [`save`].
+const CURRENT_VERSION: u8 = 0x0B;
 
 // ---------------------------------------------------------------------------
 // Tagged union for all serialisable object types
@@ -202,6 +205,7 @@ impl From<LegacySubsetSolution> for SubsetSolution {
             sssig: l.sssig,
             delta_f: l.delta_f,
             time: None,
+            seams: None,
         }
     }
 }
@@ -453,6 +457,7 @@ impl From<LegacySubsetSolutionV1> for SubsetSolution {
             sssig: l.sssig,
             delta_f: l.delta_f,
             time: None,
+            seams: None,
         }
     }
 }
@@ -862,6 +867,7 @@ impl From<LegacySubsetSolutionV3> for SubsetSolution {
             sssig: l.sssig,
             delta_f: l.delta_f,
             time: None,
+            seams: None,
         }
     }
 }
@@ -1172,7 +1178,7 @@ impl From<LegacySequenceSolutionV4> for SequenceSolution {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum LegacyGeopyvObjectV4 {
-    Subset(SubsetSolution),
+    Subset(LegacySubsetSolutionV5),
     Mesh(LegacyMeshSolutionV4),
     Field(FieldSolution),
     Sequence(LegacySequenceSolutionV4),
@@ -1184,13 +1190,74 @@ enum LegacyGeopyvObjectV4 {
 impl From<LegacyGeopyvObjectV4> for GeopyvObject {
     fn from(l: LegacyGeopyvObjectV4) -> Self {
         match l {
-            LegacyGeopyvObjectV4::Subset(s) => GeopyvObject::Subset(s),
+            LegacyGeopyvObjectV4::Subset(s) => GeopyvObject::Subset(s.into()),
             LegacyGeopyvObjectV4::Mesh(m) => GeopyvObject::Mesh(m.into()),
             LegacyGeopyvObjectV4::Field(f) => GeopyvObject::Field(f),
             LegacyGeopyvObjectV4::Sequence(s) => GeopyvObject::Sequence(s.into()),
             LegacyGeopyvObjectV4::Particle(p) => GeopyvObject::Particle(p),
             LegacyGeopyvObjectV4::Speckle(s) => GeopyvObject::Speckle(s),
             LegacyGeopyvObjectV4::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v5 — the 0x0A format). Frozen: do not edit these to
+// match future changes — freeze a new `Legacy*V6` set instead and chain it
+// in `load`. v6 added `SubsetSolution::seams`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySubsetSolutionV5 {
+    coord: [f64; 2],
+    mask: MaskSummary,
+    ref_image: PathBuf,
+    target_image: PathBuf,
+    result: SolveResult,
+    std_dev: f64,
+    sssig: f64,
+    delta_f: f64,
+    time: Option<(f64, f64)>,
+}
+
+impl From<LegacySubsetSolutionV5> for SubsetSolution {
+    fn from(l: LegacySubsetSolutionV5) -> Self {
+        SubsetSolution {
+            coord: l.coord,
+            mask: l.mask,
+            ref_image: l.ref_image,
+            target_image: l.target_image,
+            result: l.result,
+            std_dev: l.std_dev,
+            sssig: l.sssig,
+            delta_f: l.delta_f,
+            time: l.time,
+            seams: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV5 {
+    Subset(LegacySubsetSolutionV5),
+    Mesh(MeshSolution),
+    Field(FieldSolution),
+    Sequence(SequenceSolution),
+    Particle(ParticleSolution),
+    Speckle(Speckle),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV5> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV5) -> Self {
+        match l {
+            LegacyGeopyvObjectV5::Subset(s) => GeopyvObject::Subset(s.into()),
+            LegacyGeopyvObjectV5::Mesh(m) => GeopyvObject::Mesh(m),
+            LegacyGeopyvObjectV5::Field(f) => GeopyvObject::Field(f),
+            LegacyGeopyvObjectV5::Sequence(s) => GeopyvObject::Sequence(s),
+            LegacyGeopyvObjectV5::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV5::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV5::Calibration(c) => GeopyvObject::Calibration(c),
         }
     }
 }
@@ -1223,7 +1290,7 @@ pub fn save<P: AsRef<Path>>(path: P, object: &GeopyvObject) -> Result<(), Error>
 /// Returns [`Error::UnsupportedVersion`] for any unrecognised version byte.
 ///
 /// Files with version `0x01`/`0x02` (schema v0), `0x03` (schema v1, the
-/// released package's format), `0x07` (schema v2), `0x08` (schema v3) or `0x09` (schema v4) are decoded via the frozen `Legacy*` /
+/// released package's format), `0x07` (schema v2), `0x08` (schema v3), `0x09` (schema v4) or `0x0A` (schema v5) are decoded via the frozen `Legacy*` /
 /// `Legacy*V1` types and migrated into the current shapes — see "Schema
 /// versioning" in the module docs.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
@@ -1246,7 +1313,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
     let data = match ver_buf[0] {
         VERSION_UNCOMPRESSED => raw,
         VERSION_ZSTD_V0 | VERSION_ZSTD_V1 | VERSION_ZSTD_V2 | VERSION_ZSTD_V3 | VERSION_ZSTD_V4
-        | CURRENT_VERSION => {
+        | VERSION_ZSTD_V5 | CURRENT_VERSION => {
             zstd::decode_all(raw.as_slice()).map_err(|e| Error::Io(e.to_string()))?
         }
         v => return Err(Error::UnsupportedVersion(v)),
@@ -1261,6 +1328,15 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
                 )
                 .map_err(|e| Error::Io(e.to_string()))?;
             Ok(object)
+        }
+        VERSION_ZSTD_V5 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV5, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
         }
         VERSION_ZSTD_V4 => {
             let (legacy, _) =
@@ -2006,6 +2082,7 @@ mod tests {
             sssig: 430193.5,
             delta_f: 3166.75,
             time: None,
+            seams: None,
         };
         let tmp = std::env::temp_dir().join("geopyv_test_eta_omitted_round_trip.pyv");
         save(&tmp, &GeopyvObject::Subset(sol.clone())).unwrap();
@@ -2013,6 +2090,81 @@ mod tests {
         match loaded {
             GeopyvObject::Subset(s) => {
                 assert_eq!(s.result.eta_omitted, Some((0.0123, 0.0456)));
+            }
+            _ => panic!("expected Subset variant"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    fn seam_subset_solution() -> SubsetSolution {
+        use crate::seam::*;
+        let line = SeamLine { kind: EdgeKind::Hinge, theta: 0.3, c: 7.5, t: 120.0 };
+        let pass = SeamPass { stage: SeamStage::Pass1, t_bend: 12.0, hinge: Some(line), jump: None,
+                              decision: SeamDecision::Cut(EdgeKind::Hinge) };
+        SubsetSolution {
+            coord: [101.5, 99.0],
+            mask: MaskSummary { shape: crate::masks::MaskShape::Circle, size: 40, n_px: 3000 },
+            ref_image: PathBuf::from("ref.png"),
+            target_image: PathBuf::from("tar.png"),
+            result: SolveResult {
+                p: vec![0.5, 0.1, 0.01, 0.0, 0.0, 0.02], c_zncc: 0.99, c_znssd: 0.02, iterations: 4,
+                converged: true, quality_ok: true, history: vec![], max_norm: 1e-5, tolerance: 0.0,
+                subset_order: 1, max_iterations: 80, method: crate::mesh::SolveMethod::Icgn,
+                eta_omitted: None,
+            },
+            std_dev: 50.0,
+            sssig: 1.0e5,
+            delta_f: 3000.0,
+            time: Some((0.0, 1.0)),
+            seams: Some(SeamRecord {
+                plain_coord: [100.0, 99.0],
+                plain_p: vec![0.49, 0.1, 0.012, 0.0, 0.0, 0.02],
+                jolt: Some([1.5, 0.0]),
+                action: SeamAction::Cut,
+                lines: vec![line],
+                gap: 3.0,
+                passes: vec![pass],
+                h: 6.0,
+                levels: SeamLevels::image_free(5025, 6.0),
+                flags: vec![SeamFlag::SecondLineNearCentre],
+            }),
+        }
+    }
+
+    /// A subset carrying a seam record survives `save`/`load` unchanged.
+    #[test]
+    fn test_subset_seams_round_trip() {
+        let sol = seam_subset_solution();
+        let tmp = std::env::temp_dir().join("geopyv_test_seams_round_trip.pyv");
+        save(&tmp, &GeopyvObject::Subset(sol.clone())).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Subset(s) => assert_eq!(s.seams, sol.seams),
+            _ => panic!("expected Subset variant"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v5 (0x0A) subset file loads with no seam record.
+    #[test]
+    fn test_schema_v5_subset_file_loads_via_legacy_path() {
+        let sol = seam_subset_solution();
+        let legacy = LegacyGeopyvObjectV5::Subset(LegacySubsetSolutionV5 {
+            coord: sol.coord,
+            mask: sol.mask.clone(),
+            ref_image: sol.ref_image.clone(),
+            target_image: sol.target_image.clone(),
+            result: sol.result.clone(),
+            std_dev: sol.std_dev,
+            sssig: sol.sssig,
+            delta_f: sol.delta_f,
+            time: sol.time,
+        });
+        let tmp = write_versioned("geopyv_test_v5_subset.pyv", VERSION_ZSTD_V5, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Subset(s) => {
+                assert_eq!(s.result.p, sol.result.p);
+                assert_eq!(s.time, Some((0.0, 1.0)));
+                assert!(s.seams.is_none());
             }
             _ => panic!("expected Subset variant"),
         }
