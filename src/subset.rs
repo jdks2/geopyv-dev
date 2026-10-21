@@ -1342,15 +1342,23 @@ impl Subset {
     /// (e.g. a `Subset` reloaded from a `.pyv` whose original images are no
     /// longer found on disk) or if the subset has not been solved.
     pub fn residual_map(&self) -> Result<Array1<f64>, Error> {
+        if self.f_coords.is_none() || self.f.is_none() || self.f_m.is_none() || self.g_img.is_none() {
+            return Err(Error::InvalidInput("residual_map: images unavailable".to_string()));
+        }
+        let sol = self.solution.as_ref().ok_or_else(|| {
+            Error::InvalidInput("residual_map: subset has not been solved".to_string())
+        })?;
+        self.residual_with(&sol.result.p)
+    }
+
+    /// The per-pixel zero-normalised residual `e_i = zn(f_i) - zn(g_i)` at
+    /// the warp `p` (any order), without solving.
+    pub(crate) fn residual_with(&self, p: &[f64]) -> Result<Array1<f64>, Error> {
         let unavail = || Error::InvalidInput("residual_map: images unavailable".to_string());
         let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
         let f       = self.f.as_ref().ok_or_else(unavail)?;
         let f_m     = self.f_m.ok_or_else(unavail)?;
         let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
-        let sol = self.solution.as_ref().ok_or_else(|| {
-            Error::InvalidInput("residual_map: subset has not been solved".to_string())
-        })?;
-        let p = &sol.result.p;
 
         let n = f_coords.nrows();
         let gv = g_img.qcqt.view();

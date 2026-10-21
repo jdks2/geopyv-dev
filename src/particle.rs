@@ -1876,6 +1876,7 @@ mod tests {
             template_shape: None,
             template_sizes: None,
             time: None,
+            seams: None,
         }
     }
 

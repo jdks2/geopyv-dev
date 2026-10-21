@@ -111,7 +111,8 @@ const VERSION_ZSTD_V4: u8 = 0x09;
 /// load). Still readable on load, but no longer written.
 const VERSION_ZSTD_V5: u8 = 0x0A;
 /// zstd-compressed, schema v6 (current). Relative to v5: `SubsetSolution`
-/// gains `seams`. Always written by [`save`].
+/// gains `seams`; `MeshSolution` gains `seams`; `SolveConfig` gains
+/// `masking`. Always written by [`save`].
 const CURRENT_VERSION: u8 = 0x0B;
 
 // ---------------------------------------------------------------------------
@@ -256,6 +257,7 @@ impl From<LegacyMeshSolution> for MeshSolution {
             template_shape: None,
             template_sizes: None,
             time: None,
+            seams: None,
         }
     }
 }
@@ -537,6 +539,7 @@ impl From<LegacyMeshSolutionV1> for MeshSolution {
             template_shape: None,
             template_sizes: None,
             time: None,
+            seams: None,
         }
     }
 }
@@ -891,7 +894,7 @@ struct LegacyMeshSolutionV3 {
     norms: ndarray::Array1<f64>,
     f_img_path: PathBuf,
     g_img_path: PathBuf,
-    solve_config: Option<SolveConfig>,
+    solve_config: Option<LegacySolveConfigV5>,
     seed: Option<SeedConfig>,
     template_shape: Option<MaskShape>,
     template_sizes: Option<ndarray::Array1<u32>>,
@@ -918,11 +921,12 @@ impl From<LegacyMeshSolutionV3> for MeshSolution {
             norms: l.norms,
             f_img_path: l.f_img_path,
             g_img_path: l.g_img_path,
-            solve_config: l.solve_config,
+            solve_config: l.solve_config.map(Into::into),
             seed: l.seed,
             template_shape: l.template_shape,
             template_sizes: l.template_sizes,
             time: None,
+            seams: None,
         }
     }
 }
@@ -1100,7 +1104,7 @@ struct LegacyMeshSolutionV4 {
     norms: ndarray::Array1<f64>,
     f_img_path: PathBuf,
     g_img_path: PathBuf,
-    solve_config: Option<SolveConfig>,
+    solve_config: Option<LegacySolveConfigV5>,
     seed: Option<SeedConfig>,
     template_shape: Option<MaskShape>,
     template_sizes: Option<ndarray::Array1<u32>>,
@@ -1128,11 +1132,12 @@ impl From<LegacyMeshSolutionV4> for MeshSolution {
             norms: l.norms,
             f_img_path: l.f_img_path,
             g_img_path: l.g_img_path,
-            solve_config: l.solve_config,
+            solve_config: l.solve_config.map(Into::into),
             seed: l.seed,
             template_shape: l.template_shape,
             template_sizes: l.template_sizes,
             time: l.time,
+            seams: None,
         }
     }
 }
@@ -1204,7 +1209,8 @@ impl From<LegacyGeopyvObjectV4> for GeopyvObject {
 // ---------------------------------------------------------------------------
 // Legacy shapes (schema v5 — the 0x0A format). Frozen: do not edit these to
 // match future changes — freeze a new `Legacy*V6` set instead and chain it
-// in `load`. v6 added `SubsetSolution::seams`.
+// in `load`. v6 added `SubsetSolution::seams`, `MeshSolution::seams` and
+// `SolveConfig::masking`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1237,12 +1243,153 @@ impl From<LegacySubsetSolutionV5> for SubsetSolution {
     }
 }
 
+/// `SolveConfig` before `masking` (v6). Also the shape stored by v3–v5 meshes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySolveConfigV5 {
+    max_norm: f64,
+    max_iterations: usize,
+    subset_order: usize,
+    tolerance: f64,
+    method: SolveMethod,
+    override_active: bool,
+    preconditioning: crate::mesh::Preconditioning,
+    layer_rg: crate::mesh::LayerRgConfig,
+}
+
+#[cfg(test)]
+impl LegacySolveConfigV5 {
+    /// The v5 shape of a current config (tests writing old-format files).
+    fn from_current(c: SolveConfig) -> Self {
+        LegacySolveConfigV5 {
+            max_norm: c.max_norm,
+            max_iterations: c.max_iterations,
+            subset_order: c.subset_order,
+            tolerance: c.tolerance,
+            method: c.method,
+            override_active: c.override_active,
+            preconditioning: c.preconditioning,
+            layer_rg: c.layer_rg,
+        }
+    }
+}
+
+impl From<LegacySolveConfigV5> for SolveConfig {
+    fn from(l: LegacySolveConfigV5) -> Self {
+        SolveConfig {
+            max_norm: l.max_norm,
+            max_iterations: l.max_iterations,
+            subset_order: l.subset_order,
+            tolerance: l.tolerance,
+            method: l.method,
+            override_active: l.override_active,
+            preconditioning: l.preconditioning,
+            layer_rg: l.layer_rg,
+            masking: crate::mesh::Masking::Uniform,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMeshSolutionV5 {
+    nodes: ndarray::Array2<f64>,
+    elements: ndarray::Array2<usize>,
+    boundary: Vec<usize>,
+    exclusions: Vec<Vec<usize>>,
+    centroids: ndarray::Array2<f64>,
+    areas: ndarray::Array1<f64>,
+    warps: ndarray::Array2<f64>,
+    displacements: ndarray::Array2<f64>,
+    c_zncc: ndarray::Array1<f64>,
+    p: ndarray::Array2<f64>,
+    seed_node: usize,
+    mesh_order: u8,
+    subset_order: u8,
+    iterations: ndarray::Array1<u32>,
+    norms: ndarray::Array1<f64>,
+    f_img_path: PathBuf,
+    g_img_path: PathBuf,
+    solve_config: Option<LegacySolveConfigV5>,
+    seed: Option<SeedConfig>,
+    template_shape: Option<MaskShape>,
+    template_sizes: Option<ndarray::Array1<u32>>,
+    time: Option<(f64, f64)>,
+}
+
+impl From<LegacyMeshSolutionV5> for MeshSolution {
+    fn from(l: LegacyMeshSolutionV5) -> Self {
+        MeshSolution {
+            nodes: l.nodes,
+            elements: l.elements,
+            boundary: l.boundary,
+            exclusions: l.exclusions,
+            centroids: l.centroids,
+            areas: l.areas,
+            warps: l.warps,
+            displacements: l.displacements,
+            c_zncc: l.c_zncc,
+            p: l.p,
+            seed_node: l.seed_node,
+            mesh_order: l.mesh_order,
+            subset_order: l.subset_order,
+            iterations: l.iterations,
+            norms: l.norms,
+            f_img_path: l.f_img_path,
+            g_img_path: l.g_img_path,
+            solve_config: l.solve_config.map(Into::into),
+            seed: l.seed,
+            template_shape: l.template_shape,
+            template_sizes: l.template_sizes,
+            time: l.time,
+            seams: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySequenceSolutionV5 {
+    mesh_solutions: Vec<Arc<LegacyMeshSolutionV5>>,
+    mesh_paths: Vec<PathBuf>,
+    all_converged: bool,
+    unsolvable: bool,
+    override_log: Vec<usize>,
+    reference_updates: Vec<bool>,
+    mesh_order: u8,
+    first_f_img_path: Option<PathBuf>,
+    boundary_region: Region,
+    exclusion_regions: Vec<Region>,
+    options: Option<SequenceOptions>,
+    border: usize,
+    time: Option<Vec<f64>>,
+    time_source: crate::timing::TimeSource,
+}
+
+impl From<LegacySequenceSolutionV5> for SequenceSolution {
+    fn from(l: LegacySequenceSolutionV5) -> Self {
+        SequenceSolution {
+            mesh_solutions: l.mesh_solutions.into_iter().map(arc_into).collect(),
+            mesh_paths: l.mesh_paths,
+            all_converged: l.all_converged,
+            unsolvable: l.unsolvable,
+            override_log: l.override_log,
+            reference_updates: l.reference_updates,
+            mesh_order: l.mesh_order,
+            first_f_img_path: l.first_f_img_path,
+            boundary_region: l.boundary_region,
+            exclusion_regions: l.exclusion_regions,
+            options: l.options,
+            border: l.border,
+            time: l.time,
+            time_source: l.time_source,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum LegacyGeopyvObjectV5 {
     Subset(LegacySubsetSolutionV5),
-    Mesh(MeshSolution),
+    Mesh(LegacyMeshSolutionV5),
     Field(FieldSolution),
-    Sequence(SequenceSolution),
+    Sequence(LegacySequenceSolutionV5),
     Particle(ParticleSolution),
     Speckle(Speckle),
     Calibration(CalibrationSolution),
@@ -1252,9 +1399,9 @@ impl From<LegacyGeopyvObjectV5> for GeopyvObject {
     fn from(l: LegacyGeopyvObjectV5) -> Self {
         match l {
             LegacyGeopyvObjectV5::Subset(s) => GeopyvObject::Subset(s.into()),
-            LegacyGeopyvObjectV5::Mesh(m) => GeopyvObject::Mesh(m),
+            LegacyGeopyvObjectV5::Mesh(m) => GeopyvObject::Mesh(m.into()),
             LegacyGeopyvObjectV5::Field(f) => GeopyvObject::Field(f),
-            LegacyGeopyvObjectV5::Sequence(s) => GeopyvObject::Sequence(s),
+            LegacyGeopyvObjectV5::Sequence(s) => GeopyvObject::Sequence(s.into()),
             LegacyGeopyvObjectV5::Particle(p) => GeopyvObject::Particle(p),
             LegacyGeopyvObjectV5::Speckle(s) => GeopyvObject::Speckle(s),
             LegacyGeopyvObjectV5::Calibration(c) => GeopyvObject::Calibration(c),
@@ -1445,6 +1592,7 @@ mod tests {
             template_shape: Some(crate::masks::MaskShape::Circle),
             template_sizes: Some(ndarray::array![8u32, 8, 8]),
             time: None,
+            seams: None,
         }
     }
 
@@ -1503,7 +1651,7 @@ mod tests {
             norms: m.norms.clone(),
             f_img_path: m.f_img_path.clone(),
             g_img_path: m.g_img_path.clone(),
-            solve_config: m.solve_config.clone(),
+            solve_config: m.solve_config.clone().map(LegacySolveConfigV5::from_current),
             seed: m.seed.clone(),
             template_shape: m.template_shape.clone(),
             template_sizes: m.template_sizes.clone(),
@@ -1864,7 +2012,7 @@ mod tests {
             norms: m.norms.clone(),
             f_img_path: m.f_img_path.clone(),
             g_img_path: m.g_img_path.clone(),
-            solve_config: m.solve_config.clone(),
+            solve_config: m.solve_config.clone().map(LegacySolveConfigV5::from_current),
             seed: m.seed.clone(),
             template_shape: None,
             template_sizes: None,
@@ -2167,6 +2315,73 @@ mod tests {
                 assert!(s.seams.is_none());
             }
             _ => panic!("expected Subset variant"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A mesh carrying an adaptive-masking record survives `save`/`load`.
+    #[test]
+    fn test_mesh_seams_round_trip() {
+        let mut m = make_mesh_solution();
+        let n = m.nodes.nrows();
+        m.seams = Some(crate::mesh::MeshSeams {
+            plain_nodes: m.nodes.clone(),
+            plain_p: ndarray::Array2::zeros((n, 6)),
+            flagged: vec![true, false, false],
+            sent: vec![true, true, false],
+            rounds: 2,
+            noise_source: crate::screen::NoiseSource::Default { sigma: 2.0 },
+            noise_scale: ndarray::array![0.007, 0.006, 0.008],
+            still_mismatch: None,
+            h: 6.1,
+            records: vec![seam_subset_solution().seams, None, None],
+        });
+        let tmp = std::env::temp_dir().join("geopyv_test_mesh_seams_round_trip.pyv");
+        save(&tmp, &GeopyvObject::Mesh(m.clone())).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => assert_eq!(l.seams, m.seams),
+            _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v5 (0x0A) mesh file loads with uniform masking and no record.
+    #[test]
+    fn test_schema_v5_mesh_file_loads_via_legacy_path() {
+        let m = make_mesh_solution();
+        let legacy = LegacyGeopyvObjectV5::Mesh(LegacyMeshSolutionV5 {
+            nodes: m.nodes.clone(),
+            elements: m.elements.clone(),
+            boundary: m.boundary.clone(),
+            exclusions: m.exclusions.clone(),
+            centroids: m.centroids.clone(),
+            areas: m.areas.clone(),
+            warps: m.warps.clone(),
+            displacements: m.displacements.clone(),
+            c_zncc: m.c_zncc.clone(),
+            p: m.p.clone(),
+            seed_node: m.seed_node,
+            mesh_order: m.mesh_order,
+            subset_order: m.subset_order,
+            iterations: m.iterations.clone(),
+            norms: m.norms.clone(),
+            f_img_path: m.f_img_path.clone(),
+            g_img_path: m.g_img_path.clone(),
+            solve_config: m.solve_config.clone().map(LegacySolveConfigV5::from_current),
+            seed: m.seed.clone(),
+            template_shape: m.template_shape.clone(),
+            template_sizes: m.template_sizes.clone(),
+            time: Some((0.0, 2.0)),
+        });
+        let tmp = write_versioned("geopyv_test_v5_mesh.pyv", VERSION_ZSTD_V5, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => {
+                assert_eq!(l.displacements, m.displacements);
+                assert_eq!(l.time, Some((0.0, 2.0)));
+                assert!(l.seams.is_none());
+                assert_eq!(l.solve_config.map(|c| c.masking), m.solve_config.as_ref().map(|_| crate::mesh::Masking::Uniform));
+            }
+            _ => panic!("expected Mesh"),
         }
         let _ = std::fs::remove_file(tmp);
     }

@@ -109,7 +109,7 @@ def load(path):
 
 _SOLVER_OPTION_AXES = {
     "topology": {"uniform", "adaptive"},
-    "masking": {"uniform"},
+    "masking": {"uniform", "adaptive"},
     "preconditioning": {"RG", "layer-RG"},
 }
 _SOLVER_OPTION_DEFAULTS = {"topology": "uniform", "masking": "uniform", "preconditioning": "RG"}
@@ -120,7 +120,7 @@ _SUBDICT_FOR_AXIS_VALUE = {
     ("preconditioning", "layer-RG"): ("layer_rg", {"max_workers", "batch_factor", "root_rel_eps"}),
 }
 _ZONAL_REMOVED = (
-    "zonal masking has been removed; solver_options['masking'] accepts only 'uniform'"
+    "zonal masking has been removed; solver_options['masking'] accepts 'uniform' or 'adaptive'"
 )
 _ADAPTIVE_UNAVAILABLE = (
     "method='adaptive' (and the adaptive_* kwargs) is not available: it was an alias "
@@ -136,6 +136,32 @@ _NOT_YET_IMPLEMENTED = {
     # preconditioning="layer-RG": landed (src/mesh.rs::expand_parallel /
     # Preconditioning::LayerRg, geopyv_dev_fresh/layer_rg_plan.md §3).
 }
+
+
+def _subset_masking(solver_options):
+    """`Subset.solve`'s solver_options: only the masking axis applies."""
+    if solver_options is None:
+        return "uniform"
+    if not isinstance(solver_options, dict):
+        raise TypeError(f"solver_options must be a dict, got {type(solver_options).__name__}")
+    unknown = set(solver_options) - {"masking"}
+    if unknown:
+        raise ValueError(f"Subset.solve accepts only solver_options['masking'], got {sorted(unknown)!r}")
+    masking = solver_options.get("masking", "uniform")
+    if masking not in _SOLVER_OPTION_AXES["masking"]:
+        raise ValueError(f"solver_options['masking'] must be one of "
+                         f"{sorted(_SOLVER_OPTION_AXES['masking'])!r}, got {masking!r}")
+    return masking
+
+
+def _adaptive_subset_order(masking, kwargs):
+    """Adaptive masking investigates a plain order-1 solve and decides order 2
+    node by node, so `subset_order` is forced to 1 (with a warning if 2)."""
+    if masking == "adaptive" and kwargs.get("subset_order", 1) != 1:
+        warnings.warn("solver_options['masking']='adaptive' needs subset_order=1; using 1 "
+                      "(order 2 is applied node by node where bending is found)", UserWarning,
+                      stacklevel=3)
+        kwargs["subset_order"] = 1
 
 
 def _validate_solver_options(solver_options):
@@ -293,7 +319,8 @@ class Subset:
         return repr(self._inner)
 
     def solve(self, p_0=None, solver=None,
-              max_norm=1e-3, max_iterations=50, tolerance=0.75, seams=False, **extra_kwargs):
+              max_norm=1e-3, max_iterations=50, tolerance=0.75, solver_options=None,
+              **extra_kwargs):
         """Run the DIC solver. Mutates the object in place; returns None
         (read the result back via ``.p``, ``.c_zncc``, etc.).
 
@@ -311,16 +338,26 @@ class Subset:
             Iteration limit. Default 50.
         tolerance : float, optional
             Minimum acceptable C_ZNCC for solved=True. Default 0.75.
-        seams : bool, optional
-            After the plain solve, look for a band edge or bending the
-            order-1 warp misses and correct for it (move the subset off a
-            line through its centre, cut along the line, or re-solve at order
-            2). Order-1 subsets and lossless images only. The plain solve is
-            kept in ``.seams``. Default False.
+        solver_options : dict, optional
+            ``{"masking": "uniform"}`` (default) or ``{"masking":
+            "adaptive"}``, as on `Mesh.solve`: after the plain solve, look
+            for a band edge or bending the order-1 warp misses and correct
+            for it (move the subset off a line through its centre, cut along
+            the line, or re-solve at order 2). Lossless images only. Needs an
+            order-1 subset (an order-2 one is rebuilt at order 1, with a
+            warning). The plain solve is kept in ``.seams``.
         """
         algo = _checked_solver(_resolve_solver(solver, extra_kwargs, "algorithm"))
+        masking = _subset_masking(solver_options)
+        if masking == "adaptive" and self._inner.subset_order != 1:
+            warnings.warn("solver_options['masking']='adaptive' needs subset_order=1; rebuilding "
+                          "the subset at order 1 (order 2 is applied where bending is found)",
+                          UserWarning, stacklevel=2)
+            i = self._inner
+            self._inner = _core.Subset(i.coord, i.local_mask, i.f_img, i.g_img, subset_order=1,
+                                       time=i.time)
         kwargs = dict(p_0=p_0, max_norm=max_norm,
-                      max_iterations=max_iterations, tolerance=tolerance, seams=seams)
+                      max_iterations=max_iterations, tolerance=tolerance, masking=masking)
         if algo == "fagn":
             self._inner.solve_fagn(**kwargs)
         else:
@@ -349,12 +386,12 @@ class Mesh:
     """
 
     def __init__(self, boundary, target_nodes, f_img, g_img,
-                 size=(1, 1000), exclusions=None, exclusions_hard=None, mesh_order=2,
-                 time=None):
+                 size=(1, 1000), exclusions=None, exclusions_hard=None, mesh_order=1,
+                 time=None, noise=None):
         self._inner = _core.Mesh(
             boundary, target_nodes, f_img, g_img,
             size=size, exclusions=exclusions, exclusions_hard=exclusions_hard,
-            mesh_order=mesh_order, time=time,
+            mesh_order=mesh_order, time=time, noise=getattr(noise, "_inner", noise),
         )
         if time is None:
             _report_time_source(self._inner)
@@ -394,9 +431,14 @@ class Mesh:
             - ``topology`` : ``"uniform"`` (default) or ``"adaptive"``
               (mesh-relocation pipeline -- not yet implemented, raises
               ``NotImplementedError``; see `geopyv_dev_fresh/to_do.md` Step 3).
-            - ``masking`` : ``"uniform"`` (default, and the only option --
-              zonal masking has been removed; ``"zonal"`` raises
-              ``ValueError``).
+            - ``masking`` : ``"uniform"`` (default) or ``"adaptive"``:
+              after the plain solve, nodes whose neighbours disagree beyond
+              noise are investigated and corrected (moved off a line through
+              their centre, cut along it, or re-solved at order 2). The noise
+              comes from the still pair given as ``Mesh(..., noise=...)``,
+              or, if none, from a small patch around the seed point
+              (assumed to move only rigidly). Needs ``subset_order=1`` (forced,
+              with a warning, if 2 is given). Results: ``.seams``.
             - ``preconditioning`` : ``"RG"`` (default) or ``"layer-RG"``
               (layer-parallel RG frontier traversal; agrees with ``"RG"``
               within Tier C and is deterministic -- see
@@ -412,6 +454,7 @@ class Mesh:
             _validate_solver_options(solver_options)
         # topology has no implemented non-default value yet (rejected inside
         # _validate_solver_options) -- only "uniform" ever reaches here.
+        _adaptive_subset_order(masking, kwargs)
         self._inner.solve(
             local_mask, seed_coord, seed_warp=seed_warp,
             method=resolved_solver, preconditioning=preconditioning, masking=masking,
@@ -451,7 +494,7 @@ class Sequence:
     """
 
     def __init__(self, image_dir, boundary, target_nodes,
-                 size=(1.0, 1000.0), exclusions=None, mesh_order=2, time=None):
+                 size=(1.0, 1000.0), exclusions=None, mesh_order=1, time=None):
         self._inner = _core.Sequence(
             image_dir, boundary, target_nodes,
             size=size, exclusions=exclusions, mesh_order=mesh_order, time=time,
@@ -483,14 +526,16 @@ class Sequence:
         solver_options : dict, optional
             Same three axes as `Mesh.solve` -- see that method's docstring
             and `geopyv_dev_fresh/solver_options_restructure.md`.
-            ``masking`` accepts only ``"uniform"`` (zonal masking has been
-            removed).
+            ``masking="adaptive"`` takes frames 0 -> 1 as a still pair:
+            that pair is solved plain and supplies the noise for every
+            later pair. Needs ``subset_order=1`` (forced, with a warning).
 
         ``method="adaptive"`` is not available and raises ``ValueError``."""
         _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
         topology, masking, preconditioning, layer_rg_opts = \
             _validate_solver_options(solver_options)
+        _adaptive_subset_order(masking, kwargs)
         self._inner.solve(
             *args, method=resolved_solver, preconditioning=preconditioning, masking=masking,
             **_layer_rg_kwargs(layer_rg_opts), **kwargs,
