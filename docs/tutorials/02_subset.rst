@@ -256,6 +256,18 @@ axes you built yourself to combine with other plots:
    plt.tight_layout()
    plt.savefig("subset_summary.png", dpi=300)
 
+Adaptive masking
+------------------
+
+``subset.solve(solver_options={"masking": "adaptive"})`` runs the plain order-1 solve
+and then the tests and corrections described in :doc:`03_mesh` (*Adaptive masking*):
+a cut along a band edge, a bend (order 2), a jolt off a line through the centre, or
+nothing. There are no neighbours, so there is no screen: the subset is always
+tested. ``subset.seams`` keeps the plain solve and the record, and
+``subset.inspect(seams=True)`` draws the cut line and masked side and lists the
+scores. An order-2 subset is rebuilt at order 1, with a warning. Lossless images
+only.
+
 Selecting and solving a subset in the GUI
 ----------------------------------------------
 
@@ -266,7 +278,8 @@ Selecting and solving a subset in the GUI
 2. Name the subset, and pick reference/target images from the dropdowns.
 3. Choose a template shape (circle/square) and size, and a solver
    configuration (ICGN/FAGN, order 1/2, max norm, max iterations, ZNCC
-   tolerance).
+   tolerance), and **Masking: Uniform/Adaptive**. After an adaptive solve the
+   results list the action taken, any jolt and any flags.
 4. Click on the reference image in the viewer to place the subset centre.
 5. Click **Run** to solve.
 6. Once solved, switch between the **Displacement**, **Inspect**, and

@@ -10,6 +10,7 @@ use geopyv_dev::io::GeopyvObject;
 use geopyv_dev::mesh::{SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::geometry::region::{Region, RegionOption};
+use geopyv_dev::mesh::Masking;
 use geopyv_dev::sequence::{Sequence, SequenceMeshConfig, SequenceOptions as LibSequenceOptions, SequenceSolution, SequenceSolveConfig};
 use geopyv_dev::masks::{LocalMask, MaskShape};
 use geopyv_dev::timing::IncrementMode;
@@ -175,6 +176,9 @@ pub struct SequenceViewState {
     pub show_node_indices: bool,
     /// Cached (frame_index, plot_type, values) — invalidated on frame/type change.
     pub nodal_cache: Option<(usize, MeshPlotType, Vec<f64>)>,
+    /// Cached (frame_index, that frame's mesh if solved with adaptive masking),
+    /// so the frame is not reloaded on every repaint.
+    pub adaptive_frame: Option<(usize, Option<geopyv_dev::mesh::MeshSolution>)>,
 }
 
 impl SequenceViewState {
@@ -199,6 +203,7 @@ impl SequenceViewState {
             show_wireframe: false,
             show_node_indices: false,
             nodal_cache: None,
+            adaptive_frame: None,
         }
     }
 }
@@ -254,6 +259,7 @@ pub struct SequenceSpawnParams {
     pub override_: bool,
     pub border: usize,
     pub time: Option<geopyv_dev::timing::TimeInput>,
+    pub masking: Masking,
     /// Directory /Meshes/<name>/ for per-frame .pyv files.
     pub mesh_subdir: PathBuf,
     /// Directory /Sequences/ for the overall SequenceSolution.
@@ -344,6 +350,7 @@ impl SequenceTabState {
         if mode == crate::main_window::PaneMode::View {
             if self.view.loaded_path.as_deref() != selected_path {
                 self.view.loaded_path = selected_path.map(|p| p.to_path_buf());
+                self.view.adaptive_frame = None;
                 self.view.solution = selected_path.and_then(|p| {
                     geopyv_dev::io::load(p).ok().and_then(|obj| {
                         if let GeopyvObject::Sequence(s) = obj { Some(s) } else { None }
@@ -582,7 +589,8 @@ impl SequenceTabState {
     pub fn show_right_view(&mut self, ui: &mut egui::Ui, selected_path: Option<&Path>) {
         if self.view.loaded_path.as_deref() != selected_path {
             self.view.loaded_path = selected_path.map(|p| p.to_path_buf());
-            self.view.solution = selected_path.and_then(|p| {
+            self.view.adaptive_frame = None;
+                self.view.solution = selected_path.and_then(|p| {
                 geopyv_dev::io::load(p).ok().and_then(|obj| {
                     if let GeopyvObject::Sequence(s) = obj { Some(s) } else { None }
                 })
@@ -774,6 +782,24 @@ impl SequenceTabState {
             );
             ui.radio_value(&mut self.view.plot_type, MeshPlotType::Norms, "Norms");
         });
+        // Adaptive-masking plots for the current frame, when it has them.
+        let frame = self.view.current_frame;
+        if self.view.adaptive_frame.as_ref().map(|(f, _)| *f) != Some(frame) {
+            let ms = self.view.solution.as_ref()
+                .and_then(|s| s.load_mesh_at(frame).ok())
+                .filter(|m| m.seams.is_some())
+                .map(|m| (*m).clone());
+            self.view.adaptive_frame = Some((frame, ms));
+        }
+        if let Some(ms) = self.view.adaptive_frame.as_ref().and_then(|(_, m)| m.as_ref()) {
+            ui.add_space(3.0);
+            ui.label(
+                egui::RichText::new("\u{2500}\u{2500} Adaptive masking \u{2500}\u{2500}")
+                    .size(15.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
+            crate::mesh_tab::seam_plot_radios(ui, &mut self.view.plot_type, ms);
+        }
 
         if self.view.plot_type != old_plot {
             self.view.nodal_cache = None;
@@ -1225,11 +1251,17 @@ impl SequenceTabState {
                     ui.end_row();
 
                     ui.label(lbl("Order:"));
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut s.order, SubsetOrder::First, "1");
-                        ui.radio_value(&mut s.order, SubsetOrder::Second, "2");
-                    });
+                    ui.add_enabled_ui(s.masking == Masking::Uniform, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut s.order, SubsetOrder::First, "1");
+                            ui.radio_value(&mut s.order, SubsetOrder::Second, "2");
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text("Adaptive masking solves at order 1 and applies order 2 node by node");
                     ui.end_row();
+
+                    crate::subset_tab::masking_row(ui, s);
 
                     ui.label(lbl("Max norm:"));
                     let r = ui.add(
@@ -1510,6 +1542,7 @@ impl SequenceTabState {
                     target_nodes: form.gen_cfg.target_nodes,
                     method: form.solver.method,
                     subset_order: form.solver.order,
+                    masking: form.solver.masking,
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
@@ -1670,6 +1703,7 @@ fn run_solve(
                 SolveMethod::Icgn => LibSolveMethod::Icgn,
                 SolveMethod::Fagn => LibSolveMethod::Fagn,
             },
+            masking: params.masking,
             ..Default::default()
         },
         local_mask,

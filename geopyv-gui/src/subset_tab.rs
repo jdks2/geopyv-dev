@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui_plot::{HLine, Legend, Line, LineStyle, Plot, Points};
 
+use geopyv_dev::mesh::Masking;
+use geopyv_dev::seam::SeamConfig;
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
 use geopyv_dev::subset::{Subset, SubsetSolution};
@@ -53,6 +55,8 @@ impl Default for SubsetPlotMode {
 pub struct SolverConfig {
     pub method: SolveMethod,
     pub order: SubsetOrder,
+    /// Uniform, or adaptive (seam investigation and correction).
+    pub masking: Masking,
     pub max_norm_text: String,
     pub max_norm: f64,
     pub max_iterations_text: String,
@@ -72,6 +76,7 @@ impl Default for SolverConfig {
                 geopyv_dev::mesh::SolveMethod::Fagn => SolveMethod::Fagn,
             },
             order: if core.subset_order == 1 { SubsetOrder::First } else { SubsetOrder::Second },
+            masking: core.masking,
             max_norm_text: format!("{:e}", core.max_norm),
             max_norm: core.max_norm,
             max_iterations_text: core.max_iterations.to_string(),
@@ -81,6 +86,24 @@ impl Default for SolverConfig {
             parse_error: None,
         }
     }
+}
+
+/// The "Masking:" row of a solver grid. Adaptive fixes the order at 1 (order
+/// 2 is then applied node by node where bending is found).
+pub fn masking_row(ui: &mut egui::Ui, s: &mut SolverConfig) {
+    ui.label(egui::RichText::new("Masking:").size(16.0).color(ui.visuals().weak_text_color()));
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut s.masking, Masking::Uniform, "Uniform");
+        ui.radio_value(&mut s.masking, Masking::Adaptive, "Adaptive").on_hover_text(
+            "After the plain solve, find band edges or bending the order-1 warp misses and correct \
+             for them: move the subset off a line through its centre, cut along the line, or \
+             re-solve at order 2. Lossless images (PNG, TIFF, BMP) only.",
+        );
+    });
+    if s.masking == Masking::Adaptive {
+        s.order = SubsetOrder::First;
+    }
+    ui.end_row();
 }
 
 impl SolverConfig {
@@ -205,6 +228,7 @@ pub struct SubsetSpawnParams {
     pub max_norm: f64,
     pub max_iterations: usize,
     pub zncc_tol: f64,
+    pub masking: Masking,
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +774,15 @@ impl SubsetTabState {
         ui.add_space(4.0);
         section_header(ui, "Values");
         meta_row(ui, "C_ZNCC", &sig3(sol.result.c_zncc));
+        if let Some(rec) = &sol.seams {
+            meta_row(ui, "Adaptive", &format!("{:?}", rec.action).to_lowercase());
+            if let Some(j) = rec.jolt {
+                meta_row(ui, "Jolted by", &format!("{:.1}, {:.1} px", j[0], j[1]));
+            }
+            if !rec.flags.is_empty() {
+                meta_row(ui, "Flags", &rec.flags.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>().join(", "));
+            }
+        }
 
         let p = &sol.result.p;
         if p.len() >= 6 {
@@ -1007,11 +1040,17 @@ impl SubsetTabState {
                             .size(16.0)
                             .color(ui.visuals().weak_text_color()),
                     );
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut s.order, SubsetOrder::First, "1");
-                        ui.radio_value(&mut s.order, SubsetOrder::Second, "2");
-                    });
+                    ui.add_enabled_ui(s.masking == Masking::Uniform, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut s.order, SubsetOrder::First, "1");
+                            ui.radio_value(&mut s.order, SubsetOrder::Second, "2");
+                        });
+                    })
+                    .response
+                    .on_disabled_hover_text("Adaptive masking solves at order 1 and applies order 2 node by node");
                     ui.end_row();
+
+                    crate::subset_tab::masking_row(ui, s);
 
                     ui.label(
                         egui::RichText::new("Max norm:")
@@ -1150,6 +1189,7 @@ impl SubsetTabState {
                     coord: [pt.x as f64, pt.y as f64],
                     method: form.solver.method,
                     order: form.solver.order,
+                    masking: form.solver.masking,
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
@@ -1370,6 +1410,15 @@ fn run_solve(
             subset.solve_fagn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations)
         }
     };
+
+    let solve_result = solve_result.and_then(|()| {
+        if params.masking == Masking::Adaptive {
+            set_progress(&state, 0.85, "Investigating seams…");
+            subset.solve_seams(&local_mask, None, None, &SeamConfig::default())
+        } else {
+            Ok(())
+        }
+    });
 
     match solve_result {
         Ok(()) => {

@@ -286,6 +286,7 @@ impl MainWindow {
         if let Some(outcome) = self.sequence.check_solve_complete() {
             match outcome {
                 Ok((solution, name, image_paths)) => {
+                    self.sequence.view.adaptive_frame = None;
                     self.sequence.view.solution = Some(solution);
                     self.sequence.view.loaded_path =
                         Some(project.sequences_dir().join(format!("{name}.pyv")));
