@@ -5,7 +5,7 @@
   alone allows. (a) Uniform ground: the neighbour lands inside. (b) A band
   between them: it lands outside, so both go on to the tests.
 - ``adaptive_flow.png``: what happens to one node, from the screen through the
-  tests, the jolt and the corrections — reflects src/screen.rs, src/seam.rs and
+  tests, the corrections and the move of cut subsets — reflects src/screen.rs, src/seam.rs and
   Mesh::adaptive_masking.
 """
 import os
@@ -90,16 +90,15 @@ def build_flow():
     d_bend = diamond(ax, (8.4, 13.6), 3.0, 1.6, "Either score\nbeyond its alarm?")
     box(ax, (8.4, 11.2), 2.4, 0.9, "re-solve the full\ndisc at order 2", color=LOOP_COLOR)
     box(ax, (8.4, 9.6), 2.4, 0.8, "leave as is", color="#e7f3ff")
-    jx = cx - 0.6
-    diamond(ax, (jx, 13.2), 4.2, 1.7, "Line within 5 px\nof the centre?")
-    box(ax, (1.45, 11.6), 2.5, 1.8,
-        "Jolt: move node and\nsubset away from the\nline (along the edge on\na boundary; not at a\ncorner), then re-test",
-        color=LOOP_COLOR, fontsize=TEXT_SIZE - 0.5)
-    box(ax, (jx, 10.0), 4.0, 1.2, "Cut: mask the far side of the line\n(3 px gap) and re-solve")
-    box(ax, (jx, 7.9), 5.0, 1.4,
-        "Pass 2, tests on the cut subset:\nsecond cut (narrow band, keeps \u2265 15 %),\norder 2 on the cut subset, or nothing")
+    jx = cx - 1.0
+    box(ax, (jx, 13.4), 5.2, 1.2, "Cut: mask the far side of the line\n(3 px gap) and re-solve")
+    box(ax, (jx, 11.1), 5.2, 1.9,
+        "Move node and subset to the middle of\nthe pixels it keeps (as far as the mesh\nallows; along the edge on a boundary,\nnot at a corner) and re-solve there",
+        color=LOOP_COLOR)
+    box(ax, (jx, 8.4), 5.2, 1.9,
+        "Pass 2, tests on the moved subset:\nsecond cut (narrow band, keeps \u2265 15 %;\nthen move and re-solve again),\norder 2 on the cut subset, or nothing")
     box(ax, (cx, 5.6), 6.8, 1.3,
-        "Mesh updated: final warps (12 columns), jolted node positions;\n"
+        "Mesh updated: final warps (12 columns), moved node positions;\n"
         "mesh.seams keeps the plain solve and every node's record", color="#e7f3ff")
 
     arrow(ax, (cx, 24.5), (cx, 24.05))
@@ -112,13 +111,10 @@ def build_flow():
     ax.plot([9.9, 9.9], [13.6, 9.6], color="#333333", lw=1.1)
     arrow(ax, (9.9, 9.6), (9.6, 9.6))
     ax.text(10.05, 11.6, "no", fontsize=TEXT_SIZE - 1, rotation=90, va="center")
-    arrow(ax, (jx, 15.05), (jx, 14.05), text="yes", text_dx=0.3)
-    arrow(ax, (jx - 2.1, 13.2), (1.45, 12.5), text="yes", text_dx=-0.6)
-    ax.plot([1.45, 1.45], [10.7, 10.0], color="#333333", lw=1.1)
-    arrow(ax, (1.45, 10.0), (jx - 2.0, 10.0))
-    arrow(ax, (jx, 12.35), (jx, 10.6), text="no", text_dx=0.3)
-    arrow(ax, (jx, 9.4), (jx, 8.6))
-    arrow(ax, (jx, 7.2), (jx, 6.25))
+    arrow(ax, (cx - 1.0, 15.1), (jx, 14.0), text="yes", text_dx=0.3)
+    arrow(ax, (jx, 12.8), (jx, 12.05))
+    arrow(ax, (jx, 10.15), (jx, 9.35))
+    arrow(ax, (jx, 7.45), (jx, 6.25))
     ax.set_title("Adaptive masking — solver_options={'masking': 'adaptive'}", fontsize=11, pad=14)
     return fig
 

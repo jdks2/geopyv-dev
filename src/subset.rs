@@ -33,8 +33,8 @@
 
 use std::sync::Arc;
 
-use nalgebra::{DMatrix, DVector, SMatrix, SVector};
-use ndarray::{Array1, Array2, ArrayView2, ArrayView3, Axis};
+use nalgebra::{DMatrix, DVector, SMatrix};
+use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -48,10 +48,6 @@ use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, seam
 type WarpMat3 = SMatrix<f64, 3, 3>;
 /// 6×6 warp matrix for order-2 homogeneous representation.
 type WarpMat6 = SMatrix<f64, 6, 6>;
-/// 6-element B-spline polynomial vector.
-type SplineVec = SVector<f64, 6>;
-/// 6×6 QCQT block (B-spline coefficient matrix for one pixel).
-type QcqtBlock = SMatrix<f64, 6, 6>;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -190,126 +186,33 @@ fn default_solve_method() -> SolveMethod {
 // B-spline helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the 6×6 QCQT block for pixel (row = `yf`, col = `xf`).
-///
-/// QCQT is stored block-contiguous `(rows, cols, 36)` — the block is one
-/// contiguous 36-run, `[r*6 + c]` (see [`crate::image::Image::qcqt`]).
-#[inline]
-fn qcqt_block(qcqt: &ArrayView3<f64>, yf: usize, xf: usize) -> QcqtBlock {
-    let b = qcqt.index_axis(Axis(0), yf);
-    let b = b.index_axis(Axis(0), xf); // contiguous 36-run for pixel (yf, xf)
-    QcqtBlock::from_fn(|r, c| b[r * 6 + c])
-}
-
 /// Evaluate the bi-quintic B-spline at sub-pixel coordinate `(x, y)`.
 ///
-/// `x` drives the QCQT **column** index (`xf = x.floor()`).
-/// `y` drives the QCQT **row**    index (`yf = y.floor()`).
-///
-/// Formula: `intensity = dy_vec^T · QCQT_block · dx_vec`
-/// where `dx_vec = [1, dx, dx², dx³, dx⁴, dx⁵]` and similarly for `dy_vec`.
-///
-/// Matches `_intensity` in `_subset.cpp` exactly, including the clamp to avoid
-/// out-of-bounds access. `(x, y)` are clamped into the valid domain *before*
+/// `x` is the column, `y` the row. Formula `intensity = dyᵀ · Q·C_b·Qᵀ · dx`
+/// with `dx = [1, dx, …, dx⁵]`, evaluated from the coefficient block C_b
+/// (see [`crate::image`]). `(x, y)` are clamped into the valid domain *before*
 /// `xf`/`dx` are derived (not just `xf` on its own) — clamping only `xf`
 /// while leaving `dx = x - xf` unbounded lets a far-out-of-range query
 /// produce a `dx` of thousands or millions, and `dx⁵` in the quintic basis
-/// then explodes instead of saturating. Clamping `x`/`y` first keeps
-/// `dx`/`dy` in `[0, 1)` always, so in-bounds queries are completely
-/// unaffected and out-of-bounds ones saturate to the boundary pixel's edge
-/// value instead of blowing up.
+/// then explodes instead of saturating. In-bounds queries are unaffected and
+/// out-of-bounds ones saturate to the boundary pixel's edge value.
 #[inline]
-fn bspline_eval(x: f64, y: f64, qcqt: &ArrayView3<f64>) -> f64 {
-    let qrows = qcqt.shape()[0];
-    let qcols = qcqt.shape()[1];
-    let x = x.clamp(0.0, qcols as f64 - 1e-9);
-    let y = y.clamp(0.0, qrows as f64 - 1e-9);
-    let xf = x.floor() as usize;
-    let yf = y.floor() as usize;
-    let dx = x - xf as f64;
-    let dy = y - yf as f64;
-
-    let dx_v = poly_vec(dx);
-    let dy_v = poly_vec(dy);
-    let block = qcqt_block(qcqt, yf, xf);
-    dy_v.dot(&(block * dx_v))
+fn bspline_eval(x: f64, y: f64, img: &Image) -> f64 {
+    img.eval(x, y)
 }
 
-/// Evaluate the B-spline gradient in both coordinate directions at `(x, y)`.
-///
-/// Returns `[grad_x, grad_y]`.
-/// - `grad_x`: derivative in the `x` (column) direction.
-///   `dx_vec = [0, 1, 0, 0, 0, 0]`, `dy_vec = [1, dy, dy², ...]`.
-/// - `grad_y`: derivative in the `y` (row) direction.
-///   `dx_vec = [1, dx, dx², ...]`, `dy_vec = [0, 1, 0, 0, 0, 0]`.
-///
-/// Matches `_grad` in `_subset.cpp` exactly. Clamps `(x, y)` before deriving
-/// `xf`/`dx` for the same reason as `bspline_eval` — see its doc comment.
+/// Evaluate the B-spline gradient `[grad_x, grad_y]` at `(x, y)` (same clamp
+/// as [`bspline_eval`]).
 #[inline]
-fn bspline_grad(x: f64, y: f64, qcqt: &ArrayView3<f64>) -> [f64; 2] {
-    let qrows = qcqt.shape()[0];
-    let qcols = qcqt.shape()[1];
-    let x = x.clamp(0.0, qcols as f64 - 1e-9);
-    let y = y.clamp(0.0, qrows as f64 - 1e-9);
-    let xf = x.floor() as usize;
-    let yf = y.floor() as usize;
-    let dx = x - xf as f64;
-    let dy = y - yf as f64;
-    let block = qcqt_block(qcqt, yf, xf);
-
-    // x-direction: derivative basis in x, standard basis in y
-    let dx_deriv = SplineVec::new(0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
-    let dy_std = poly_vec(dy);
-    let grad_x = dy_std.dot(&(block * dx_deriv));
-
-    // y-direction: standard basis in x, derivative basis in y
-    let dx_std = poly_vec(dx);
-    let dy_deriv = SplineVec::new(0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
-    let grad_y = dy_deriv.dot(&(block * dx_std));
-
-    [grad_x, grad_y]
+fn bspline_grad(x: f64, y: f64, img: &Image) -> [f64; 2] {
+    img.eval_grad(x, y).1
 }
 
-/// Fused [`bspline_eval`] + [`bspline_grad`] — one clamp, one block gather,
-/// one pair of basis vectors (`geopyv_dev_fresh/layer_rg_plan.md` §11.3).
-///
-/// Bit-identical to calling both separately: `value` uses the exact
-/// expression `bspline_eval` does; `grad_x` / `grad_y` use the exact
-/// expressions `bspline_grad` does (`block · dx_v` and `block · deriv` are
-/// each formed once and reused across the three dot products).
+/// Fused [`bspline_eval`] + [`bspline_grad`] — one clamp, one block gather.
+/// Bit-identical to calling both separately.
 #[inline]
-fn bspline_eval_grad(x: f64, y: f64, qcqt: &ArrayView3<f64>) -> (f64, [f64; 2]) {
-    let qrows = qcqt.shape()[0];
-    let qcols = qcqt.shape()[1];
-    let x = x.clamp(0.0, qcols as f64 - 1e-9);
-    let y = y.clamp(0.0, qrows as f64 - 1e-9);
-    let xf = x.floor() as usize;
-    let yf = y.floor() as usize;
-    let dx = x - xf as f64;
-    let dy = y - yf as f64;
-    let block = qcqt_block(qcqt, yf, xf);
-
-    let dx_v = poly_vec(dx);
-    let dy_v = poly_vec(dy);
-    let deriv = SplineVec::new(0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
-
-    let bx = block * dx_v; // block · [1, dx, …, dx⁵]
-    let bd = block * deriv; // block · [0, 1, 0, 0, 0, 0]
-
-    let value = dy_v.dot(&bx);
-    let grad_x = dy_v.dot(&bd);
-    let grad_y = deriv.dot(&bx);
-    (value, [grad_x, grad_y])
-}
-
-/// Build the B-spline polynomial basis vector `[1, t, t², t³, t⁴, t⁵]`.
-#[inline]
-fn poly_vec(t: f64) -> SplineVec {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    let t4 = t3 * t;
-    let t5 = t4 * t;
-    SplineVec::new(1.0, t, t2, t3, t4, t5)
+fn bspline_eval_grad(x: f64, y: f64, img: &Image) -> (f64, [f64; 2]) {
+    img.eval_grad(x, y)
 }
 
 // ---------------------------------------------------------------------------
@@ -941,7 +844,7 @@ impl Subset {
             n_px: n,
         };
 
-        let qv = f_img.qcqt.view();
+        let qv: &Image = &f_img;
 
         // f_coords[i] = coords[i] + coord  (matches _f_coords in C++)
         let mut f_coords = Array2::zeros((n, 2));
@@ -957,7 +860,7 @@ impl Subset {
         let mut f = Array1::<f64>::zeros(n);
         let mut grad_f = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
-            let (fi, [gx, gy]) = bspline_eval_grad(f_coords[[i, 0]], f_coords[[i, 1]], &qv);
+            let (fi, [gx, gy]) = bspline_eval_grad(f_coords[[i, 0]], f_coords[[i, 1]], qv);
             f[i] = fi;
             grad_f[[i, 0]] = gx;
             grad_f[[i, 1]] = gy;
@@ -1162,7 +1065,7 @@ impl Subset {
         let expected = p_len(self.subset_order);
         let mut p = p_0.map(|v| v.to_vec()).unwrap_or_else(|| vec![0.0; expected]);
         p.resize(expected, 0.0);
-        let gv = g_img.qcqt.view();
+        let gv: &Image = &g_img;
 
         // Precompute SDI and Hessian (constant in ICGN); invert once --
         // ICGN's Hessian is loop-invariant (layer_rg_plan.md §11.1).
@@ -1180,7 +1083,7 @@ impl Subset {
         for iteration in 1..=max_iterations {
             apply_warp_into(&mut gc, self.coord, &p, f_coords);
             for i in 0..n {
-                g[i] = bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv);
+                g[i] = bspline_eval(gc[[i, 0]], gc[[i, 1]], gv);
             }
             let g_m = g.sum() / n as f64;
             let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
@@ -1254,7 +1157,7 @@ impl Subset {
         let expected = p_len(self.subset_order);
         let mut p = p_0.map(|v| v.to_vec()).unwrap_or_else(|| vec![0.0; expected]);
         p.resize(expected, 0.0);
-        let gv = g_img.qcqt.view();
+        let gv: &Image = &g_img;
 
         let mut history = Vec::with_capacity(max_iterations);
         let mut converged = false;
@@ -1268,7 +1171,7 @@ impl Subset {
 
             let gc = apply_warp(self.coord, &p, f_coords);
             g = (0..n)
-                .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
+                .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], gv))
                 .collect();
             let g_m = g.sum() / n as f64;
             let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
@@ -1276,7 +1179,7 @@ impl Subset {
             // Gradient at target positions
             let mut grad_g = Array2::zeros((n, 2));
             for i in 0..n {
-                let [gx, gy] = bspline_grad(gc[[i, 0]], gc[[i, 1]], &gv);
+                let [gx, gy] = bspline_grad(gc[[i, 0]], gc[[i, 1]], gv);
                 grad_g[[i, 0]] = gx;
                 grad_g[[i, 1]] = gy;
             }
@@ -1361,10 +1264,10 @@ impl Subset {
         let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
 
         let n = f_coords.nrows();
-        let gv = g_img.qcqt.view();
+        let gv: &Image = &g_img;
         let gc = apply_warp(self.coord, p, f_coords);
         let g: Array1<f64> = (0..n)
-            .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], &gv))
+            .map(|i| bspline_eval(gc[[i, 0]], gc[[i, 1]], gv))
             .collect();
         let g_m = g.sum() / n as f64;
         let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
@@ -1649,14 +1552,14 @@ mod tests {
             }),
             6,
         );
-        let qv = img.qcqt.view();
+        let qv = &img;
         for &(x, y) in &[
             (3.25, 4.75), (10.0, 12.0), (0.0, 0.0), (15.999, 9.001),
             (7.5, 0.5), (-3.0, 40.0), (1e6, -1e6),
         ] {
-            let v_ref = bspline_eval(x, y, &qv);
-            let g_ref = bspline_grad(x, y, &qv);
-            let (v, g) = bspline_eval_grad(x, y, &qv);
+            let v_ref = bspline_eval(x, y, qv);
+            let g_ref = bspline_grad(x, y, qv);
+            let (v, g) = bspline_eval_grad(x, y, qv);
             assert_eq!(v_ref.to_bits(), v.to_bits(), "value at ({x},{y})");
             assert_eq!(g_ref[0].to_bits(), g[0].to_bits(), "grad_x at ({x},{y})");
             assert_eq!(g_ref[1].to_bits(), g[1].to_bits(), "grad_y at ({x},{y})");
@@ -1775,61 +1678,43 @@ mod tests {
     }
 
     /// B-spline evaluation on a constant image returns that constant.
-    ///
-    /// For a constant image `val`, all B-spline coefficients = `val`, and
-    /// the QCQT block [0,0] entry = `val` (Q row 0 sums to 1; all others = 0).
-    /// Evaluating at integer coordinates (dx=dy=0): intensity = val.
     #[test]
     fn test_bspline_eval_constant_image() {
-        // Build a tiny constant QCQT (enough for 2×2 pixels)
-        // For a constant image `val`, QCQT block[0, 0] = val, rest 0
-        // (because Q row-0 = [1/120, 13/60, 11/20, 13/60, 1/120, 0] sums to 1,
-        //  and at dx=dy=0 only the constant term contributes).
         let val = 42.0_f64;
-        let mut qcqt = ndarray::Array3::zeros((2, 2, 36)); // 2×2 pixels
-        // At each pixel: block[0] (== old block[0,0]) = val, rest 0
-        qcqt[[0, 0, 0]] = val;
-        qcqt[[0, 1, 0]] = val;
-        qcqt[[1, 0, 0]] = val;
-        qcqt[[1, 1, 0]] = val;
+        let img = Image::from_array(Array2::from_elem((4, 4), val), 5);
+        for &(x, y) in &[(0.0, 0.0), (1.5, 2.25), (3.0, 3.0)] {
+            let result = bspline_eval(x, y, &img);
+            assert!((result - val).abs() < 1e-8 * val, "expected {val}, got {result}");
+        }
+    }
 
-        let result = bspline_eval(0.0, 0.0, &qcqt.view());
-        assert!(
-            (result - val).abs() < 1e-12,
-            "expected {val}, got {result}"
-        );
+    /// A small non-constant image for the clamp tests: an unbounded `dx`
+    /// would blow up through `dx⁵` (a constant image would not tell).
+    fn wavy_image() -> Image {
+        Image::from_array(
+            Array2::from_shape_fn((8, 9), |(y, x)| {
+                100.0 + ((x as f64) * 1.3).sin() * 20.0 + ((y as f64) * 0.8).cos() * 10.0
+            }),
+            5,
+        )
     }
 
     /// A far out-of-range query must saturate to the boundary pixel's edge
     /// value, not explode.
     ///
     /// Before the clamp fix, only `xf` was clamped into range while
-    /// `dx = x - xf` was left unbounded, so a query far outside the QCQT
-    /// domain (e.g. `x = 1_000_000`) produced a `dx` of the same enormous
+    /// `dx = x - xf` was left unbounded, so a query far outside the image
+    /// (e.g. `x = 1_000_000`) produced a `dx` of the same enormous
     /// magnitude, and `dx⁵` in the quintic basis exploded instead of
     /// saturating (originally found via TV-DIC's `warp_image`, which could
     /// sample far outside the image once a displacement estimate diverged —
     /// see `mds/TV_DIC_abandoned.md`).
     #[test]
     fn test_bspline_eval_clamps_far_out_of_range_query() {
-        // 1×1-pixel QCQT block: constant term 100, plus a nonzero dx⁵
-        // coefficient so an unbounded dx would actually blow the result up
-        // (a purely constant image wouldn't distinguish the two behaviours).
-        let mut qcqt = ndarray::Array3::zeros((1, 1, 36));
-        qcqt[[0, 0, 0]] = 100.0; // constant term
-        qcqt[[0, 0, 5]] = 1.0; // dx⁵ coefficient
-
-        let far_out = bspline_eval(1_000_000.0, 0.0, &qcqt.view());
-        assert!(far_out.is_finite(), "far out-of-range query exploded: {far_out}");
-        assert!(
-            far_out.abs() < 200.0,
-            "expected the query to saturate near the boundary pixel value \
-             (~101), got {far_out} -- clamp is not bounding dx"
-        );
-
-        // Should saturate to (essentially) the same value as querying right
-        // at the boundary edge.
-        let at_edge = bspline_eval(0.999_999, 0.0, &qcqt.view());
+        let img = wavy_image();
+        let far_out = bspline_eval(1_000_000.0, 0.0, &img);
+        assert!(far_out.is_finite() && far_out.abs() < 200.0, "far out-of-range query exploded: {far_out}");
+        let at_edge = bspline_eval(9.0 - 1e-9, 0.0, &img);
         assert!(
             (far_out - at_edge).abs() < 1e-3,
             "far out-of-range query should match the boundary edge value: \
@@ -1838,16 +1723,11 @@ mod tests {
     }
 
     /// Same guarantee as `test_bspline_eval_clamps_far_out_of_range_query`,
-    /// for `bspline_grad` — a far out-of-range gradient query must stay
-    /// bounded rather than exploding via the same unclamped-`dx` mechanism.
+    /// for `bspline_grad`.
     #[test]
     fn test_bspline_grad_clamps_far_out_of_range_query() {
-        let mut qcqt = ndarray::Array3::zeros((1, 1, 36));
-        qcqt[[0, 0, 0]] = 100.0;
-        qcqt[[0, 0, 5]] = 1.0;
-        qcqt[[0, 0, 30]] = 1.0; // dy⁵ coefficient ([5*6+0]), for the y-direction half
-
-        let [gx, gy] = bspline_grad(1_000_000.0, -1_000_000.0, &qcqt.view());
+        let img = wavy_image();
+        let [gx, gy] = bspline_grad(1_000_000.0, -1_000_000.0, &img);
         assert!(gx.is_finite() && gy.is_finite(), "grad exploded: [{gx}, {gy}]");
         assert!(
             gx.abs() < 200.0 && gy.abs() < 200.0,

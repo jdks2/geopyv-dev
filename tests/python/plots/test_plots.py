@@ -466,7 +466,7 @@ class TestContourField:
 @pytest.fixture(scope="module")
 def solved_field_meshless(solved_mesh):
     field = Field(sequence_solution=solved_mesh)
-    field.solve()  # strain_method=None -> meshless, the default
+    field.solve()  # strain_method=None -> the subset average, the default (gradient pass as meshless)
     return field
 
 

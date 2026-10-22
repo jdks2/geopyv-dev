@@ -159,12 +159,13 @@ impl PyField {
     /// true_incs : bool, optional
     ///     Logarithmic strain increments. Default ``True``.
     /// strain_method : MeshlessParams or False, optional
-    ///     ``None`` (default): meshless (IRLS-robust MLS) strain estimator
-    ///     with default ``MeshlessParams`` -- the package-wide default. A
-    ///     ``MeshlessParams`` instance: meshless with those parameters.
-    ///     ``False``: force the original mesh-element (shape-function)
-    ///     interpolation instead -- retained for comparison, no longer the
-    ///     default.
+    ///     ``None`` (default): the subset average -- each particle takes the
+    ///     weighted average of the warps of every subset whose template holds
+    ///     it and whose cuts (adaptive masking) keep it, each evaluated at the
+    ///     particle; the most accurate option. A ``MeshlessParams`` instance:
+    ///     the meshless (IRLS-robust MLS) fit to node displacements with those
+    ///     parameters. ``False``: mesh-element (shape-function) interpolation.
+    ///     Both are retained for comparison.
     #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None, strain_method=None))]
     fn solve(
         &mut self,

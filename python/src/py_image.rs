@@ -73,13 +73,13 @@ impl PyImage {
     ///
     /// The B-spline block for pixel (i, j) is `qcqt[i*6:i*6+6, j*6:j*6+6]`.
     ///
-    /// Internally the core stores this block-contiguous `(H, W, 36)`
-    /// (`layer_rg_plan.md` §11.5); this getter re-interleaves to the
-    /// historical `(H*6, W*6)` layout so the Python-visible shape and
-    /// block-indexing convention are unchanged.
+    /// The core no longer stores this (it keeps only the B-spline
+    /// coefficients, 1/36 of the memory); the blocks are built on request
+    /// here, in the historical `(H*6, W*6)` layout, so the Python-visible
+    /// shape and block-indexing convention are unchanged.
     #[getter]
     fn qcqt<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let q3 = &self.inner.qcqt; // (rows, cols, 36), block-contiguous
+        let q3 = self.inner.qcqt(); // (rows, cols, 36), block-contiguous
         let (rows, cols, _) = q3.dim();
         let mut out = numpy::ndarray::Array2::<f64>::zeros((rows * 6, cols * 6));
         for i in 0..rows {
