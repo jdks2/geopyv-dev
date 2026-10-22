@@ -2267,7 +2267,7 @@ mod tests {
             seams: Some(SeamRecord {
                 plain_coord: [100.0, 99.0],
                 plain_p: vec![0.49, 0.1, 0.012, 0.0, 0.0, 0.02],
-                jolt: Some([1.5, 0.0]),
+                moved: Some([1.5, 0.0]),
                 action: SeamAction::Cut,
                 lines: vec![line],
                 gap: 3.0,

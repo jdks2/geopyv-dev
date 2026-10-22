@@ -231,7 +231,7 @@ def _draw_seam_overlay(ax, rec, centre, size):
         ax.plot([a[0], b[0]], [a[1], b[1]], color="#d62828", lw=1.5, zorder=7)
 
 
-_STAGE_NAMES = {"pass1": "pass 1", "pass1jolted": "pass 1 after jolt", "pass2": "pass 2 (cut)"}
+_STAGE_NAMES = {"pass1": "pass 1", "pass1jolted": "pass 1 after jolt", "pass2": "pass 2 (cut, moved)"}
 
 
 def _seam_score_text(rec):
@@ -248,7 +248,7 @@ def _seam_score_text(rec):
 
 
 def _picked_pass1(rec, lv):
-    """(T_edge, T_bend) of the pass-1 decision (after any jolt)."""
+    """(T_edge, T_bend) of the pass-1 decision."""
     ps = [p for p in rec["passes"] if p["stage"] != "pass2"][-1]
     th = ps["hinge"]["T"] if ps["hinge"] else 0.0
     tj = ps["jump"]["T"] if ps["jump"] else 0.0
@@ -313,7 +313,7 @@ def inspect_mesh(mesh, subset_idx=None, show_areas=False, ax=None,
     ``seams`` : {"actions", "scores"}, optional
         After ``solver_options={"masking": "adaptive"}``. ``"actions"``: nodes
         coloured by what was done (left, order 2, cut, cut + order 2, two
-        cuts), cut lines in red, jolted nodes linked to where they started;
+        cuts), cut lines in red, moved nodes linked to where they started;
         ``sent=True`` also rings the nodes the screen sent on. ``"scores"``:
         edge score against bending score for every node sent on, with the
         alarm and margin lines.
@@ -438,7 +438,7 @@ def _inspect_mesh_actions(mesh, sent, ax, show, block, save, **kwargs):
         ax.add_collection(LineCollection(np.stack([plain[moved], nodes[moved]], axis=1),
                                          colors="k", linewidths=0.8, zorder=8))
         ax.scatter(plain[moved, 0], plain[moved, 1], s=10, facecolors="none", edgecolors="k",
-                   lw=0.6, zorder=8, label=f"jolted from ({int(moved.sum())})")
+                   lw=0.6, zorder=8, label=f"moved from ({int(moved.sum())})")
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=7, markerscale=2, frameon=False)
     ax.set_title(f"Noise: {sm['noise_source']}", fontsize=9)
     ax.set_axis_off()
@@ -1062,9 +1062,10 @@ def contour_field(field, quantity, window=None, increment=None, mode="leapfrog",
     increment instead of the initial ones (same triangles).
 
     gamma_max_grad requires the Field to have been solved via
-    Field.solve() with strain_method left as meshless (the default) --
-    the spatial gradient of gamma_max is computed once, at solve time,
-    using the exact MeshlessParams the solve itself used.
+    Field.solve() with strain_method left as the default or a
+    MeshlessParams -- the spatial gradient of gamma_max is computed once,
+    at solve time, with those MeshlessParams (the defaults under the
+    default subset average).
     """
     _require_solved(field)
     valid = {"u", "v", "R", "ep_xx", "ep_yy", "ep_xy", "ep_vol",

@@ -151,6 +151,8 @@ def test_sequence_uses_frames_zero_one_for_noise(frames):
 # checked against the sandbox reference (screen_all.pkl, wd10 low noise) and
 # match exactly. A ~1e-13 px run-to-run wobble in the plain solve can flip a
 # handful of borderline cut/leave decisions, so action counts get a margin.
+# The action counts are those of cut -> move to the kept side's centre of area
+# -> re-test (geopyv_dev_pub/docs/centroid_jolt_report.pdf).
 # ---------------------------------------------------------------------------
 
 import os

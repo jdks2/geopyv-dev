@@ -2,11 +2,21 @@
 //! 
 //! Image loading and bi-quintic B-spline precomputation.
 //!
-//! # Memory note (architectural candidate)
+//! # Memory
 //!
-//! `qcqt` is a `(rows*6) × (cols*6)` dense f64 array. For a 1001×1001 image
-//! that is ≈ 288 MB. A lazy/chunked representation would reduce peak memory
-//! significantly. Propose to the user before implementing.
+//! Only the B-spline coefficient array C is stored (one f64 per pixel). An
+//! evaluation forms the 6×6 block Q·C_b·Qᵀ's action directly from the 6×6
+//! block C_b around the point:
+//!
+//! ```text
+//! value  = dyᵀ Q C_b Qᵀ dx = (Qᵀdy)ᵀ C_b (Qᵀdx)
+//! grad_x = (Qᵀdy)ᵀ C_b q₁,   grad_y = q₁ᵀ C_b (Qᵀdx),   q₁ = Qᵀe₁
+//! ```
+//!
+//! with `dx = [1, t, …, t⁵]`. This is the interpolant the per-pixel QCQT
+//! blocks gave (agreement ~1e-13) at 1/36 of the memory: the old
+//! `(rows, cols, 36)` array was ≈ 1.15 GB for a 2001×2001 image. The QCQT
+//! blocks are still available, built on request, through [`get_qcqt`].
 //!
 //! # Tolerance tiers
 //! - `get_c`    Tier B  rtol = 1e-8   (FFT-based computation)
@@ -34,14 +44,10 @@ pub const DEFAULT_BORDER: usize = 20;
 pub struct Image {
     /// Grayscale pixel intensities (height × width), values 0.0–255.0.
     pub image_gs: Array2<f64>,
-    /// Pre-computed Q·C_block·Qᵀ for every pixel, **block-contiguous**:
-    /// shape `(rows, cols, 36)`, the block for pixel `(i, j)` is the
-    /// contiguous slice `qcqt.slice(s![i, j, ..])` laid out row-major
-    /// (`[r*6 + c]`). This is the `layer_rg_plan.md` §11.5 layout — the
-    /// old `(rows*6, cols*6)` array scattered a block's 6 rows `cols*6*8`
-    /// bytes apart, hostile to the `bspline_eval` gather that runs
-    /// `n_px * iters * nodes` times.
-    pub qcqt: Array3<f64>,
+    /// B-spline coefficients C, shape `(rows + 2·border, cols + 2·border)`,
+    /// standard (row-major) layout. Pixel `(i, j)`'s 6×6 block starts at
+    /// `C[i + border − 2, j + border − 2]`.
+    pub coef: Array2<f64>,
     /// Border used for padding during B-spline coefficient computation. Must be ≥ 3.
     pub border: usize,
     /// File path used to load the image; `None` when constructed from an array.
@@ -71,10 +77,117 @@ impl Image {
     /// Useful for testing and for the PyO3 wrapper when cv2 has already
     /// performed loading and Gaussian pre-filtering on the Python side.
     pub fn from_array(image_gs: Array2<f64>, border: usize) -> Self {
-        let c = get_c(&image_gs, border);
-        let qcqt = get_qcqt(&image_gs, &c, border);
-        Self { image_gs, qcqt, border, filepath: None }
+        let coef = get_c(&image_gs, border);
+        Self { image_gs, coef, border, filepath: None }
     }
+
+    /// Per-pixel Q·C_b·Qᵀ blocks `(rows, cols, 36)`, built on request (not
+    /// stored; ≈ 288 B per pixel).
+    pub fn qcqt(&self) -> Array3<f64> {
+        get_qcqt(&self.image_gs, &self.coef, self.border)
+    }
+
+    /// Bi-quintic value and gradient `[d/dx, d/dy]` at `(x = column, y = row)`.
+    ///
+    /// `(x, y)` are clamped into the image *before* the floor, so `dx`, `dy`
+    /// stay in `[0, 1)` and an out-of-range query saturates to the boundary
+    /// pixel's edge value instead of exploding through `dx⁵`.
+    #[inline]
+    pub(crate) fn eval_grad(&self, x: f64, y: f64) -> (f64, [f64; 2]) {
+        let (cb, cq, a) = self.rows(x, y);
+        let (mut val, mut gx, mut gy) = (0.0, 0.0, 0.0);
+        for r in 0..6 {
+            val += a[r] * cb[r];
+            gx += a[r] * cq[r];
+            gy += Q1[r] * cb[r];
+        }
+        (val, [gx, gy])
+    }
+
+    /// Value only (same expression as the value in [`Self::eval_grad`]).
+    #[inline]
+    pub(crate) fn eval(&self, x: f64, y: f64) -> f64 {
+        let (h, w) = self.image_gs.dim();
+        let x = x.clamp(0.0, w as f64 - 1e-9);
+        let y = y.clamp(0.0, h as f64 - 1e-9);
+        let (xf, yf) = (x.floor() as usize, y.floor() as usize);
+        let a = qt_poly(y - yf as f64);
+        let b = qt_poly(x - xf as f64);
+        let (r0, c0) = (yf + self.border - 2, xf + self.border - 2);
+        let (c, cw) = (self.coef.as_slice().expect("C is standard layout"), self.coef.ncols());
+        let mut val = 0.0;
+        for r in 0..6 {
+            let o = (r0 + r) * cw + c0;
+            let row = &c[o..o + 6];
+            let mut s = 0.0;
+            for k in 0..6 {
+                s += row[k] * b[k];
+            }
+            val += a[r] * s;
+        }
+        val
+    }
+
+    /// The rows of the 6×6 coefficient block around `(x, y)` contracted with
+    /// `Qᵀdx` (`cb`) and with `q₁` (`cq`), and `Qᵀdy` (`a`).
+    #[inline]
+    fn rows(&self, x: f64, y: f64) -> ([f64; 6], [f64; 6], [f64; 6]) {
+        let (h, w) = self.image_gs.dim();
+        let x = x.clamp(0.0, w as f64 - 1e-9);
+        let y = y.clamp(0.0, h as f64 - 1e-9);
+        let (xf, yf) = (x.floor() as usize, y.floor() as usize);
+        let a = qt_poly(y - yf as f64);
+        let b = qt_poly(x - xf as f64);
+        let (r0, c0) = (yf + self.border - 2, xf + self.border - 2);
+        let (c, cw) = (self.coef.as_slice().expect("C is standard layout"), self.coef.ncols());
+        let mut cb = [0.0f64; 6];
+        let mut cq = [0.0f64; 6];
+        for r in 0..6 {
+            let o = (r0 + r) * cw + c0;
+            let row = &c[o..o + 6];
+            let (mut s, mut t) = (0.0, 0.0);
+            for k in 0..6 {
+                s += row[k] * b[k];
+                t += row[k] * Q1[k];
+            }
+            cb[r] = s;
+            cq[r] = t;
+        }
+        (cb, cq, a)
+    }
+}
+
+/// q₁ = Qᵀe₁: the derivative basis `[0, 1, 0, 0, 0, 0]` pushed through Qᵀ
+/// (row 1 of Q).
+const Q1: [f64; 6] = Q[1];
+
+/// Q as a constant table (same values as [`q_matrix`]).
+#[rustfmt::skip]
+const Q: [[f64; 6]; 6] = [
+    [ 1.0/120.0,  13.0/60.0,  11.0/20.0,  13.0/60.0,  1.0/120.0,  0.0],
+    [-1.0/24.0,  -5.0/12.0,   0.0,         5.0/12.0,   1.0/24.0,   0.0],
+    [ 1.0/12.0,   1.0/6.0,   -1.0/2.0,     1.0/6.0,    1.0/12.0,   0.0],
+    [-1.0/12.0,   1.0/6.0,    0.0,        -1.0/6.0,    1.0/12.0,   0.0],
+    [ 1.0/24.0,  -1.0/6.0,    1.0/4.0,    -1.0/6.0,    1.0/24.0,   0.0],
+    [-1.0/120.0,  1.0/24.0,  -1.0/12.0,    1.0/12.0,  -1.0/24.0,   1.0/120.0],
+];
+
+/// Qᵀ·[1, t, t², t³, t⁴, t⁵].
+#[inline]
+fn qt_poly(t: f64) -> [f64; 6] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let t4 = t3 * t;
+    let p = [1.0, t, t2, t3, t4, t4 * t];
+    let mut out = [0.0; 6];
+    for k in 0..6 {
+        let mut s = 0.0;
+        for r in 0..6 {
+            s += Q[r][k] * p[r];
+        }
+        out[k] = s;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +520,39 @@ mod tests {
         assert!((qcqt[[5, 5, 0]] - val).abs() < 1e-10, "block[0] = {}", qcqt[[5, 5, 0]]);
         for k in 1..36 {
             assert!(qcqt[[5, 5, k]].abs() < 1e-10, "block[{k}] = {}", qcqt[[5, 5, k]]);
+        }
+    }
+
+    /// The coefficient-block evaluation equals the per-pixel QCQT block
+    /// formula `dyᵀ·QCQT·dx` (value and both gradients).
+    #[test]
+    fn test_eval_matches_qcqt_blocks() {
+        let img = Image::from_array(
+            Array2::from_shape_fn((24, 28), |(y, x)| {
+                60.0 + ((x as f64) * 0.9).sin() * 20.0 + ((y as f64) * 0.7).cos() * 15.0
+            }),
+            6,
+        );
+        let q3 = img.qcqt();
+        let p = |t: f64| [1.0, t, t * t, t.powi(3), t.powi(4), t.powi(5)];
+        let d = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        for &(x, y) in &[(3.25f64, 4.75f64), (10.0, 12.0), (0.0, 0.0), (15.999, 9.001), (7.5, 0.5), (26.3, 22.9)] {
+            let (xf, yf) = (x.floor() as usize, y.floor() as usize);
+            let (px, py) = (p(x - xf as f64), p(y - yf as f64));
+            let form = |a: &[f64; 6], b: &[f64; 6]| {
+                let mut s = 0.0;
+                for r in 0..6 {
+                    for c in 0..6 {
+                        s += a[r] * q3[[yf, xf, r * 6 + c]] * b[c];
+                    }
+                }
+                s
+            };
+            let (v, [gx, gy]) = img.eval_grad(x, y);
+            assert!((v - form(&py, &px)).abs() < 1e-11, "value at ({x},{y})");
+            assert!((gx - form(&py, &d)).abs() < 1e-11, "grad_x at ({x},{y})");
+            assert!((gy - form(&d, &px)).abs() < 1e-11, "grad_y at ({x},{y})");
+            assert_eq!(v.to_bits(), img.eval(x, y).to_bits(), "eval vs eval_grad at ({x},{y})");
         }
     }
 

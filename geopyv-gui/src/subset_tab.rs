@@ -779,8 +779,8 @@ impl SubsetTabState {
         meta_row(ui, "C_ZNCC", &sig3(sol.result.c_zncc));
         if let Some(rec) = &sol.seams {
             meta_row(ui, "Adaptive", &format!("{:?}", rec.action).to_lowercase());
-            if let Some(j) = rec.jolt {
-                meta_row(ui, "Jolted by", &format!("{:.1}, {:.1} px", j[0], j[1]));
+            if let Some(j) = rec.moved {
+                meta_row(ui, "Moved by", &format!("{:.1}, {:.1} px", j[0], j[1]));
             }
             if !rec.flags.is_empty() {
                 meta_row(ui, "Flags", &rec.flags.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>().join(", "));

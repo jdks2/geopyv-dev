@@ -28,11 +28,15 @@
 //!
 //! # Correction
 //!
-//! A cut line within `c_min` of the centre first **jolts** the subset (and so
-//! its node) perpendicular to the line, away from it, until the line is `c_min`
-//! away, and reruns the solve and the tests there (once). A cut masks the far
-//! side of the line (gap `g`), re-solves, and runs the tests again (pass 2):
-//! a second cut, order 2 on the cut subset, or nothing.
+//! A cut masks the far side of the line (gap `g`) and re-solves. The cut
+//! subset then **moves** (and so its node) to the centre of area of the
+//! pixels it keeps, with the line fixed in the image, and is solved again
+//! there: its result describes the kept side, so it is reported at the
+//! middle of that side, not at a centre that may lie on the line itself. The
+//! moved subset is tested again (pass 2): a second cut (then moved and
+//! re-solved again), order 2 on the cut subset, or nothing. Testing after the
+//! move matters: the moved disc can reach an edge the first disc did not
+//! (`geopyv_dev_pub/docs/centroid_jolt_report.pdf`).
 //!
 //! # Levels
 //!
@@ -57,8 +61,8 @@ use crate::{image::Image, masks::LocalMask, mesh::SolveMethod, subset::{SolveRes
 pub struct SeamConfig {
     /// Gap (px) left on the kept side of a cut line.
     pub gap: f64,
-    /// A first cut line closer than this (px) to the centre jolts the subset.
-    pub c_min: f64,
+    /// Move each cut subset to the centre of area of its kept pixels.
+    pub recentre: bool,
     /// Smallest kept fraction of the full template for a second cut.
     pub min_keep: f64,
     /// Maximum number of cuts (1 or 2).
@@ -71,7 +75,7 @@ pub struct SeamConfig {
 
 impl Default for SeamConfig {
     fn default() -> Self {
-        SeamConfig { gap: 3.0, c_min: 5.0, min_keep: 0.15, max_cuts: 2, allow_order2: true, levels: None }
+        SeamConfig { gap: 3.0, recentre: true, min_keep: 0.15, max_cuts: 2, allow_order2: true, levels: None }
     }
 }
 
@@ -141,9 +145,10 @@ pub enum SeamDecision {
 pub enum SeamStage {
     /// The plain subset at its original position.
     Pass1,
-    /// The plain subset after a jolt.
+    /// No longer produced: the plain subset after the earlier pre-cut jolt
+    /// (kept so older files still load).
     Pass1Jolted,
-    /// The cut subset.
+    /// The cut subset, after its move.
     Pass2,
 }
 
@@ -172,10 +177,10 @@ pub enum SeamAction {
 pub enum SeamFlag {
     /// The plain solve had not converged; nothing was investigated.
     PlainNotConverged,
-    /// The jolted subset could not be built or solved; the cut was made in place.
+    /// No longer produced (the earlier pre-cut jolt; kept so older files
+    /// still load).
     JoltFailed,
-    /// The node may not move that way (a geometry-defining boundary node, or
-    /// the move would distort an element); the cut was made in place.
+    /// No longer produced (as `JoltFailed`).
     JoltBlocked,
     /// The cut subset could not be solved; the plain solve is kept.
     CutFailed,
@@ -183,19 +188,28 @@ pub enum SeamFlag {
     Order2Failed,
     /// A second cut would keep less than `min_keep` of the template.
     SecondCutTooSmall,
-    /// The second cut line passed within `c_min` of the centre.
+    /// No longer produced (as `JoltFailed`).
     SecondLineNearCentre,
+    /// The mesh allowed only part of a move (it would otherwise distort an
+    /// element, or the node is on the boundary); the subset moved that far.
+    MoveLimited,
+    /// The mesh allowed no move; the subset stays where it was cut.
+    MoveBlocked,
+    /// The moved subset could not be solved; it stays where it was cut.
+    MoveFailed,
 }
 
 /// Per-subset record of the seam investigation and correction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeamRecord {
-    /// Centre before any jolt.
+    /// Centre of the plain solve, before any move.
     pub plain_coord: [f64; 2],
     /// Warp of the plain order-1 solve at `plain_coord`.
     pub plain_p: Vec<f64>,
-    /// Shift applied by the jolt, if any (final centre = `plain_coord + jolt`).
-    pub jolt: Option<[f64; 2]>,
+    /// Total move of the centre after its cuts, if any (final centre =
+    /// `plain_coord + moved`). Files from before the move hold the earlier
+    /// pre-cut jolt here.
+    pub moved: Option<[f64; 2]>,
     pub action: SeamAction,
     /// Cut lines applied, in the final subset's offsets.
     pub lines: Vec<SeamLine>,
@@ -1133,6 +1147,18 @@ impl LocalMask {
 // Driver
 // ---------------------------------------------------------------------------
 
+/// The shift a cut subset at the given centre may make towards the given
+/// full shift (to the centre of area of its kept pixels).
+pub(crate) type Mover<'m> = dyn Fn([f64; 2], [f64; 2]) -> [f64; 2] + Sync + 'm;
+
+/// A subset cut at pass 1, not yet moved: what [`Subset::seam_rest`] needs.
+pub(crate) struct SeamPending {
+    rec: SeamRecord,
+    /// Cut lines in the subset's current offsets.
+    lines: Vec<SeamLine>,
+    settings: Settings,
+}
+
 /// Solve settings of the plain solve, reused for every re-solve.
 #[derive(Clone, Copy)]
 struct Settings {
@@ -1232,9 +1258,10 @@ impl Subset {
     }
 
     /// Investigate and correct this solved order-1 subset (see the module
-    /// docs). On return the subset is the corrected one: its centre (after a
-    /// jolt), mask (after cuts), order and solution all change accordingly,
-    /// and the solution carries a [`SeamRecord`] with the plain solve.
+    /// docs). On return the subset is the corrected one: its centre (after
+    /// any move), mask (after cuts), order and solution all change
+    /// accordingly, and the solution carries a [`SeamRecord`] with the plain
+    /// solve.
     ///
     /// `local_mask` / `global_mask` must be the masks this subset was built
     /// with. `h` is the reference image's speckle correlation length
@@ -1246,21 +1273,38 @@ impl Subset {
         h: Option<f64>,
         cfg: &SeamConfig,
     ) -> Result<(), Error> {
-        self.solve_seams_with(local_mask, global_mask, h, cfg, &|away, dist| Some([away[0] * dist, away[1] * dist]))
+        self.solve_seams_with(local_mask, global_mask, h, cfg, &|_, d| d)
     }
 
-    /// [`Subset::solve_seams`] with a rule for the jolt: given the unit
-    /// direction away from the cut line and the distance the line must gain,
-    /// `jolt` returns the shift to apply, or `None` if the subset may not move
-    /// (a mesh constrains boundary nodes this way).
+    /// [`Subset::solve_seams`] with a rule for the moves: given the current
+    /// centre and the full shift to the centre of area of the kept pixels,
+    /// `mover` returns the shift to apply (all of it, part of it, or none; a
+    /// mesh limits it so no element is distorted).
     pub(crate) fn solve_seams_with<'a>(
         &mut self,
         local_mask: &'a LocalMask,
         global_mask: Option<ArrayView2<'a, u8>>,
         h: Option<f64>,
         cfg: &SeamConfig,
-        jolt: &(dyn Fn([f64; 2], f64) -> Option<[f64; 2]> + Sync),
+        mover: &Mover<'_>,
     ) -> Result<(), Error> {
+        if let Some(pending) = self.seam_first(local_mask, global_mask, h, cfg)? {
+            self.seam_rest(local_mask, global_mask, cfg, pending, mover)?;
+        }
+        Ok(())
+    }
+
+    /// Pass 1 and its correction. If the decision is a cut, the subset is
+    /// left cut but not yet moved and the returned [`SeamPending`] carries
+    /// the record on to [`Subset::seam_rest`]; otherwise the subset is final
+    /// and carries its record.
+    pub(crate) fn seam_first<'a>(
+        &mut self,
+        local_mask: &'a LocalMask,
+        global_mask: Option<ArrayView2<'a, u8>>,
+        h: Option<f64>,
+        cfg: &SeamConfig,
+    ) -> Result<Option<SeamPending>, Error> {
         self.check_seam_inputs()?;
         let h = match h {
             Some(h) => h,
@@ -1268,19 +1312,11 @@ impl Subset {
         };
         let levels = cfg.levels.unwrap_or_else(|| SeamLevels::image_free(local_mask.n_px, h));
         let plain = self.solution().cloned().expect("checked");
-        let b = Builder {
-            local_mask,
-            global_mask,
-            f_img: Arc::clone(self.f_img.as_ref().expect("checked")),
-            g_img: Arc::clone(self.g_img.as_ref().expect("checked")),
-            settings: Settings::of(&plain.result),
-            time: self.time,
-            time_source: self.time_source.clone(),
-        };
+        let b = self.builder(local_mask, global_mask, Settings::of(&plain.result));
         let mut rec = SeamRecord {
             plain_coord: self.coord,
             plain_p: plain.result.p.clone(),
-            jolt: None,
+            moved: None,
             action: SeamAction::Nothing,
             lines: Vec::new(),
             gap: cfg.gap,
@@ -1291,51 +1327,23 @@ impl Subset {
         };
         if !plain.result.converged {
             rec.flags.push(SeamFlag::PlainNotConverged);
-            return self.finish(None, rec);
+            self.finish(None, rec)?;
+            return Ok(None);
         }
 
-        // Pass 1, with at most one jolt.
-        let mut pass = investigate_pass(self, h, &levels.pass1, SeamStage::Pass1)?;
+        let pass = investigate_pass(self, h, &levels.pass1, SeamStage::Pass1)?;
         rec.passes.push(pass);
-        let mut base: Option<Subset> = None; // the plain subset after a jolt
-        if let SeamDecision::Cut(kind) = pass.decision {
-            let line = pick(&pass, kind).expect("a cut has its line");
-            if line.c.abs() < cfg.c_min {
-                let (ct, st) = (line.theta.cos(), line.theta.sin());
-                let dist = cfg.c_min - line.c.abs();
-                // Away from the line: the centre (s = 0) lies on the kept side.
-                let sign = if line.c > 0.0 { -1.0 } else { 1.0 };
-                match jolt([sign * ct, sign * st], dist) {
-                    None => rec.flags.push(SeamFlag::JoltBlocked),
-                    Some(shift) => {
-                        let coord = [self.coord[0] + shift[0], self.coord[1] + shift[1]];
-                        let p0 = shift_warp(&plain.result.p, shift);
-                        match b.solve(coord, &[], cfg.gap, 1, &p0) {
-                            Some(s) => {
-                                pass = investigate_pass(&s, h, &levels.pass1, SeamStage::Pass1Jolted)?;
-                                rec.passes.push(pass);
-                                rec.jolt = Some(shift);
-                                base = Some(s);
-                            }
-                            None => rec.flags.push(SeamFlag::JoltFailed),
-                        }
-                    }
-                }
-            }
-        }
-        let base_ref: &Subset = base.as_ref().unwrap_or(self);
-        let base_p = base_ref.solution().expect("solved").result.p.clone();
-        let coord = base_ref.coord;
-
-        let mut fin: Option<Subset> = base;
+        let p = plain.result.p.clone();
+        let coord = self.coord;
         match pass.decision {
             SeamDecision::Nothing => {}
             SeamDecision::Order2 => {
                 if cfg.allow_order2 {
-                    match b.solve(coord, &[], cfg.gap, 2, &with_zero_quadratic(&base_p)) {
+                    match b.solve(coord, &[], cfg.gap, 2, &with_zero_quadratic(&p)) {
                         Some(s) => {
-                            fin = Some(s);
                             rec.action = SeamAction::Order2;
+                            self.finish(Some(s), rec)?;
+                            return Ok(None);
                         }
                         None => rec.flags.push(SeamFlag::Order2Failed),
                     }
@@ -1343,54 +1351,121 @@ impl Subset {
             }
             SeamDecision::Cut(kind) => {
                 let l1 = pick(&pass, kind).expect("a cut has its line");
-                match b.solve(coord, &[l1], cfg.gap, 1, &base_p) {
+                match b.solve(coord, &[l1], cfg.gap, 1, &p) {
                     None => rec.flags.push(SeamFlag::CutFailed),
                     Some(cut) => {
                         rec.action = SeamAction::Cut;
-                        rec.lines.push(l1);
-                        let p2 = investigate_pass(&cut, h, &levels.pass2, SeamStage::Pass2)?;
-                        rec.passes.push(p2);
-                        let cut_p = cut.solution().expect("solved").result.p.clone();
-                        fin = Some(cut);
-                        match p2.decision {
-                            SeamDecision::Nothing => {}
-                            SeamDecision::Order2 => {
-                                if cfg.allow_order2 {
-                                    match b.solve(coord, &[l1], cfg.gap, 2, &with_zero_quadratic(&cut_p)) {
-                                        Some(s) => {
-                                            fin = Some(s);
-                                            rec.action = SeamAction::CutOrder2;
-                                        }
-                                        None => rec.flags.push(SeamFlag::Order2Failed),
-                                    }
-                                }
-                            }
-                            SeamDecision::Cut(k2) if cfg.max_cuts >= 2 => {
-                                let l2 = pick(&p2, k2).expect("a cut has its line");
-                                if l2.c.abs() < cfg.c_min {
-                                    rec.flags.push(SeamFlag::SecondLineNearCentre);
-                                }
-                                let full = local_mask.n_px as f64;
-                                if (b.n_kept(&[l1, l2], cfg.gap) as f64) < cfg.min_keep * full {
-                                    rec.flags.push(SeamFlag::SecondCutTooSmall);
-                                } else {
-                                    match b.solve(coord, &[l1, l2], cfg.gap, 1, &base_p) {
-                                        Some(s) => {
-                                            fin = Some(s);
-                                            rec.action = SeamAction::Cut2;
-                                            rec.lines.push(l2);
-                                        }
-                                        None => rec.flags.push(SeamFlag::CutFailed),
-                                    }
-                                }
-                            }
-                            SeamDecision::Cut(_) => {}
-                        }
+                        *self = cut;
+                        return Ok(Some(SeamPending { rec, lines: vec![l1], settings: b.settings }));
                     }
                 }
             }
         }
-        self.finish(fin, rec)
+        self.finish(None, rec)?;
+        Ok(None)
+    }
+
+    /// After the first cut: move to the kept side's centre of area and
+    /// re-solve, then pass 2 on the moved subset (a second cut, which is
+    /// moved and re-solved again, or order 2 on the cut subset, or nothing).
+    pub(crate) fn seam_rest<'a>(
+        &mut self,
+        local_mask: &'a LocalMask,
+        global_mask: Option<ArrayView2<'a, u8>>,
+        cfg: &SeamConfig,
+        pending: SeamPending,
+        mover: &Mover<'_>,
+    ) -> Result<(), Error> {
+        let SeamPending { mut rec, mut lines, settings } = pending;
+        let b = self.builder(local_mask, global_mask, settings);
+        self.recentre(&b, &mut lines, &mut rec, cfg, mover);
+
+        let p2 = investigate_pass(self, rec.h, &rec.levels.pass2, SeamStage::Pass2)?;
+        rec.passes.push(p2);
+        let cut_p = self.solution().expect("solved").result.p.clone();
+        let coord = self.coord;
+        match p2.decision {
+            SeamDecision::Nothing => {}
+            SeamDecision::Order2 => {
+                if cfg.allow_order2 {
+                    match b.solve(coord, &lines, cfg.gap, 2, &with_zero_quadratic(&cut_p)) {
+                        Some(s) => {
+                            *self = s;
+                            rec.action = SeamAction::CutOrder2;
+                        }
+                        None => rec.flags.push(SeamFlag::Order2Failed),
+                    }
+                }
+            }
+            SeamDecision::Cut(k2) if cfg.max_cuts >= 2 => {
+                let l2 = pick(&p2, k2).expect("a cut has its line");
+                let mut both = lines.clone();
+                both.push(l2);
+                if (b.n_kept(&both, cfg.gap) as f64) < cfg.min_keep * local_mask.n_px as f64 {
+                    rec.flags.push(SeamFlag::SecondCutTooSmall);
+                } else {
+                    match b.solve(coord, &both, cfg.gap, 1, &cut_p) {
+                        Some(s) => {
+                            *self = s;
+                            lines = both;
+                            rec.action = SeamAction::Cut2;
+                            self.recentre(&b, &mut lines, &mut rec, cfg, mover);
+                        }
+                        None => rec.flags.push(SeamFlag::CutFailed),
+                    }
+                }
+            }
+            SeamDecision::Cut(_) => {}
+        }
+        rec.lines = lines;
+        self.finish(None, rec)
+    }
+
+    /// Move this cut subset towards the centre of area of the pixels it
+    /// keeps (as far as `mover` allows), with its cut lines fixed in the
+    /// image, and solve it again there. On failure it stays where it was.
+    fn recentre(&mut self, b: &Builder, lines: &mut Vec<SeamLine>, rec: &mut SeamRecord, cfg: &SeamConfig, mover: &Mover<'_>) {
+        if !cfg.recentre {
+            return;
+        }
+        let Some(fc) = self.f_coords.as_ref() else { return };
+        let n = fc.nrows() as f64;
+        let d = [fc.column(0).sum() / n - self.coord[0], fc.column(1).sum() / n - self.coord[1]];
+        let shift = mover(self.coord, d);
+        if shift[0].hypot(shift[1]) < 1e-9 {
+            rec.flags.push(SeamFlag::MoveBlocked);
+            return;
+        }
+        let moved: Vec<SeamLine> = lines
+            .iter()
+            .map(|l| SeamLine { c: l.c - (l.theta.cos() * shift[0] + l.theta.sin() * shift[1]), ..*l })
+            .collect();
+        let p = self.solution().expect("solved").result.p.clone();
+        let coord = [self.coord[0] + shift[0], self.coord[1] + shift[1]];
+        match b.solve(coord, &moved, cfg.gap, 1, &shift_warp(&p, shift)) {
+            Some(s) => {
+                if (shift[0] - d[0]).hypot(shift[1] - d[1]) > 1e-9 {
+                    rec.flags.push(SeamFlag::MoveLimited);
+                }
+                *self = s;
+                *lines = moved;
+                let total = [coord[0] - rec.plain_coord[0], coord[1] - rec.plain_coord[1]];
+                rec.moved = Some(total);
+            }
+            None => rec.flags.push(SeamFlag::MoveFailed),
+        }
+    }
+
+    fn builder<'a>(&self, local_mask: &'a LocalMask, global_mask: Option<ArrayView2<'a, u8>>, settings: Settings) -> Builder<'a> {
+        Builder {
+            local_mask,
+            global_mask,
+            f_img: Arc::clone(self.f_img.as_ref().expect("checked")),
+            g_img: Arc::clone(self.g_img.as_ref().expect("checked")),
+            settings,
+            time: self.time,
+            time_source: self.time_source.clone(),
+        }
     }
 
     /// Adopt the corrected subset (if any) and attach the record.

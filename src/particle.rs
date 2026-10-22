@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     calibration::CalibrationParams,
+    masks::MaskShape,
     mesh::MeshSolution,
     sequence::SequenceSolution,
     Error,
@@ -372,8 +373,8 @@ impl Default for MeshlessParams {
 }
 
 /// Strain-computation method for [`Particle::solve_increment`]. Defaults to
-/// `Meshless(MeshlessParams::default())` -- the same default the Python
-/// boundary (`strain_method=None`) resolves to.
+/// `Subsets` -- the same default the Python boundary (`strain_method=None`)
+/// resolves to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StrainMethod {
     /// Locate the containing mesh element and differentiate its shape
@@ -383,11 +384,20 @@ pub enum StrainMethod {
     /// affine displacement field ([`meshless_warp_increment`]), ignoring
     /// mesh element connectivity entirely.
     Meshless(MeshlessParams),
+    /// Average the warps of the subsets themselves ([`subsets_warp_increment`]):
+    /// every subset whose template holds the point and whose cut lines
+    /// (adaptive masking) leave it on the subset's own side, each evaluated
+    /// at the point. Nothing is blended across a cut, and each subset's own
+    /// gradient is used. The most accurate of the methods on the sandbox band
+    /// images, with or without adaptive masking
+    /// (`geopyv_dev_pub/docs/refined_vs_plain_followup.pdf`). Appended last
+    /// so stored solutions keep their variant indices.
+    Subsets,
 }
 
 impl Default for StrainMethod {
     fn default() -> Self {
-        StrainMethod::Meshless(MeshlessParams::default())
+        StrainMethod::Subsets
     }
 }
 
@@ -488,6 +498,100 @@ pub fn meshless_warp_increment(
     warp[4] = cu[2]; // du/dy
     warp[5] = cv[2]; // dv/dy
     warp
+}
+
+/// Compute the warp increment for a particle at `coordinate` as the
+/// weighted average of the subsets that hold and keep it.
+///
+/// A subset holds the point if the point lies within its template (circle,
+/// square or semicircle of the mesh's `template_sizes`), and keeps it if
+/// none of its cut lines (`seams` records, in the subset's own offsets)
+/// puts the point on the far side. Each such subset's warp (order 1 or 2,
+/// the row of `p`) is evaluated at the point, and the values and gradients
+/// are averaged with weight `(1 - ρ²)²`, `ρ` the distance from the subset
+/// centre as a fraction of its template radius (half-diagonal for a
+/// square). With no such subset the nearest subset's warp at the point is
+/// used. A mesh without template sizes (files from before they were
+/// stored) falls back to [`meshless_warp_increment`] with default
+/// parameters.
+///
+/// # Returns
+/// Warp increment of length `out_len`, laid out as [`warp_increment`]'s:
+/// `[u, v, du/dx, dv/dx, du/dy, dv/dy, 0, ..., 0]`.
+pub fn subsets_warp_increment(coordinate: [f64; 2], mesh: &MeshSolution, out_len: usize) -> Array1<f64> {
+    let (Some(shape), Some(sizes)) = (mesh.template_shape.as_ref(), mesh.template_sizes.as_ref()) else {
+        return meshless_warp_increment(
+            coordinate, mesh.nodes.view(), mesh.p.view(), mesh.c_zncc.view(), &MeshlessParams::default(), out_len,
+        );
+    };
+    let records = mesh.seams.as_ref().map(|s| &s.records);
+    let n = mesh.nodes.nrows();
+    let keeps = |i: usize, dx: f64, dy: f64| {
+        records.and_then(|r| r[i].as_ref()).map_or(true, |rec| {
+            rec.lines.iter().all(|l| {
+                let s = l.theta.cos() * dx + l.theta.sin() * dy;
+                if l.c > 0.0 { s < l.c } else { s > l.c }
+            })
+        })
+    };
+    // ρ² for a point at offset (dx, dy) from a template of half-size `r`,
+    // or None if the template does not hold it.
+    let rho2 = |dx: f64, dy: f64, r: f64| -> Option<f64> {
+        match shape {
+            MaskShape::Circle => (dx * dx + dy * dy <= r * r).then(|| (dx * dx + dy * dy) / (r * r)),
+            MaskShape::Semicircle => (dx * dx + dy * dy <= r * r && dy >= 0.0).then(|| (dx * dx + dy * dy) / (r * r)),
+            MaskShape::Square => (dx.abs() <= r && dy.abs() <= r).then(|| (dx * dx + dy * dy) / (2.0 * r * r)),
+        }
+    };
+    let (mut w_sum, mut acc) = (0.0, [0.0f64; 6]);
+    for i in 0..n {
+        let dx = coordinate[0] - mesh.nodes[[i, 0]];
+        let dy = coordinate[1] - mesh.nodes[[i, 1]];
+        let Some(r2) = rho2(dx, dy, sizes[i] as f64) else { continue };
+        if !keeps(i, dx, dy) {
+            continue;
+        }
+        let w = (1.0 - r2).powi(2);
+        if w <= 0.0 {
+            continue;
+        }
+        let v = warp_at(mesh.p.row(i), dx, dy);
+        for k in 0..6 {
+            acc[k] += w * v[k];
+        }
+        w_sum += w;
+    }
+    let v = if w_sum > 0.0 {
+        acc.map(|a| a / w_sum)
+    } else {
+        let nearest = (0..n)
+            .min_by(|&a, &b| {
+                let d = |i: usize| (coordinate[0] - mesh.nodes[[i, 0]]).hypot(coordinate[1] - mesh.nodes[[i, 1]]);
+                d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        warp_at(mesh.p.row(nearest), coordinate[0] - mesh.nodes[[nearest, 0]], coordinate[1] - mesh.nodes[[nearest, 1]])
+    };
+    let mut warp = Array1::<f64>::zeros(out_len);
+    for k in 0..6.min(out_len) {
+        warp[k] = v[k];
+    }
+    warp
+}
+
+/// `[u, v, du/dx, dv/dx, du/dy, dv/dy]` of a subset warp `p` (order 1, or
+/// order 2 when it has 12 terms) at offset `(dx, dy)` from its centre.
+fn warp_at(p: ArrayView1<f64>, dx: f64, dy: f64) -> [f64; 6] {
+    let q = |k: usize| if k < p.len() { p[k] } else { 0.0 };
+    let (uxx, vxx, uxy, vxy, uyy, vyy) = (q(6), q(7), q(8), q(9), q(10), q(11));
+    [
+        q(0) + q(2) * dx + q(4) * dy + 0.5 * uxx * dx * dx + uxy * dx * dy + 0.5 * uyy * dy * dy,
+        q(1) + q(3) * dx + q(5) * dy + 0.5 * vxx * dx * dx + vxy * dx * dy + 0.5 * vyy * dy * dy,
+        q(2) + uxx * dx + uxy * dy,
+        q(3) + vxx * dx + vxy * dy,
+        q(4) + uxy * dx + uyy * dy,
+        q(5) + vxy * dx + vyy * dy,
+    ]
 }
 
 /// Robust local-affine estimate of a scalar field's value and spatial
@@ -905,8 +1009,9 @@ pub struct ParticleConfig {
     pub factor: f64,
     /// Use true (logarithmic) strain increments.
     pub true_incs: bool,
-    /// How `solve_increment` computes each increment's warp: the meshless
-    /// local fit (default) or mesh-element interpolation.
+    /// How `solve_increment` computes each increment's warp: the subset
+    /// average (default), the meshless local fit, or mesh-element
+    /// interpolation.
     #[serde(default)]
     pub strain_method: StrainMethod,
 }
@@ -957,7 +1062,9 @@ pub struct ParticleSolution {
     /// post-finalize gradient pass. `None` for solutions predating this
     /// field, for a `Particle` solved standalone (not via `Field`, so it has
     /// no neighbours to estimate a spatial gradient from), or when solved
-    /// with an explicit `StrainMethod::Mesh` -- a spatial gradient has no
+    /// with an explicit `StrainMethod::Mesh` (under `StrainMethod::Subsets`
+    /// it uses the default `MeshlessParams`, the only radius in play) -- a
+    /// spatial gradient has no
     /// meshless neighbourhood radius to be driven by in that case, and this
     /// deliberately does NOT fall back to an independent default radius
     /// (that was exactly the earlier bug: two silently-mismatchable radii
@@ -1083,7 +1190,14 @@ impl Particle {
         let ref_update = self.source.ref_update_at(m);
         self.update_reference_index(m, ref_update);
 
-        let warp_inc = if let StrainMethod::Meshless(params) = &cfg.strain_method {
+        let warp_inc = if let StrainMethod::Subsets = &cfg.strain_method {
+            // Image-space only, as the meshless path (calibration not supported yet).
+            let coord = [
+                self.coordinates[[self.reference_index, 0]],
+                self.coordinates[[self.reference_index, 1]],
+            ];
+            subsets_warp_increment(coord, mesh, self.incs.ncols())
+        } else if let StrainMethod::Meshless(params) = &cfg.strain_method {
             // Calibration is not supported on the meshless path yet (v1):
             // it always operates on image-space coordinates directly.
             let coord = [
@@ -1289,16 +1403,92 @@ mod tests {
     }
 
     #[test]
-    fn strain_method_default_is_meshless_with_default_params() {
+    fn strain_method_default_is_subsets() {
         // Must match the Python boundary's `strain_method=None`.
-        match ParticleConfig::default().strain_method {
-            StrainMethod::Meshless(p) => {
-                let d = MeshlessParams::default();
-                assert_eq!(p.radius, d.radius);
-                assert_eq!(p.min_neighbours, d.min_neighbours);
+        assert!(matches!(ParticleConfig::default().strain_method, StrainMethod::Subsets));
+    }
+
+    /// A 3×3 grid of order-1 nodes, spacing 10, circular templates of
+    /// radius 15, every subset carrying the warp `p`.
+    fn subsets_mesh(p: [f64; 6]) -> MeshSolution {
+        let nodes = Array2::from_shape_fn((9, 2), |(i, c)| if c == 0 { (i % 3) as f64 * 10.0 } else { (i / 3) as f64 * 10.0 });
+        let mut pp = Array2::<f64>::zeros((9, 12));
+        for i in 0..9 {
+            for k in 0..6 {
+                pp[[i, k]] = p[k];
             }
-            StrainMethod::Mesh => panic!("core default must be meshless"),
         }
+        // each node's warp is the same affine field, re-expressed about its own centre
+        for i in 0..9 {
+            let (x, y) = (nodes[[i, 0]], nodes[[i, 1]]);
+            pp[[i, 0]] = p[0] + p[2] * x + p[4] * y;
+            pp[[i, 1]] = p[1] + p[3] * x + p[5] * y;
+        }
+        let elements = Array2::from_shape_fn((8, 3), |(e, k)| {
+            let (r, c, up) = (e / 4, (e % 4) / 2, e % 2);
+            let a = r * 3 + c;
+            if up == 0 { [a, a + 1, a + 4][k] } else { [a, a + 4, a + 3][k] }
+        });
+        MeshSolution {
+            nodes: nodes.clone(),
+            elements,
+            boundary: vec![],
+            exclusions: vec![],
+            centroids: Array2::zeros((8, 2)),
+            areas: Array1::zeros(8),
+            warps: Array2::zeros((8, 12)),
+            displacements: pp.slice(ndarray::s![.., 0..2]).to_owned(),
+            c_zncc: Array1::ones(9),
+            p: pp,
+            seed_node: 0,
+            mesh_order: 1,
+            subset_order: 1,
+            iterations: Array1::zeros(9),
+            norms: Array1::zeros(9),
+            f_img_path: PathBuf::new(),
+            g_img_path: PathBuf::new(),
+            solve_config: None,
+            seed: None,
+            template_shape: Some(crate::masks::MaskShape::Circle),
+            template_sizes: Some(Array1::from_elem(9, 15)),
+            time: None,
+            seams: None,
+        }
+    }
+
+    #[test]
+    fn subsets_reproduce_an_affine_field_exactly() {
+        let p = [0.3, -0.2, 0.01, 0.02, -0.03, 0.04];
+        let mesh = subsets_mesh(p);
+        for &(x, y) in &[(7.0, 4.0), (12.5, 17.0), (0.0, 0.0)] {
+            let w = subsets_warp_increment([x, y], &mesh, 6);
+            assert!((w[0] - (p[0] + p[2] * x + p[4] * y)).abs() < 1e-12);
+            assert!((w[1] - (p[1] + p[3] * x + p[5] * y)).abs() < 1e-12);
+            for k in 2..6 {
+                assert!((w[k] - p[k]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn subsets_do_not_reach_across_a_cut() {
+        use crate::seam::{EdgeKind, SeamAction, SeamLevels, SeamLine, SeamRecord};
+        // node 4 (10, 10) carries a different warp, and its cut line x = 13
+        // (offset c = 3) masks everything to its right
+        let mut mesh = subsets_mesh([0.0; 6]);
+        mesh.p[[4, 0]] = 5.0;
+        let line = SeamLine { kind: EdgeKind::Hinge, theta: 0.0, c: 3.0, t: 0.0 };
+        let rec = SeamRecord {
+            plain_coord: [10.0, 10.0], plain_p: vec![0.0; 6], moved: None, action: SeamAction::Cut,
+            lines: vec![line], gap: 3.0, passes: vec![], h: 3.0, levels: SeamLevels::image_free(700, 3.0), flags: vec![],
+        };
+        let mut records = vec![None; 9];
+        records[4] = Some(rec);
+        mesh.seams = Some(crate::mesh::MeshSeams::for_test(records));
+        let right = subsets_warp_increment([16.0, 10.0], &mesh, 6);
+        assert!(right[0].abs() < 1e-12, "node 4 reached across its cut: {}", right[0]);
+        let left = subsets_warp_increment([8.0, 10.0], &mesh, 6);
+        assert!(left[0] > 0.1, "node 4 should contribute on its own side");
     }
     use ndarray::array;
 

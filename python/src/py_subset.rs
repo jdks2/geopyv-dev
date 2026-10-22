@@ -534,7 +534,7 @@ pub(crate) fn record_dict<'py>(py: Python<'py>, r: &SeamRecord) -> PyResult<Boun
     let d = PyDict::new_bound(py);
     d.set_item("plain_coord", r.plain_coord)?;
     d.set_item("plain_p", r.plain_p.clone())?;
-    d.set_item("jolt", r.jolt)?;
+    d.set_item("moved", r.moved)?;
     d.set_item("action", format!("{:?}", r.action).to_lowercase())?;
     let lines = PyList::empty_bound(py);
     for l in &r.lines {

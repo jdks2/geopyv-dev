@@ -150,17 +150,18 @@ impl PyParticleSolution {
     /// dgamma/dy]``, shape ``(inc_no, 2)``. Only populated when this
     /// particle was solved via ``Field.solve()`` (not a standalone
     /// ``Particle.solve()`` -- no neighbours to estimate a gradient from)
-    /// with ``strain_method`` left as meshless (the default). Raises
-    /// otherwise, rather than silently returning NaN/zero.
+    /// with ``strain_method`` left as the default (subset average) or a
+    /// ``MeshlessParams``. Raises otherwise, rather than silently returning
+    /// NaN/zero.
     #[getter]
     fn gamma_max_grad<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         if self.inner.gamma_max_grad.is_none() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "gamma_max_grad is not available on this ParticleSolution -- it requires \
                  solving via Field.solve() (not a standalone Particle) with strain_method left \
-                 as meshless (the default); it is never computed when strain_method=False \
-                 (StrainMethod::Mesh), for a standalone Particle, or on solutions predating \
-                 this field",
+                 as the default or a MeshlessParams; it is never computed when \
+                 strain_method=False (StrainMethod::Mesh), for a standalone Particle, or on \
+                 solutions predating this field",
             ));
         }
         arc_array2(py, &self.inner, |s| s.gamma_max_grad.as_ref().unwrap())
@@ -270,14 +271,11 @@ impl PyMeshlessParams {
 /// Build a `StrainMethod` from the optional Python-facing `strain_method`
 /// argument on `Field.solve()`/`Particle.solve()`.
 ///
-/// `strain_method=None` (the default) now means "meshless, with default
-/// `MeshlessParams`" -- meshless is the package-wide default strain
-/// estimator, not mesh-element interpolation (see module docs). Passing a
-/// `MeshlessParams` instance selects meshless with those specific
-/// parameters, exactly as before. `StrainMethod::Mesh` (shape-function
-/// differentiation) is retained for comparison purposes but is no longer
-/// reachable by omission -- it must be requested explicitly by passing
-/// `strain_method=False`.
+/// `strain_method=None` (the default) means the core default,
+/// `StrainMethod::Subsets` (the subset average). Passing a `MeshlessParams`
+/// instance selects meshless with those parameters. `StrainMethod::Mesh`
+/// (shape-function differentiation) is retained for comparison purposes and
+/// must be requested explicitly by passing `strain_method=False`.
 pub(crate) fn strain_method_from_py(
     strain_method: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<particle::StrainMethod> {
@@ -291,9 +289,9 @@ pub(crate) fn strain_method_from_py(
             } else if let Ok(force_mesh) = obj.extract::<bool>() {
                 if force_mesh {
                     Err(pyo3::exceptions::PyValueError::new_err(
-                        "strain_method=True is not valid -- pass None (meshless, default \
-                         params), a MeshlessParams instance (meshless, custom params), or \
-                         False (force mesh-element interpolation, StrainMethod::Mesh)",
+                        "strain_method=True is not valid -- pass None (subset average, the \
+                         default), a MeshlessParams instance (meshless fit), or False \
+                         (mesh-element interpolation, StrainMethod::Mesh)",
                     ))
                 } else {
                     Ok(particle::StrainMethod::Mesh)
@@ -373,12 +371,11 @@ impl PyParticle {
     /// true_incs : bool, optional
     ///     Logarithmic strain increments. Default ``True``.
     /// strain_method : MeshlessParams or False, optional
-    ///     ``None`` (default): meshless (IRLS-robust MLS) strain estimator
-    ///     with default ``MeshlessParams`` -- the package-wide default. A
-    ///     ``MeshlessParams`` instance: meshless with those parameters.
-    ///     ``False``: force the original mesh-element (shape-function)
-    ///     interpolation instead -- retained for comparison, no longer the
-    ///     default.
+    ///     ``None`` (default): the subset average -- the weighted average of
+    ///     the warps of every subset whose template holds the particle and
+    ///     whose cuts (adaptive masking) keep it, each evaluated at the
+    ///     particle. A ``MeshlessParams`` instance: the meshless fit with those
+    ///     parameters. ``False``: mesh-element (shape-function) interpolation.
     #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None, strain_method=None))]
     fn solve(
         &mut self,
@@ -498,16 +495,17 @@ impl PyParticle {
     /// dgamma/dy]``, shape ``(inc_no, 2)``. Only populated when this
     /// particle was solved via ``Field.solve()`` (not a standalone
     /// ``Particle.solve()`` -- no neighbours to estimate a gradient from)
-    /// with ``strain_method`` left as meshless (the default). Raises
-    /// otherwise, rather than silently returning NaN/zero.
+    /// with ``strain_method`` left as the default (subset average) or a
+    /// ``MeshlessParams``. Raises otherwise, rather than silently returning
+    /// NaN/zero.
     #[getter]
     fn gamma_max_grad<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let sol = self.require_solved()?;
         if sol.gamma_max_grad.is_none() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "gamma_max_grad is not available on this Particle -- it requires solving via \
-                 Field.solve() (not a standalone Particle) with strain_method left as meshless \
-                 (the default); it is never computed when strain_method=False \
+                 Field.solve() (not a standalone Particle) with strain_method left as the \
+                 default or a MeshlessParams; it is never computed when strain_method=False \
                  (StrainMethod::Mesh), for a standalone Particle, or on solutions predating \
                  this field",
             ));

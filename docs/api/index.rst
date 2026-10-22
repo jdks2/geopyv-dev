@@ -60,8 +60,8 @@ Adaptive masking results
 After ``solve(..., solver_options={"masking": "adaptive"})`` (see
 :doc:`../tutorials/03_mesh`):
 
-- ``Subset.seams`` — dict: ``plain_coord``, ``plain_p``, ``jolt`` (shift, or
-  ``None``), ``action``, ``lines`` (cut lines: ``kind``, ``theta``, ``c``, ``T``),
+- ``Subset.seams`` — dict: ``plain_coord``, ``plain_p``, ``moved`` (total move of
+  the centre after its cuts, or ``None``), ``action``, ``lines`` (cut lines: ``kind``, ``theta``, ``c``, ``T``),
   ``gap``, ``passes`` (scores and decision per pass), ``h``, ``levels``, ``flags``.
   ``None`` after a uniform solve.
 - ``Mesh.seams`` (and each ``Sequence`` pair's ``mesh_solution_at(i).seams``) —

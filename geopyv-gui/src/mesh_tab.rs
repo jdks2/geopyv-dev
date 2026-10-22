@@ -1688,8 +1688,8 @@ pub fn seam_summary(ui: &mut egui::Ui, sol: &MeshSolution) {
     meta_row(ui, "Order 2", &(count(A::Order2) + count(A::CutOrder2)).to_string());
     meta_row(
         ui,
-        "Jolted",
-        &sm.records.iter().filter(|r| r.as_ref().is_some_and(|r| r.jolt.is_some())).count().to_string(),
+        "Moved",
+        &sm.records.iter().filter(|r| r.as_ref().is_some_and(|r| r.moved.is_some())).count().to_string(),
     );
 }
 

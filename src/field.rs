@@ -453,7 +453,12 @@ impl Field {
         // functions (operate on the full accumulated `warps` array in one
         // shot), not incremental, so there is no per-increment gamma_max
         // available until finalize() has already run for every particle.
-        if let StrainMethod::Meshless(params) = &cfg.strain_method {
+        let gradient_params = match &cfg.strain_method {
+            StrainMethod::Meshless(params) => Some(params.clone()),
+            StrainMethod::Subsets => Some(crate::particle::MeshlessParams::default()),
+            StrainMethod::Mesh => None,
+        };
+        if let Some(params) = gradient_params.as_ref() {
             if let Some(inc_no) = solutions.first().map(|s| s.coordinates.nrows()) {
                 let n_particles = solutions.len();
                 let mut grads: Vec<Array2<f64>> = (0..n_particles)
@@ -787,7 +792,7 @@ impl ParticleSolution {
             FieldQuantity::GammaMaxGrad => {
                 let g = self.gamma_max_grad.as_ref().ok_or_else(|| Error::InvalidInput(
                     "gamma_max_grad is not available -- it requires solving via \
-                     Field.solve() with strain_method left as meshless (the default)"
+                     Field.solve() with strain_method left as the default or a MeshlessParams"
                         .to_string(),
                 ))?;
                 // Each component reduced separately, then the magnitude.

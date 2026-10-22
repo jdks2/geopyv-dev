@@ -259,10 +259,12 @@ corrects them:
    line.
 4. **Correct.** A clear edge is **cut**: the far side of the line is masked (with a
    3 px gap) and the subset re-solved; a second look may cut again (a narrow band)
-   or add a bend. A bend is re-solved at **order 2**. If the line passes within 5 px
-   of the centre, the node and its subset are first **jolted** that far away from it
-   (along the edge for a node on the boundary or an exclusion; never at a corner)
-   and tested again.
+   or add a bend. A bend is re-solved at **order 2**. A cut subset's result describes
+   the side it keeps, so the node and its subset then **move** to the middle of the
+   pixels it keeps (as far as the mesh allows without distorting an element; along
+   the edge for a node on the boundary or an exclusion; never at a corner) and are
+   solved again there, before the second look. The moved disc can reach an edge the
+   first one did not, which the second look then cuts.
 
 .. image:: /_static/img/adaptive_neighbour_check.png
    :alt: Two panels. Node A's arrow and B's displacement predicted from A's warp,
@@ -274,8 +276,8 @@ corrects them:
 
 .. image:: /_static/img/adaptive_flow.png
    :alt: Flow diagram of adaptive masking for one node: plain solve, screen, tests,
-         then cut (after a jolt if the line is within 5 px of the centre), order 2,
-         or nothing, and a second pass on a cut subset.
+         then cut, move to the middle of the kept pixels and re-solve, order 2, or
+         nothing, and a second pass on the moved cut subset.
    :width: 520px
    :align: center
 
@@ -313,7 +315,7 @@ positions, which nodes were flagged and sent on, each node's action (``"nothing"
 
 .. code-block:: python
 
-   mesh.inspect(seams="actions", sent=True)  # what was done where, cut lines, jolts
+   mesh.inspect(seams="actions", sent=True)  # what was done where, cut lines, moves
    mesh.inspect(seams="scores")              # edge vs bending score, alarm and margin lines
    mesh.inspect(subset_idx=i)                # one node: its cut line(s) and masked side
    mesh.contour("noise")                     # each node's noise level (px)
@@ -351,7 +353,7 @@ Building, solving, and inspecting a mesh in the GUI
    above. Under **Displacements**, **Rate (velocity, px/s)** divides by the
    pair's Δt (shown underneath); it is greyed out when the mesh has no times.
    After an adaptive solve, the metadata adds the noise source and how many nodes
-   were sent on, cut, bent and jolted; **Quality** adds **Noise**, **Frame 0–1** and
+   were sent on, cut, bent and moved; **Quality** adds **Noise**, **Frame 0–1** and
    **Correction**, and **Show adaptive actions and cuts** draws each node's action
    and cut lines over the plot.
 
