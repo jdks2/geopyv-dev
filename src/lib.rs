@@ -11,9 +11,11 @@ pub mod sequence;
 pub mod screen;
 pub mod seam;
 pub mod subset;
+pub(crate) mod texture;
 pub mod timing;
 pub mod masks;
 pub mod speckle;
+pub mod soil;
 pub mod validation;
 
 pub use error::Error;

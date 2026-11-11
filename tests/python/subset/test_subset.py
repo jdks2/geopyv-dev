@@ -11,6 +11,10 @@ geopyv Python package: geopyv_dev's B-spline prefilter
 geopyv's `image.py::_get_C` that shifts every interpolated intensity by
 (1, 1) px.  Reference-subset quantities (f_m, delta_f, sssig, ...) and the
 converged translation therefore differ from geopyv by that one-pixel offset.
+They also differ because geopyv_dev's spline gradient is taken at the query
+point itself (`image.rs::qt_dpoly`, 2026-11-04); geopyv took it at the pixel
+corner below (sssig 430193.49, ICGN p[0] 0.0338914761, FAGN p[0] 0.0334467004
+before that fix).
 """
 
 import os
@@ -45,23 +49,23 @@ BORDER = 20
 GOLDEN_N_PX = 1961
 GOLDEN_F_M = 72.4607678591
 GOLDEN_DELTA_F = 3166.7538783369
-GOLDEN_SSSIG = 430193.4940805415
+GOLDEN_SSSIG = 436891.1726101164
 GOLDEN_SIGMA_INT = 71.5114385032
 
-GOLDEN_ICGN_O1_ZNCC = 0.9999868056
+GOLDEN_ICGN_O1_ZNCC = 0.9999868118
 GOLDEN_ICGN_O1_ITERS = 3
 GOLDEN_ICGN_O1_P = [
-    3.38914761e-02, 3.51348955e-02,
-    9.94055325e-05, -5.21745977e-05,
-    4.29306692e-05, -5.84241277e-05,
+    3.37212712e-02, 3.48352532e-02,
+    8.64913540e-05, -5.44238092e-05,
+    1.92803733e-05, -6.03563472e-05,
 ]
 
-GOLDEN_FAGN_O1_ZNCC = 0.9999868042
+GOLDEN_FAGN_O1_ZNCC = 0.9999868125
 GOLDEN_FAGN_O1_ITERS = 3
 GOLDEN_FAGN_O1_P = [
-    3.34467004e-02, 3.44336229e-02,
-    9.55317604e-05, -5.02131885e-05,
-    4.17281040e-05, -4.96162986e-05,
+    3.37782191e-02, 3.46451578e-02,
+    9.05262033e-05, -5.74550788e-05,
+    1.94298350e-05, -5.87262168e-05,
 ]
 
 pytestmark = pytest.mark.skipif(

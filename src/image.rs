@@ -23,6 +23,7 @@
 //! - `get_qcqt` Tier A  atol = 1e-12  (pure matrix algebra)
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use nalgebra::SMatrix;
 use ndarray::{s, Array2, Array3, ArrayView2};
@@ -52,6 +53,11 @@ pub struct Image {
     pub border: usize,
     /// File path used to load the image; `None` when constructed from an array.
     pub filepath: Option<PathBuf>,
+    /// Rigid-texture curvature maps, built on the first rigid solve against
+    /// this reference (`None` inside: no measurable speckle).
+    pub(crate) grain: OnceLock<Option<crate::texture::GrainMaps>>,
+    /// Grain centre of every pixel for `texture="grains"`, built on first use.
+    pub(crate) grain_centres: OnceLock<Option<crate::texture::GrainCentres>>,
 }
 
 impl Image {
@@ -78,7 +84,45 @@ impl Image {
     /// performed loading and Gaussian pre-filtering on the Python side.
     pub fn from_array(image_gs: Array2<f64>, border: usize) -> Self {
         let coef = get_c(&image_gs, border);
-        Self { image_gs, coef, border, filepath: None }
+        Self { image_gs, coef, border, filepath: None, grain: OnceLock::new(), grain_centres: OnceLock::new() }
+    }
+
+    /// Rigid-texture curvature maps of this image as a reference, built once
+    /// on first use; `None` (with one warning) when it has no measurable
+    /// speckle, and the rigid solve then falls back to the deformable one.
+    pub(crate) fn grain(&self) -> Option<&crate::texture::GrainMaps> {
+        self.grain
+            .get_or_init(|| {
+                let maps = crate::texture::GrainMaps::build(self);
+                if maps.is_none() {
+                    eprintln!("geopyv: no measurable speckle in the reference image; texture=\"rigid\" falls back to \"deformable\"");
+                }
+                maps
+            })
+            .as_ref()
+    }
+
+    /// Grain centre of every pixel of this image as a reference, built once
+    /// on first use; `None` (with one warning) when no grains are found, and
+    /// the grains solve then falls back to the deformable one.
+    /// The grains the "shape" correction finds in this image as a reference:
+    /// the centre `[x, y]` of each grain, and the grain number of every pixel
+    /// `(rows, cols)` (row of the centres + 1; 0 where no grain, so no
+    /// correction). `None` when no grains are found.
+    pub fn grains(&self) -> Option<(Vec<[f64; 2]>, Array2<i64>)> {
+        self.grain_centres().map(|g| (g.centres.clone(), g.label.clone()))
+    }
+
+    pub(crate) fn grain_centres(&self) -> Option<&crate::texture::GrainCentres> {
+        self.grain_centres
+            .get_or_init(|| {
+                let c = crate::texture::GrainCentres::build(self);
+                if c.is_none() {
+                    eprintln!("geopyv: no grains found in the reference image; texture=\"grains\" falls back to \"deformable\"");
+                }
+                c
+            })
+            .as_ref()
     }
 
     /// Per-pixel Q·C_b·Qᵀ blocks `(rows, cols, 36)`, built on request (not
@@ -94,12 +138,12 @@ impl Image {
     /// pixel's edge value instead of exploding through `dx⁵`.
     #[inline]
     pub(crate) fn eval_grad(&self, x: f64, y: f64) -> (f64, [f64; 2]) {
-        let (cb, cq, a) = self.rows(x, y);
+        let (cb, cq, a, da) = self.rows(x, y);
         let (mut val, mut gx, mut gy) = (0.0, 0.0, 0.0);
         for r in 0..6 {
             val += a[r] * cb[r];
             gx += a[r] * cq[r];
-            gy += Q1[r] * cb[r];
+            gy += da[r] * cb[r];
         }
         (val, [gx, gy])
     }
@@ -129,15 +173,17 @@ impl Image {
     }
 
     /// The rows of the 6×6 coefficient block around `(x, y)` contracted with
-    /// `Qᵀdx` (`cb`) and with `q₁` (`cq`), and `Qᵀdy` (`a`).
+    /// `Qᵀdx` (`cb`) and with its derivative `Qᵀdx'` (`cq`), and `Qᵀdy`
+    /// (`a`) with its derivative `Qᵀdy'` (`da`) - derivatives at the actual
+    /// fractional position, so the gradient is that of the spline at `(x, y)`.
     #[inline]
-    fn rows(&self, x: f64, y: f64) -> ([f64; 6], [f64; 6], [f64; 6]) {
+    fn rows(&self, x: f64, y: f64) -> ([f64; 6], [f64; 6], [f64; 6], [f64; 6]) {
         let (h, w) = self.image_gs.dim();
         let x = x.clamp(0.0, w as f64 - 1e-9);
         let y = y.clamp(0.0, h as f64 - 1e-9);
         let (xf, yf) = (x.floor() as usize, y.floor() as usize);
-        let a = qt_poly(y - yf as f64);
-        let b = qt_poly(x - xf as f64);
+        let (a, da) = (qt_poly(y - yf as f64), qt_dpoly(y - yf as f64));
+        let (b, db) = (qt_poly(x - xf as f64), qt_dpoly(x - xf as f64));
         let (r0, c0) = (yf + self.border - 2, xf + self.border - 2);
         let (c, cw) = (self.coef.as_slice().expect("C is standard layout"), self.coef.ncols());
         let mut cb = [0.0f64; 6];
@@ -148,18 +194,14 @@ impl Image {
             let (mut s, mut t) = (0.0, 0.0);
             for k in 0..6 {
                 s += row[k] * b[k];
-                t += row[k] * Q1[k];
+                t += row[k] * db[k];
             }
             cb[r] = s;
             cq[r] = t;
         }
-        (cb, cq, a)
+        (cb, cq, a, da)
     }
 }
-
-/// q₁ = Qᵀe₁: the derivative basis `[0, 1, 0, 0, 0, 0]` pushed through Qᵀ
-/// (row 1 of Q).
-const Q1: [f64; 6] = Q[1];
 
 /// Q as a constant table (same values as [`q_matrix`]).
 #[rustfmt::skip]
@@ -179,6 +221,28 @@ fn qt_poly(t: f64) -> [f64; 6] {
     let t3 = t2 * t;
     let t4 = t3 * t;
     let p = [1.0, t, t2, t3, t4, t4 * t];
+    let mut out = [0.0; 6];
+    for k in 0..6 {
+        let mut s = 0.0;
+        for r in 0..6 {
+            s += Q[r][k] * p[r];
+        }
+        out[k] = s;
+    }
+    out
+}
+
+/// Qᵀ·d/dt[1, t, t², t³, t⁴, t⁵] = Qᵀ·[0, 1, 2t, 3t², 4t³, 5t⁴]: the
+/// derivative basis at `t`. (Until 2026-11-04 the gradient used the
+/// derivative at t = 0, i.e. at the pixel corner below, at every query: a
+/// gradient error growing linearly with the fractional position, up to
+/// about 40 % - it biased displacements wherever the model did not fit the
+/// texture exactly, e.g. rigid grains under strain.)
+#[inline]
+fn qt_dpoly(t: f64) -> [f64; 6] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let p = [0.0, 1.0, 2.0 * t, 3.0 * t2, 4.0 * t3, 5.0 * t2 * t2];
     let mut out = [0.0; 6];
     for k in 0..6 {
         let mut s = 0.0;
@@ -432,8 +496,11 @@ fn load_grayscale(path: &Path) -> Result<Array2<f64>, Error> {
 ///
 /// After blurring the float values are rounded and clamped to 0–255,
 /// matching cv2's uint8 output.
+/// Width (px) of the Gaussian blur applied to images loaded from a file.
+pub(crate) const LOAD_BLUR_SIGMA: f64 = 1.1;
+
 fn gaussian_blur_5x5(gs: &Array2<f64>) -> Array2<f64> {
-    let sigma = 1.1_f64;
+    let sigma = LOAD_BLUR_SIGMA;
     // Compute normalised kernel (identical to `cv2.getGaussianKernel(5, 1.1)`).
     let raw: [f64; 5] = std::array::from_fn(|i| {
         let x = i as f64 - 2.0;
@@ -535,7 +602,8 @@ mod tests {
         );
         let q3 = img.qcqt();
         let p = |t: f64| [1.0, t, t * t, t.powi(3), t.powi(4), t.powi(5)];
-        let d = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        // derivative basis at the query's own fractional position
+        let d = |t: f64| [0.0, 1.0, 2.0 * t, 3.0 * t * t, 4.0 * t.powi(3), 5.0 * t.powi(4)];
         for &(x, y) in &[(3.25f64, 4.75f64), (10.0, 12.0), (0.0, 0.0), (15.999, 9.001), (7.5, 0.5), (26.3, 22.9)] {
             let (xf, yf) = (x.floor() as usize, y.floor() as usize);
             let (px, py) = (p(x - xf as f64), p(y - yf as f64));
@@ -550,8 +618,8 @@ mod tests {
             };
             let (v, [gx, gy]) = img.eval_grad(x, y);
             assert!((v - form(&py, &px)).abs() < 1e-11, "value at ({x},{y})");
-            assert!((gx - form(&py, &d)).abs() < 1e-11, "grad_x at ({x},{y})");
-            assert!((gy - form(&d, &px)).abs() < 1e-11, "grad_y at ({x},{y})");
+            assert!((gx - form(&py, &d(x - xf as f64))).abs() < 1e-11, "grad_x at ({x},{y})");
+            assert!((gy - form(&d(y - yf as f64), &px)).abs() < 1e-11, "grad_y at ({x},{y})");
             assert_eq!(v.to_bits(), img.eval(x, y).to_bits(), "eval vs eval_grad at ({x},{y})");
         }
     }
@@ -582,6 +650,24 @@ mod tests {
                 (row_sum - expected).abs() < 1e-15,
                 "Q row {r} sum = {row_sum}, expected {expected}"
             );
+        }
+    }
+
+    /// The spline gradient is the derivative of the spline value at the query
+    /// point itself, at any fractional position (regression: it used to be the
+    /// derivative at the pixel corner below).
+    #[test]
+    fn eval_grad_is_derivative_at_fractional_position() {
+        let a = Array2::from_shape_fn((60, 60), |(r, c)| {
+            120.0 + 60.0 * (2.0 * std::f64::consts::PI * r as f64 / 7.0 + 0.3).sin() * (2.0 * std::f64::consts::PI * c as f64 / 9.0).cos()
+        });
+        let img = Image::from_array(a, 8);
+        let h = 1e-5;
+        for &(x, y) in &[(30.0, 30.0), (30.25, 30.75), (30.5, 29.5), (31.9, 28.1)] {
+            let (_, [gx, gy]) = img.eval_grad(x, y);
+            let fx = (img.eval(x + h, y) - img.eval(x - h, y)) / (2.0 * h);
+            let fy = (img.eval(x, y + h) - img.eval(x, y - h)) / (2.0 * h);
+            assert!((gx - fx).abs() < 1e-4 && (gy - fy).abs() < 1e-4, "({x}, {y}): grad ({gx}, {gy}) vs ({fx}, {fy})");
         }
     }
 }

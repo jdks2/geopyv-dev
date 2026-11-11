@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui_plot::{HLine, Legend, Line, LineStyle, Plot, Points};
 
-use geopyv_dev::mesh::Masking;
+use geopyv_dev::mesh::{Masking, Texture};
 use geopyv_dev::seam::SeamConfig;
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
@@ -57,6 +57,8 @@ pub struct SolverConfig {
     pub order: SubsetOrder,
     /// Uniform, or adaptive (seam investigation and correction).
     pub masking: Masking,
+    /// Deformable (painted) or rigid (grain / particle) speckle.
+    pub texture: Texture,
     pub max_norm_text: String,
     pub max_norm: f64,
     pub max_iterations_text: String,
@@ -77,6 +79,7 @@ impl Default for SolverConfig {
             },
             order: if core.subset_order == 1 { SubsetOrder::First } else { SubsetOrder::Second },
             masking: core.masking,
+            texture: core.texture,
             max_norm_text: format!("{:e}", core.max_norm),
             max_norm: core.max_norm,
             max_iterations_text: core.max_iterations.to_string(),
@@ -103,6 +106,26 @@ pub fn masking_row(ui: &mut egui::Ui, s: &mut SolverConfig) {
     if s.masking == Masking::Adaptive {
         s.order = SubsetOrder::First;
     }
+    ui.end_row();
+}
+
+/// "Texture:" radio row shared by the Subset/Mesh/Sequence solver forms.
+pub fn texture_row(ui: &mut egui::Ui, s: &mut SolverConfig) {
+    ui.label(egui::RichText::new("Texture:").size(16.0).color(ui.visuals().weak_text_color()));
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut s.texture, Texture::Deformable, "Deformable")
+            .on_hover_text("The speckle stretches and shears with the material (painted speckle).");
+        ui.radio_value(&mut s.texture, Texture::RigidSphere, "Rigid: sphere").on_hover_text(
+            "Each speckle is a round lump that moves with the material under its centre but keeps \
+             its shape (grains, tracer particles, synthetic Speckle images). Corrects the template \
+             for the mismatch this leaves under strain. Wrong for painted speckle.",
+        );
+        ui.radio_value(&mut s.texture, Texture::RigidShape, "Rigid: shape").on_hover_text(
+            "Rigid grains of any shape that do not overlap and turn with the material (a grain \
+             surface such as sand). Splits the reference into grains and corrects each pixel about \
+             its own grain's centre. Not for speckle that overlaps.",
+        );
+    });
     ui.end_row();
 }
 
@@ -229,6 +252,7 @@ pub struct SubsetSpawnParams {
     pub max_iterations: usize,
     pub zncc_tol: f64,
     pub masking: Masking,
+    pub texture: Texture,
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1078,7 @@ impl SubsetTabState {
                     ui.end_row();
 
                     crate::subset_tab::masking_row(ui, s);
+                    crate::subset_tab::texture_row(ui, s);
 
                     ui.label(
                         egui::RichText::new("Max norm:")
@@ -1193,6 +1218,7 @@ impl SubsetTabState {
                     method: form.solver.method,
                     order: form.solver.order,
                     masking: form.solver.masking,
+                    texture: form.solver.texture,
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
@@ -1407,10 +1433,10 @@ fn run_solve(
 
     let solve_result = match params.method {
         SolveMethod::Icgn => {
-            subset.solve_icgn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations)
+            subset.solve_icgn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations, params.texture)
         }
         SolveMethod::Fagn => {
-            subset.solve_fagn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations)
+            subset.solve_fagn(Some(&p_0), params.zncc_tol, params.max_norm, params.max_iterations, params.texture)
         }
     };
 

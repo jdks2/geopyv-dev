@@ -274,10 +274,10 @@ pub fn warp_increment(
     let j_x_t = dn.dot(&element_nodes);    // (2, 2)
     let j_u_t = dn.dot(&element_disps);    // (2, 2)
     let inv_j = inv2x2(j_x_t.view());
-    let grad_u = inv_j.dot(&j_u_t);        // (2, 2)
+    let grad_u = inv_j.dot(&j_u_t);        // (2, 2), grad_u[[i, j]] = d u_j / d x_i
     warp_inc[2] = grad_u[[0, 0]]; // du/dx
-    warp_inc[3] = grad_u[[1, 0]]; // dv/dx
-    warp_inc[4] = grad_u[[0, 1]]; // du/dy
+    warp_inc[3] = grad_u[[0, 1]]; // dv/dx
+    warp_inc[4] = grad_u[[1, 0]]; // du/dy
     warp_inc[5] = grad_u[[1, 1]]; // dv/dy
 
     // 2nd-order strain (order-2 only)
@@ -393,6 +393,14 @@ pub enum StrainMethod {
     /// (`geopyv_dev_pub/docs/refined_vs_plain_followup.pdf`). Appended last
     /// so stored solutions keep their variant indices.
     Subsets,
+    /// Blend the warps of the containing element's own subsets, each evaluated
+    /// at the point, with the element weights ([`element_warps_increment`]);
+    /// a subset is left out when its cut lines put the point on the far side or
+    /// its template does not reach the point. Exact wherever the subsets are,
+    /// and the lowest displacement error of the methods in
+    /// `geopyv_dev_pub/docs/particle_interp_report.pdf`. Appended last so
+    /// stored solutions keep their variant indices.
+    ElementWarps,
 }
 
 impl Default for StrainMethod {
@@ -519,69 +527,192 @@ pub fn meshless_warp_increment(
 /// Warp increment of length `out_len`, laid out as [`warp_increment`]'s:
 /// `[u, v, du/dx, dv/dx, du/dy, dv/dy, 0, ..., 0]`.
 pub fn subsets_warp_increment(coordinate: [f64; 2], mesh: &MeshSolution, out_len: usize) -> Array1<f64> {
-    let (Some(shape), Some(sizes)) = (mesh.template_shape.as_ref(), mesh.template_sizes.as_ref()) else {
+    let Some(rules) = SubsetRules::of(mesh) else {
         return meshless_warp_increment(
             coordinate, mesh.nodes.view(), mesh.p.view(), mesh.c_zncc.view(), &MeshlessParams::default(), out_len,
         );
     };
-    let records = mesh.seams.as_ref().map(|s| &s.records);
-    let n = mesh.nodes.nrows();
-    let keeps = |i: usize, dx: f64, dy: f64| {
-        records.and_then(|r| r[i].as_ref()).map_or(true, |rec| {
-            rec.lines.iter().all(|l| {
-                let s = l.theta.cos() * dx + l.theta.sin() * dy;
-                if l.c > 0.0 { s < l.c } else { s > l.c }
-            })
-        })
-    };
-    // ρ² for a point at offset (dx, dy) from a template of half-size `r`,
-    // or None if the template does not hold it.
-    let rho2 = |dx: f64, dy: f64, r: f64| -> Option<f64> {
-        match shape {
-            MaskShape::Circle => (dx * dx + dy * dy <= r * r).then(|| (dx * dx + dy * dy) / (r * r)),
-            MaskShape::Semicircle => (dx * dx + dy * dy <= r * r && dy >= 0.0).then(|| (dx * dx + dy * dy) / (r * r)),
-            MaskShape::Square => (dx.abs() <= r && dy.abs() <= r).then(|| (dx * dx + dy * dy) / (2.0 * r * r)),
-        }
-    };
-    let (mut w_sum, mut acc) = (0.0, [0.0f64; 6]);
-    for i in 0..n {
-        let dx = coordinate[0] - mesh.nodes[[i, 0]];
-        let dy = coordinate[1] - mesh.nodes[[i, 1]];
-        let Some(r2) = rho2(dx, dy, sizes[i] as f64) else { continue };
-        if !keeps(i, dx, dy) {
-            continue;
-        }
-        let w = (1.0 - r2).powi(2);
-        if w <= 0.0 {
-            continue;
-        }
-        let v = warp_at(mesh.p.row(i), dx, dy);
-        for k in 0..6 {
-            acc[k] += w * v[k];
-        }
-        w_sum += w;
-    }
-    let v = if w_sum > 0.0 {
-        acc.map(|a| a / w_sum)
-    } else {
-        let nearest = (0..n)
+    let v = rules.average(coordinate, mesh).unwrap_or_else(|| {
+        let nearest = (0..mesh.nodes.nrows())
             .min_by(|&a, &b| {
                 let d = |i: usize| (coordinate[0] - mesh.nodes[[i, 0]]).hypot(coordinate[1] - mesh.nodes[[i, 1]]);
                 d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap_or(0);
         warp_at(mesh.p.row(nearest), coordinate[0] - mesh.nodes[[nearest, 0]], coordinate[1] - mesh.nodes[[nearest, 1]])
+    });
+    padded(v, out_len)
+}
+
+/// Compute the warp increment for a particle at `coordinate` by blending the
+/// warps of the containing element's subsets.
+///
+/// Each element node's subset warp is evaluated at the point and weighted by
+/// the element's shape function there. A node is left out when its template
+/// does not hold the point or a cut line puts the point on its far side (the
+/// same rules as [`subsets_warp_increment`]), and the weights are shared out
+/// again among the rest. An order-2 element uses its quadratic weights when no
+/// node is left out; otherwise the straight-line weights of the quarter of
+/// the element holding the point (quadratic weights go negative and cannot be
+/// shared out). With no qualifying element node: the average of all subsets
+/// that hold and keep the point; failing that, the nearest subset that keeps
+/// it. Gradients are the same weighted average of the subsets' own gradients.
+/// A mesh without template sizes falls back to [`subsets_warp_increment`].
+///
+/// # Returns
+/// Warp increment of length `out_len`, laid out as [`warp_increment`]'s:
+/// `[u, v, du/dx, dv/dx, du/dy, dv/dy, 0, ..., 0]`.
+pub fn element_warps_increment(coordinate: [f64; 2], mesh: &MeshSolution, out_len: usize) -> Array1<f64> {
+    let Some(rules) = SubsetRules::of(mesh) else {
+        return subsets_warp_increment(coordinate, mesh, out_len);
     };
+    let (tri, _) = element_locator(coordinate, &mesh.nodes, &mesh.elements, &mesh.centroids);
+    let elem: Vec<usize> = mesh.elements.row(tri).to_vec();
+    let x = |i: usize| [mesh.nodes[[i, 0]], mesh.nodes[[i, 1]]];
+    let ok: Vec<bool> = elem
+        .iter()
+        .map(|&i| {
+            let (dx, dy) = (coordinate[0] - x(i)[0], coordinate[1] - x(i)[1]);
+            rules.holds(i, dx, dy).is_some() && rules.keeps(i, dx, dy)
+        })
+        .collect();
+    let corners = Array2::from_shape_fn((3, 2), |(k, j)| x(elem[k])[j]);
+    let (z, e, t, _) = local_coordinates(coordinate, corners.view());
+    let mut w: Vec<f64> = if elem.len() == 3 {
+        vec![z, e, t]
+    } else if ok.iter().all(|&b| b) {
+        shape_function(2, z, e, t).0.to_vec()
+    } else {
+        // quarter of the order-2 element holding the point (corners 0, 1, 2;
+        // mid-sides 3: 0-1, 4: 1-2, 5: 2-0), straight-line weights within it
+        const SUB: [[usize; 3]; 4] = [[0, 3, 5], [3, 1, 4], [5, 4, 2], [3, 4, 5]];
+        let sub = if z >= 0.5 { 0 } else if e >= 0.5 { 1 } else if t >= 0.5 { 2 } else { 3 };
+        let loc = SUB[sub];
+        let c = Array2::from_shape_fn((3, 2), |(k, j)| x(elem[loc[k]])[j]);
+        let (zz, ee, tt, _) = local_coordinates(coordinate, c.view());
+        let mut w = vec![0.0; 6];
+        for (k, wk) in loc.iter().zip([zz, ee, tt]) {
+            w[*k] = wk;
+        }
+        w
+    };
+    for (wk, &okk) in w.iter_mut().zip(&ok) {
+        if !okk {
+            *wk = 0.0;
+        }
+    }
+    let w_sum: f64 = w.iter().sum();
+    let v = if w_sum > f64::EPSILON {
+        let mut acc = [0.0f64; 6];
+        for (&i, &wk) in elem.iter().zip(&w) {
+            if wk != 0.0 {
+                let wi = warp_at(mesh.p.row(i), coordinate[0] - x(i)[0], coordinate[1] - x(i)[1]);
+                for k in 0..6 {
+                    acc[k] += wk * wi[k];
+                }
+            }
+        }
+        acc.map(|a| a / w_sum)
+    } else {
+        rules.average(coordinate, mesh).unwrap_or_else(|| rules.nearest_kept(coordinate, mesh))
+    };
+    padded(v, out_len)
+}
+
+/// The template and cut-line rules a mesh's subsets carry: which subsets hold
+/// a point (inside the template) and keep it (on the subset's own side of
+/// every cut line, in the subset's own offsets).
+struct SubsetRules<'a> {
+    shape: &'a MaskShape,
+    sizes: &'a Array1<u32>,
+    records: Option<&'a Vec<Option<crate::seam::SeamRecord>>>,
+}
+
+impl<'a> SubsetRules<'a> {
+    /// `None` for a mesh without template sizes (files from before they were stored).
+    fn of(mesh: &'a MeshSolution) -> Option<Self> {
+        Some(SubsetRules {
+            shape: mesh.template_shape.as_ref()?,
+            sizes: mesh.template_sizes.as_ref()?,
+            records: mesh.seams.as_ref().map(|s| &s.records),
+        })
+    }
+
+    fn keeps(&self, i: usize, dx: f64, dy: f64) -> bool {
+        self.records.and_then(|r| r[i].as_ref()).map_or(true, |rec| {
+            rec.lines.iter().all(|l| {
+                let s = l.theta.cos() * dx + l.theta.sin() * dy;
+                if l.c > 0.0 { s < l.c } else { s > l.c }
+            })
+        })
+    }
+
+    /// ρ² for a point at offset (dx, dy) from subset `i`, or `None` if its
+    /// template does not hold the point.
+    fn holds(&self, i: usize, dx: f64, dy: f64) -> Option<f64> {
+        let r = self.sizes[i] as f64;
+        match self.shape {
+            MaskShape::Circle => (dx * dx + dy * dy <= r * r).then(|| (dx * dx + dy * dy) / (r * r)),
+            MaskShape::Semicircle => (dx * dx + dy * dy <= r * r && dy >= 0.0).then(|| (dx * dx + dy * dy) / (r * r)),
+            MaskShape::Square => (dx.abs() <= r && dy.abs() <= r).then(|| (dx * dx + dy * dy) / (2.0 * r * r)),
+        }
+    }
+
+    /// Weighted average, `(1 - ρ²)²`, of the warps of every subset that holds
+    /// and keeps the point, each evaluated there; `None` if there is none.
+    fn average(&self, coordinate: [f64; 2], mesh: &MeshSolution) -> Option<[f64; 6]> {
+        let (mut w_sum, mut acc) = (0.0, [0.0f64; 6]);
+        for i in 0..mesh.nodes.nrows() {
+            let dx = coordinate[0] - mesh.nodes[[i, 0]];
+            let dy = coordinate[1] - mesh.nodes[[i, 1]];
+            let Some(r2) = self.holds(i, dx, dy) else { continue };
+            if !self.keeps(i, dx, dy) {
+                continue;
+            }
+            let w = (1.0 - r2).powi(2);
+            if w <= 0.0 {
+                continue;
+            }
+            let v = warp_at(mesh.p.row(i), dx, dy);
+            for k in 0..6 {
+                acc[k] += w * v[k];
+            }
+            w_sum += w;
+        }
+        (w_sum > 0.0).then(|| acc.map(|a| a / w_sum))
+    }
+
+    /// The nearest subset whose cuts keep the point, evaluated there (the
+    /// nearest subset of all if none keeps it).
+    fn nearest_kept(&self, coordinate: [f64; 2], mesh: &MeshSolution) -> [f64; 6] {
+        let d = |i: usize| (coordinate[0] - mesh.nodes[[i, 0]]).hypot(coordinate[1] - mesh.nodes[[i, 1]]);
+        let mut order: Vec<usize> = (0..mesh.nodes.nrows()).collect();
+        order.sort_by(|&a, &b| d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal));
+        let off = |i: usize| (coordinate[0] - mesh.nodes[[i, 0]], coordinate[1] - mesh.nodes[[i, 1]]);
+        let i = order
+            .iter()
+            .copied()
+            .find(|&i| {
+                let (dx, dy) = off(i);
+                self.keeps(i, dx, dy)
+            })
+            .unwrap_or(order[0]);
+        let (dx, dy) = off(i);
+        warp_at(mesh.p.row(i), dx, dy)
+    }
+}
+
+/// `v` zero-padded (or cut) to `out_len`.
+fn padded(v: [f64; 6], out_len: usize) -> Array1<f64> {
     let mut warp = Array1::<f64>::zeros(out_len);
     for k in 0..6.min(out_len) {
         warp[k] = v[k];
     }
     warp
 }
-
 /// `[u, v, du/dx, dv/dx, du/dy, dv/dy]` of a subset warp `p` (order 1, or
 /// order 2 when it has 12 terms) at offset `(dx, dy)` from its centre.
-fn warp_at(p: ArrayView1<f64>, dx: f64, dy: f64) -> [f64; 6] {
+pub(crate) fn warp_at(p: ArrayView1<f64>, dx: f64, dy: f64) -> [f64; 6] {
     let q = |k: usize| if k < p.len() { p[k] } else { 0.0 };
     let (uxx, vxx, uxy, vxy, uyy, vyy) = (q(6), q(7), q(8), q(9), q(10), q(11));
     [
@@ -1197,6 +1328,13 @@ impl Particle {
                 self.coordinates[[self.reference_index, 1]],
             ];
             subsets_warp_increment(coord, mesh, self.incs.ncols())
+        } else if let StrainMethod::ElementWarps = &cfg.strain_method {
+            // Image-space only, as the subset and meshless paths.
+            let coord = [
+                self.coordinates[[self.reference_index, 0]],
+                self.coordinates[[self.reference_index, 1]],
+            ];
+            element_warps_increment(coord, mesh, self.incs.ncols())
         } else if let StrainMethod::Meshless(params) = &cfg.strain_method {
             // Calibration is not supported on the meshless path yet (v1):
             // it always operates on image-space coordinates directly.
@@ -1453,6 +1591,7 @@ mod tests {
             template_sizes: Some(Array1::from_elem(9, 15)),
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 
@@ -1489,6 +1628,56 @@ mod tests {
         assert!(right[0].abs() < 1e-12, "node 4 reached across its cut: {}", right[0]);
         let left = subsets_warp_increment([8.0, 10.0], &mesh, 6);
         assert!(left[0] > 0.1, "node 4 should contribute on its own side");
+    }
+
+    #[test]
+    fn element_warps_reproduce_an_affine_field_exactly() {
+        let p = [0.3, -0.2, 0.01, 0.02, -0.03, 0.04];
+        let mut mesh = subsets_mesh(p);
+        mesh.centroids = crate::mesh::compute_centroids(&mesh.nodes, &mesh.elements);
+        for &(x, y) in &[(7.0, 4.0), (12.5, 17.0), (0.0, 0.0), (19.0, 1.0)] {
+            let w = element_warps_increment([x, y], &mesh, 6);
+            assert!((w[0] - (p[0] + p[2] * x + p[4] * y)).abs() < 1e-12);
+            assert!((w[1] - (p[1] + p[3] * x + p[5] * y)).abs() < 1e-12);
+            for k in 2..6 {
+                assert!((w[k] - p[k]).abs() < 1e-12, "slot {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn element_warps_do_not_reach_across_a_cut() {
+        use crate::seam::{EdgeKind, SeamAction, SeamLevels, SeamLine, SeamRecord};
+        // as subsets_do_not_reach_across_a_cut: node 4 (10, 10) carries u = 5
+        // and its cut line x = 13 masks everything to its right
+        let mut mesh = subsets_mesh([0.0; 6]);
+        mesh.centroids = crate::mesh::compute_centroids(&mesh.nodes, &mesh.elements);
+        mesh.p[[4, 0]] = 5.0;
+        let line = SeamLine { kind: EdgeKind::Hinge, theta: 0.0, c: 3.0, t: 0.0 };
+        let rec = SeamRecord {
+            plain_coord: [10.0, 10.0], plain_p: vec![0.0; 6], moved: None, action: SeamAction::Cut,
+            lines: vec![line], gap: 3.0, passes: vec![], h: 3.0, levels: SeamLevels::image_free(700, 3.0), flags: vec![],
+        };
+        let mut records = vec![None; 9];
+        records[4] = Some(rec);
+        mesh.seams = Some(crate::mesh::MeshSeams::for_test(records));
+        let right = element_warps_increment([16.0, 11.0], &mesh, 6);
+        assert!(right[0].abs() < 1e-12, "node 4 reached across its cut: {}", right[0]);
+        let left = element_warps_increment([11.0, 10.5], &mesh, 6);
+        assert!(left[0] > 0.1, "node 4 should contribute on its own side");
+    }
+
+    #[test]
+    fn element_warps_skip_subsets_whose_template_misses_the_point() {
+        // node 4 (10, 10) carries u = 5 but its template only reaches 2 px
+        let mut mesh = subsets_mesh([0.0; 6]);
+        mesh.centroids = crate::mesh::compute_centroids(&mesh.nodes, &mesh.elements);
+        mesh.p[[4, 0]] = 5.0;
+        mesh.template_sizes.as_mut().unwrap()[4] = 2;
+        let far = element_warps_increment([13.0, 11.0], &mesh, 6);
+        assert!(far[0].abs() < 1e-12, "node 4 used beyond its template: {}", far[0]);
+        let near = element_warps_increment([11.0, 10.5], &mesh, 6);
+        assert!(near[0] > 0.1, "node 4 should contribute inside its template");
     }
     use ndarray::array;
 
@@ -1631,6 +1820,21 @@ mod tests {
         assert!(w[1].abs() < 1e-12);
         assert!((w[2] - 1.0).abs() < 1e-12,     "w[2]={}", w[2]);  // du/dx
         for i in 3..6 { assert!(w[i].abs() < 1e-12, "w[{i}]={}", w[i]); }
+    }
+
+    #[test]
+    fn test_warp_increment_simple_shear_order1() {
+        // u = 0.3 y, v = 0.1 x: du/dy and dv/dx must land in their own slots
+        // (p order [u, v, du/dx, dv/dx, du/dy, dv/dy]).
+        let nodes = tri_nodes();
+        let disps = Array2::from_shape_fn((3, 2), |(k, c)| {
+            if c == 0 { 0.3 * nodes[[k, 1]] } else { 0.1 * nodes[[k, 0]] }
+        });
+        let w = warp_increment([1.0/3.0, 1.0/3.0], nodes.view(), disps.view(), 1);
+        assert!(w[2].abs() < 1e-12,         "du/dx={}", w[2]);
+        assert!((w[3] - 0.1).abs() < 1e-12, "dv/dx={}", w[3]);
+        assert!((w[4] - 0.3).abs() < 1e-12, "du/dy={}", w[4]);
+        assert!(w[5].abs() < 1e-12,         "dv/dy={}", w[5]);
     }
 
     #[test]
@@ -2067,6 +2271,7 @@ mod tests {
             template_sizes: None,
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 
@@ -2401,5 +2606,77 @@ mod tests {
 
         assert!((cal_disp[0] - 0.5 * uncal_disp[0]).abs() < 1e-9, "{} vs {}", cal_disp[0], 0.5 * uncal_disp[0]);
         assert!((cal_disp[1] - 0.5 * uncal_disp[1]).abs() < 1e-9, "{} vs {}", cal_disp[1], 0.5 * uncal_disp[1]);
+    }
+}
+
+/// The warp vector convention, `[u, v, u_x, v_x, u_y, v_y, u_xx, v_xx, u_xy,
+/// v_xy, u_yy, v_yy]`, on a skewed 6-node element under an exact quadratic
+/// field with a different value in every slot, so a swapped slot fails.
+#[cfg(test)]
+pub(crate) mod warp_convention_tests {
+    use super::*;
+    use ndarray::array;
+
+    // [u, v, u_x, v_x, u_y, v_y, u_xx, v_xx, u_xy, v_xy, u_yy, v_yy] at the origin
+    pub(crate) const Q: [f64; 12] = [0.1, -0.2, 0.02, 0.07, 0.03, -0.01, 0.004, 0.008, 0.005, 0.009, 0.006, -0.003];
+
+    /// The field's warp at (x, y), in convention order.
+    pub(crate) fn quad_warp(x: f64, y: f64) -> [f64; 12] {
+        let q = Q;
+        [
+            q[0] + q[2] * x + q[4] * y + 0.5 * q[6] * x * x + q[8] * x * y + 0.5 * q[10] * y * y,
+            q[1] + q[3] * x + q[5] * y + 0.5 * q[7] * x * x + q[9] * x * y + 0.5 * q[11] * y * y,
+            q[2] + q[6] * x + q[8] * y,
+            q[3] + q[7] * x + q[9] * y,
+            q[4] + q[8] * x + q[10] * y,
+            q[5] + q[9] * x + q[11] * y,
+            q[6], q[7], q[8], q[9], q[10], q[11],
+        ]
+    }
+
+    pub(crate) fn element() -> Array2<f64> {
+        let c = [[1.0, 2.0], [9.0, 3.5], [3.0, 8.0]];
+        let mid = |a: usize, b: usize| [(c[a][0] + c[b][0]) / 2.0, (c[a][1] + c[b][1]) / 2.0];
+        let (m01, m12, m20) = (mid(0, 1), mid(1, 2), mid(2, 0));
+        array![c[0], c[1], c[2], m01, m12, m20]
+    }
+
+    fn disps(nodes: &Array2<f64>, n: usize) -> Array2<f64> {
+        Array2::from_shape_fn((n, 2), |(k, j)| quad_warp(nodes[[k, 0]], nodes[[k, 1]])[j])
+    }
+
+    #[test]
+    fn order2_quadratic_field_every_slot() {
+        let nodes = element();
+        let w = warp_increment([4.0, 4.0], nodes.view(), disps(&nodes, 6).view(), 2);
+        let want = quad_warp(4.0, 4.0);
+        for k in 0..12 {
+            assert!((w[k] - want[k]).abs() < 1e-12, "slot {k}: {} vs {}", w[k], want[k]);
+        }
+    }
+
+    #[test]
+    fn order1_linear_field_every_slot() {
+        // The linear part of Q only (order-1 elements reproduce it exactly).
+        let nodes = element().slice(ndarray::s![0..3, ..]).to_owned();
+        let lin = |x: f64, y: f64| [Q[0] + Q[2] * x + Q[4] * y, Q[1] + Q[3] * x + Q[5] * y];
+        let d = Array2::from_shape_fn((3, 2), |(k, j)| lin(nodes[[k, 0]], nodes[[k, 1]])[j]);
+        let w = warp_increment([4.0, 4.0], nodes.view(), d.view(), 1);
+        let want = [lin(4.0, 4.0)[0], lin(4.0, 4.0)[1], Q[2], Q[3], Q[4], Q[5]];
+        for k in 0..6 {
+            assert!((w[k] - want[k]).abs() < 1e-12, "slot {k}: {} vs {}", w[k], want[k]);
+        }
+    }
+
+    #[test]
+    fn warp_at_follows_the_convention() {
+        // warp_at carries a subset's warp p (given at its centre) to an offset.
+        let (cx, cy, dx, dy) = (2.0, -1.0, 3.0, 5.0);
+        let p = quad_warp(cx, cy);
+        let w = warp_at(ndarray::ArrayView1::from(&p[..]), dx, dy);
+        let want = quad_warp(cx + dx, cy + dy);
+        for k in 0..6 {
+            assert!((w[k] - want[k]).abs() < 1e-12, "slot {k}: {} vs {}", w[k], want[k]);
+        }
     }
 }

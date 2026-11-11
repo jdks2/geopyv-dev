@@ -7,7 +7,7 @@ use ndarray::Array2;
 
 use geopyv_dev::image::Image;
 use geopyv_dev::io::GeopyvObject;
-use geopyv_dev::mesh::{Masking, Mesh, MeshSolution, SeedConfig, SolveConfig};
+use geopyv_dev::mesh::{Masking, Mesh, MeshSolution, SeedConfig, SolveConfig, Texture};
 use geopyv_dev::screen::{NoiseSource, StillPair};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::masks::{LocalMask, MaskShape};
@@ -284,6 +284,7 @@ pub struct MeshSpawnParams {
     pub zncc_tol: f64,
     pub time: Option<geopyv_dev::timing::TimeInput>,
     pub masking: Masking,
+    pub texture: Texture,
     /// Adaptive masking: frame 1 of a still pair with the reference image
     /// (no mechanical movement); `None` estimates the noise near the seed.
     pub still_path: Option<PathBuf>,
@@ -1122,6 +1123,7 @@ impl MeshTabState {
                     ui.end_row();
 
                     crate::subset_tab::masking_row(ui, s);
+                    crate::subset_tab::texture_row(ui, s);
 
                     ui.label(
                         egui::RichText::new("Max norm:")
@@ -1360,6 +1362,7 @@ impl MeshTabState {
                     zncc_tol: form.solver.zncc_tol,
                     time: form.time.input().ok().flatten(),
                     masking: form.solver.masking,
+                    texture: form.solver.texture,
                     still_path: (form.solver.masking == Masking::Adaptive)
                         .then(|| form.still_idx.map(|i| images[i].clone()))
                         .flatten(),
@@ -1545,6 +1548,7 @@ fn run_solve(
         },
         override_active: false,
         masking: params.masking,
+        texture: params.texture,
         ..Default::default()
     };
     let seed_warp = vec![0.0f64; 6 * p_len];

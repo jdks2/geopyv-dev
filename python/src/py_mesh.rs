@@ -24,7 +24,7 @@ use geopyv_dev::io::{save as io_save, GeopyvObject};
 use geopyv_dev::masks::MaskShape;
 use geopyv_dev::mesh::{
     self, LayerRgConfig, Masking, Mesh, MeshSeams, MeshSolution, Preconditioning, SeedConfig, SolveConfig,
-    SolveMethod,
+    SolveMethod, Texture,
 };
 use geopyv_dev::screen::{NoiseSource, StillPair};
 use pyo3::types::{PyDict, PyList};
@@ -83,7 +83,7 @@ impl PyMesh {
     #[new]
     #[pyo3(signature = (boundary, target_nodes, f_img, g_img,
                          size=(1.0, 1000.0), exclusions=None, exclusions_hard=None,
-                         mesh_order=1, time=None, noise=None))]
+                         mesh_order=1, time=None, noise=None, soil_properties=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         _py: Python<'_>,
@@ -97,8 +97,10 @@ impl PyMesh {
         mesh_order: u8,
         time: Option<&Bound<'_, PyAny>>,
         noise: Option<PyRef<'_, PyMesh>>,
+        soil_properties: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let time = crate::utils::extract_time_input(time)?;
+        let soil = crate::py_speckle::soil_properties_arg(soil_properties)?;
         let still = noise
             .map(|m| -> PyResult<StillPair> {
                 let solution = m.inner.solution().cloned().ok_or_else(|| {
@@ -138,6 +140,7 @@ impl PyMesh {
         .map_err(Error::from)?;
         inner.set_time(time.as_ref()).map_err(Error::from)?;
         inner.set_noise(still);
+        inner.soil_properties = soil;
 
         Ok(PyMesh {
             inner,
@@ -185,6 +188,18 @@ impl PyMesh {
     ///     nodes whose neighbours disagree beyond noise are investigated
     ///     and corrected (moved off a line through their centre, cut along
     ///     it, or re-solved at order 2). Needs ``subset_order=1``.
+    /// texture : str, optional
+    ///     ``"deformable"`` (default): the speckle stretches and shears with
+    ///     the material (painted speckle). ``"rigid"``: each speckle is a
+    ///     round lump that moves with the material under its centre but
+    ///     keeps its shape (grains, PIV tracer particles, ``gp.Speckle``);
+    ///     the reference template is corrected for the mismatch this leaves
+    ///     at the current strain. Wrong for painted speckle. Order 0 carries
+    ///     no strain, so it is the same as ``"deformable"`` there.
+    ///     ``"grains"``: opaque rigid grains of any shape (a grain surface such as
+    ///     sand) that turn with the material; the reference is split into grains
+    ///     once and each pixel corrected about its own grain's centre. Wrong where
+    ///     grains overlap and add (painted or translucent speckle).
     /// preconditioning : str, optional
     ///     Intra-mesh RG frontier traversal strategy -- ``"RG"`` (default,
     ///     today's serial cascade) or ``"layer-RG"`` (layer-parallel
@@ -207,6 +222,8 @@ impl PyMesh {
                         override_active=false,
                         preconditioning="RG",
                         masking="uniform",
+                        texture="deformable",
+                        grain=None,
                         layer_rg_batch_factor=4,
                         layer_rg_root_rel_eps=0.02,
                         layer_rg_max_workers=None))]
@@ -226,6 +243,8 @@ impl PyMesh {
         override_active: bool,
         preconditioning: &str,
         masking: &str,
+        texture: &str,
+        grain: Option<&str>,
         layer_rg_batch_factor: usize,
         layer_rg_root_rel_eps: f64,
         layer_rg_max_workers: Option<usize>,
@@ -263,6 +282,10 @@ impl PyMesh {
             max_workers: layer_rg_max_workers,
         };
         let masking = check_masking(masking)?;
+        let texture = check_texture(texture, grain)?;
+        if texture == Texture::RigidEdge && self.inner.soil_properties.is_none() {
+            return Err(PyValueError::new_err("grain='edge' needs the mesh's soil_properties"));
+        }
         let cfg = SolveConfig {
             max_norm,
             max_iterations,
@@ -273,6 +296,7 @@ impl PyMesh {
             preconditioning,
             layer_rg,
             masking,
+            texture,
         };
         self.inner.solve(local_mask_ref, &seed, &cfg, None).map_err(Error::from)?;
         Ok(())
@@ -337,6 +361,12 @@ impl PyMesh {
         self.inner.time_source.describe()
     }
 
+    /// The soil properties given at instantiation (as a dict), or ``None``.
+    #[getter]
+    fn soil_properties<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.inner.soil_properties.as_ref().map(|c| crate::py_speckle::soil_properties_dict(py, c)).transpose()
+    }
+
     #[getter]
     fn f_img(&self, py: Python<'_>) -> Option<Py<PyImage>> {
         self.f_img.as_ref().map(|img| img.clone_ref(py))
@@ -386,6 +416,17 @@ impl PyMesh {
         }
     }
 
+    /// Each subset's history in a tracked sequence (dict of per-node arrays:
+    /// ``id``, ``origin``, ``position``, ``reference_warp``, ``increment``,
+    /// ``warp``), or ``None`` outside one.
+    #[getter]
+    fn tracks<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        match self.require_solved_arc()?.tracks.as_ref() {
+            Some(t) => Ok(Some(tracks_dict(py, t)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Per-node ZNCC scores ``(N,)``.
     #[getter]
     fn c_zncc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
@@ -408,6 +449,13 @@ impl PyMesh {
     #[getter]
     fn subset_order(&self) -> PyResult<u8> {
         Ok(self.require_solved()?.subset_order)
+    }
+
+    /// Speckle texture the mesh was solved with: ``("deformable", None)``,
+    /// ``("rigid", "sphere")`` or ``("rigid", "shape")``.
+    #[getter]
+    fn texture(&self) -> PyResult<(&'static str, Option<&'static str>)> {
+        Ok(texture_pair(self.require_solved()?.solve_config.as_ref().map(|c| c.texture)))
     }
 
     /// Per-node iteration counts ``(N,)``.
@@ -629,6 +677,7 @@ impl PyMeshSolution {
                 template_sizes: None,
                 time: None,
                 seams: None,
+                tracks: None,
             },
         }
     }
@@ -698,6 +747,13 @@ impl PyMeshSolution {
         self.inner.subset_order
     }
 
+    /// Speckle texture the mesh was solved with: ``("deformable", None)``,
+    /// ``("rigid", "sphere")`` or ``("rigid", "shape")``.
+    #[getter]
+    fn texture(&self) -> (&'static str, Option<&'static str>) {
+        texture_pair(self.inner.solve_config.as_ref().map(|c| c.texture))
+    }
+
     #[getter]
     fn f_img_path(&self) -> Option<String> {
         let s = self.inner.f_img_path.to_string_lossy().into_owned();
@@ -723,6 +779,13 @@ impl PyMeshSolution {
     #[getter]
     fn template_shape(&self) -> Option<String> {
         self.inner.template_shape.as_ref().map(mask_shape_name)
+    }
+
+    /// Each subset's history in a tracked sequence (see ``Mesh.tracks``), or
+    /// ``None`` outside one.
+    #[getter]
+    fn tracks<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.inner.tracks.as_ref().map(|t| tracks_dict(py, t)).transpose()
     }
 
     #[getter]
@@ -898,7 +961,47 @@ pub(crate) fn check_masking(masking: &str) -> PyResult<Masking> {
     }
 }
 
+/// `texture=` and `grain=`: `"deformable"` (no `grain`), or `"rigid"` with
+/// `grain` `"shape"` (default) or `"sphere"` — see [`Texture`].
+pub(crate) fn check_texture(texture: &str, grain: Option<&str>) -> PyResult<Texture> {
+    match (texture, grain) {
+        ("deformable", None) => Ok(Texture::Deformable),
+        ("deformable", Some(g)) => Err(PyValueError::new_err(format!(
+            "grain={g:?} applies only to texture='rigid'"))),
+        ("rigid", None | Some("shape")) => Ok(Texture::RigidShape),
+        ("rigid", Some("sphere")) => Ok(Texture::RigidSphere),
+        ("rigid", Some("edge")) => Ok(Texture::RigidEdge),
+        ("rigid", Some(other)) => Err(PyValueError::new_err(format!(
+            "grain must be 'sphere', 'shape' or 'edge', got {other:?}"))),
+        (other, _) => Err(PyValueError::new_err(format!(
+            "texture must be 'deformable' or 'rigid', got {other:?}"))),
+    }
+}
+
+/// Python form of a texture: `("deformable", None)`, `("rigid", "sphere")`
+/// or `("rigid", "shape")` (`None` input: no stored setting, i.e. deformable).
+pub(crate) fn texture_pair(t: Option<Texture>) -> (&'static str, Option<&'static str>) {
+    match t.unwrap_or_default() {
+        Texture::Deformable => ("deformable", None),
+        Texture::RigidSphere => ("rigid", Some("sphere")),
+        Texture::RigidShape => ("rigid", Some("shape")),
+        Texture::RigidEdge => ("rigid", Some("edge")),
+    }
+}
+
 /// An adaptive-masking record as a dict of per-node arrays.
+/// `NodeTracks` as a dict of numpy arrays.
+pub(crate) fn tracks_dict<'py>(py: Python<'py>, t: &geopyv_dev::mesh::NodeTracks) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("id", Array1::from(t.id.clone()).into_pyarray_bound(py))?;
+    d.set_item("origin", t.origin.clone().into_pyarray_bound(py))?;
+    d.set_item("position", t.position.clone().into_pyarray_bound(py))?;
+    d.set_item("reference_warp", t.reference_warp.clone().into_pyarray_bound(py))?;
+    d.set_item("increment", t.increment.clone().into_pyarray_bound(py))?;
+    d.set_item("warp", t.warp.clone().into_pyarray_bound(py))?;
+    Ok(d)
+}
+
 pub(crate) fn seams_dict<'py>(py: Python<'py>, m: &MeshSeams) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
     d.set_item("plain_nodes", m.plain_nodes.clone().into_pyarray_bound(py))?;

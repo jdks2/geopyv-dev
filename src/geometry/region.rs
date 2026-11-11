@@ -238,8 +238,8 @@ impl Region {
     /// Replicates `Region._store` for `option == "R"`.
     ///
     /// `warp` is a 1-D warp parameter vector with at least 5 elements:
-    /// `[u, v, _, du/dx, du/dy, ...]` where `[u, v]` is the translation and
-    /// `theta = (warp[3] - warp[4]) / 2` is the rotation angle.
+    /// `[u, v, du/dx, dv/dx, du/dy, ...]` where `[u, v]` is the translation and
+    /// `theta = (dv/dx - du/dy) / 2 = (warp[3] - warp[4]) / 2` is the rotation angle.
     pub fn store_rigid(&mut self, warp: &[f64]) -> Result<(), Error> {
         if warp.len() < 5 {
             return Err(Error::InvalidInput(

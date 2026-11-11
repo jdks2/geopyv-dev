@@ -186,6 +186,13 @@ def test_warp_increment_pure_y_stretch_order1():
     np.testing.assert_allclose(w[5], 1.0, atol=1e-12)   # dv/dy
 
 
+def test_warp_increment_simple_shear_order1():
+    # u = 0.3 y, v = 0.1 x: p order [u, v, du/dx, dv/dx, du/dy, dv/dy]
+    disps = np.stack([0.3 * TRI_NODES[:, 1], 0.1 * TRI_NODES[:, 0]], axis=1)
+    w = particle_warp_increment([1/3, 1/3], TRI_NODES, disps, 1)
+    np.testing.assert_allclose(w[2:6], [0.0, 0.1, 0.3, 0.0], atol=1e-12)
+
+
 def test_warp_increment_pure_translation_order2():
     u, v = 1.5, 2.5
     disps = np.tile([u, v], (6, 1))
@@ -449,3 +456,45 @@ def test_particle_solution_repr():
     p = Particle([1/3, 1/3], [0.0]*6, 1.0, 2)
     p.solve()
     assert "Particle" in repr(p)
+
+
+# ===========================================================================
+# Tests: strain_method="element_warps"
+# ===========================================================================
+
+@pytest.fixture(scope="module")
+def solved_mesh(tmp_path_factory):
+    import glob, os
+    import geopyv_dev as gp
+    d = str(tmp_path_factory.mktemp("element_warps"))
+    comp = [1.2, -0.4, 0.02, 0.01, -0.015, 0.03] + [0.0] * 6
+    sp = gp.Speckle(image_cfg={"image_dir": d, "name": "e", "image_size": (301, 301), "file_format": ".png"},
+                    speckle_cfg={"speckle_size": 2.5, "speckle_number": 1000}, progression="deformation",
+                    deformation_cfg={"comp": comp, "origin": (150.0, 150.0)}, noise_cfg=(0.0, 0.0),
+                    scale_cfg={"scale": "lin", "n": 2})
+    sp.solve(seed=5)
+    f0, f1 = sorted(glob.glob(os.path.join(d, "*.png")))
+    boundary = np.array([[60.0, 60.0], [240.0, 60.0], [240.0, 240.0], [60.0, 240.0]])
+    mesh = gp.Mesh(boundary=gp.PathRegion(nodes=boundary, hard=False), target_nodes=60,
+                   f_img=gp.Image(filepath=f0), g_img=gp.Image(filepath=f1))
+    mesh.solve(local_mask=gp.Mask(mask_type="local", shape="circle", size=20), seed_coord=[200.0, 200.0])
+    return mesh
+
+
+def test_element_warps_at_a_subset_centre_is_that_subset(solved_mesh):
+    """At a subset centre the element weights are 1 on that subset, so
+    element_warps returns its own warp."""
+    import geopyv_dev as gp
+    nodes, p = np.asarray(solved_mesh.nodes), np.asarray(solved_mesh.p)
+    i = int(np.argmin(np.hypot(*(nodes - 150.0).T)))
+    part = gp.Particle(solved_mesh, [float(nodes[i, 0]), float(nodes[i, 1])])
+    part.solve(strain_method="element_warps")
+    np.testing.assert_allclose(np.asarray(part.incs)[1, :6], p[i, :6], atol=1e-9)
+
+
+def test_element_warps_unknown_name_raises(solved_mesh):
+    import geopyv_dev as gp
+    nodes = np.asarray(solved_mesh.nodes)
+    part = gp.Particle(solved_mesh, [float(nodes[0, 0]), float(nodes[0, 1])])
+    with pytest.raises(ValueError, match="element_warps"):
+        part.solve(strain_method="nope")

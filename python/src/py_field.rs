@@ -158,14 +158,19 @@ impl PyField {
     ///     Volumetric correction factor. Default 0.0.
     /// true_incs : bool, optional
     ///     Logarithmic strain increments. Default ``True``.
-    /// strain_method : MeshlessParams or False, optional
+    /// strain_method : MeshlessParams, str or False, optional
     ///     ``None`` (default): the subset average -- each particle takes the
     ///     weighted average of the warps of every subset whose template holds
     ///     it and whose cuts (adaptive masking) keep it, each evaluated at the
-    ///     particle; the most accurate option. A ``MeshlessParams`` instance:
-    ///     the meshless (IRLS-robust MLS) fit to node displacements with those
-    ///     parameters. ``False``: mesh-element (shape-function) interpolation.
-    ///     Both are retained for comparison.
+    ///     particle. ``"element_warps"``: the warps of the particle's own mesh
+    ///     element's subsets, each evaluated at the particle and blended with
+    ///     the element weights, leaving out subsets that are cut away or whose
+    ///     template does not reach it (lowest displacement error; see
+    ///     ``geopyv_dev_pub/docs/particle_interp_report.pdf``). A
+    ///     ``MeshlessParams`` instance: the meshless (IRLS-robust MLS) fit to
+    ///     node displacements with those parameters. ``False``: mesh-element
+    ///     (shape-function) interpolation of node displacements. The last two
+    ///     are retained for comparison.
     #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None, strain_method=None))]
     fn solve(
         &mut self,

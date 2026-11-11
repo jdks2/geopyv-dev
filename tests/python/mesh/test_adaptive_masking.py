@@ -149,7 +149,9 @@ def test_sequence_uses_frames_zero_one_for_noise(frames):
 # frame 1 (same speckles, fresh noise of 2 grey levels), and frame 2 with a
 # 10-speckle-wide horizontal shear band. The flagged and sent node sets were
 # checked against the sandbox reference (screen_all.pkl, wd10 low noise) and
-# match exactly. A ~1e-13 px run-to-run wobble in the plain solve can flip a
+# matched exactly; re-based 2026-11-04 after the sub-pixel gradient fix
+# (Image::eval_grad), which changes the screening: 1551 -> 1450 flagged,
+# 1274 -> 1236 sent, 4 -> 6 rounds (old file: adaptive_wd10_golden_pre_gradfix.npz). A ~1e-13 px run-to-run wobble in the plain solve can flip a
 # handful of borderline cut/leave decisions, so action counts get a margin.
 # The action counts are those of cut -> move to the kept side's centre of area
 # -> re-test (geopyv_dev_pub/docs/centroid_jolt_report.pdf).

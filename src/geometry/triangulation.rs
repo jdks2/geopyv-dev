@@ -55,6 +55,140 @@ pub fn generate_mesh(
     build_trimesh(&poly, max_area, size_lower, mesh_order)
 }
 
+/// The closed boundary loops of an order-1 triangulation (corner columns of
+/// `elements`): every edge used by exactly one element, chained head to tail
+/// in the elements' own orientation. One loop for the outer boundary and one
+/// per hole; every node on a boundary appears, in order.
+pub fn boundary_loops(elements: &Array2<usize>) -> Vec<Vec<usize>> {
+    let mut count: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut directed: Vec<(usize, usize)> = Vec::new();
+    for row in elements.rows() {
+        for k in 0..3 {
+            let (a, b) = (row[k], row[(k + 1) % 3]);
+            *count.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+            directed.push((a, b));
+        }
+    }
+    let mut next: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &(a, b) in &directed {
+        if count[&(a.min(b), a.max(b))] == 1 {
+            next.entry(a).or_default().push(b);
+        }
+    }
+    let mut starts: Vec<usize> = next.keys().copied().collect();
+    starts.sort_unstable();
+    let mut loops = Vec::new();
+    for s in starts {
+        while next.get(&s).is_some_and(|v| !v.is_empty()) {
+            let mut lp = vec![s];
+            let mut cur = next.get_mut(&s).unwrap().pop().unwrap();
+            while cur != s {
+                lp.push(cur);
+                match next.get_mut(&cur).and_then(|v| v.pop()) {
+                    Some(n) => cur = n,
+                    None => break,
+                }
+            }
+            loops.push(lp);
+        }
+    }
+    loops
+}
+
+/// Result of [`retriangulate`].
+pub struct Retriangulation {
+    /// Order-1 connectivity `(M, 3)` over the input node indices.
+    pub elements: Array2<usize>,
+    /// Input nodes no element uses: outside the outer loop, inside a hole, or
+    /// at the same position as an earlier node.
+    pub orphans: Vec<usize>,
+    /// Loop edges that could not be enforced because they cross another.
+    pub skipped_constraints: usize,
+}
+
+/// Delaunay connectivity for given node positions, keeping every node's
+/// index: constrained along `loops` (closed node chains, e.g. from
+/// [`boundary_loops`] of a previous triangulation with its nodes moved). The
+/// loop of largest area is the outer boundary and the others are holes;
+/// elements outside the outer boundary or inside a hole are dropped, as are
+/// slivers (area below 1e-8 of the longest edge squared) between nodes of a
+/// straight boundary.
+pub fn retriangulate(nodes: ArrayView2<f64>, loops: &[Vec<usize>]) -> Result<Retriangulation, Error> {
+    let n = nodes.nrows();
+    let mut cdt = Cdt::new();
+    let mut handle_of = Vec::with_capacity(n);
+    let mut node_of: HashMap<usize, usize> = HashMap::new();
+    let mut orphans = Vec::new();
+    for i in 0..n {
+        let h = cdt.insert(Point2::new(nodes[[i, 0]], nodes[[i, 1]])).map_err(|e: InsertionError| {
+            Error::MeshGeneration(format!("node {i} insertion failed: {e:?}"))
+        })?;
+        if node_of.contains_key(&h.index()) {
+            orphans.push(i); // coincides with an earlier node
+        } else {
+            node_of.insert(h.index(), i);
+        }
+        handle_of.push(h);
+    }
+    let mut skipped_constraints = 0;
+    for lp in loops {
+        for k in 0..lp.len() {
+            let (a, b) = (handle_of[lp[k]], handle_of[lp[(k + 1) % lp.len()]]);
+            if a == b {
+                continue;
+            }
+            if cdt.can_add_constraint(a, b) {
+                cdt.add_constraint(a, b);
+            } else {
+                skipped_constraints += 1;
+            }
+        }
+    }
+    let poly = |lp: &Vec<usize>| -> Vec<(f64, f64)> { lp.iter().map(|&i| (nodes[[i, 0]], nodes[[i, 1]])).collect() };
+    let area = |pts: &[(f64, f64)]| {
+        (0..pts.len()).map(|k| {
+            let (a, b) = (pts[k], pts[(k + 1) % pts.len()]);
+            a.0 * b.1 - b.0 * a.1
+        }).sum::<f64>().abs() / 2.0
+    };
+    let polys: Vec<Vec<(f64, f64)>> = loops.iter().map(poly).collect();
+    let outer = (0..polys.len())
+        .max_by(|&a, &b| area(&polys[a]).partial_cmp(&area(&polys[b])).unwrap_or(std::cmp::Ordering::Equal))
+        .ok_or_else(|| Error::MeshGeneration("retriangulate needs at least one boundary loop".into()))?;
+    let mut rows: Vec<[usize; 3]> = Vec::new();
+    for face in cdt.inner_faces() {
+        let [p0, p1, p2] = face.positions();
+        let (cx, cy) = ((p0.x + p1.x + p2.x) / 3.0, (p0.y + p1.y + p2.y) / 3.0);
+        let inside = point_in_polygon_winding(cx, cy, &polys[outer])
+            && !polys.iter().enumerate().any(|(k, p)| k != outer && point_in_polygon_winding(cx, cy, p));
+        // A sliver between consecutive nodes of a straight boundary (collinear
+        // up to rounding) is not an element.
+        let twice_area = ((p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y)).abs();
+        let longest = [(p0, p1), (p1, p2), (p2, p0)]
+            .iter()
+            .map(|(a, b)| (a.x - b.x).powi(2) + (a.y - b.y).powi(2))
+            .fold(0.0, f64::max);
+        if inside && twice_area > 1e-8 * longest {
+            let v = face.vertices();
+            rows.push([node_of[&v[0].fix().index()], node_of[&v[1].fix().index()], node_of[&v[2].fix().index()]]);
+        }
+    }
+    let used: HashSet<usize> = rows.iter().flatten().copied().collect();
+    for i in 0..n {
+        if !used.contains(&i) && !orphans.contains(&i) {
+            orphans.push(i);
+        }
+    }
+    orphans.sort_unstable();
+    let mut elements = Array2::<usize>::zeros((rows.len(), 3));
+    for (e, r) in rows.iter().enumerate() {
+        for k in 0..3 {
+            elements[[e, k]] = r[k];
+        }
+    }
+    Ok(Retriangulation { elements, orphans, skipped_constraints })
+}
+
 // ---------------------------------------------------------------------------
 // Internal polygon data
 // ---------------------------------------------------------------------------
@@ -569,6 +703,51 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn boundary_loops_of_a_mesh_with_a_hole() {
+        let (b, s, c) = square_roi_with_hole(100.0, 40.0);
+        let tm = generate_mesh(b.view(), s.view(), &c, 1.0, 1000.0, 300, 1).unwrap();
+        let loops = boundary_loops(&tm.elements);
+        assert_eq!(loops.len(), 2, "outer boundary and one hole");
+        for v in tm.boundary.iter().chain(tm.exclusions[0].iter()) {
+            assert!(loops.iter().any(|l| l.contains(v)), "polygon vertex {v} missing from the loops");
+        }
+    }
+
+    #[test]
+    fn retriangulate_keeps_nodes_and_the_hole_after_a_shear() {
+        let (b, s, c) = square_roi_with_hole(100.0, 40.0);
+        let tm = generate_mesh(b.view(), s.view(), &c, 1.0, 1000.0, 300, 1).unwrap();
+        let loops = boundary_loops(&tm.elements);
+        // simple shear x += 0.4 y: element shapes change, the domain stays one piece
+        let mut moved = tm.nodes.clone();
+        for i in 0..moved.nrows() {
+            moved[[i, 0]] += 0.4 * moved[[i, 1]];
+        }
+        let r = retriangulate(moved.view(), &loops).unwrap();
+        assert!(r.orphans.is_empty(), "orphans {:?}", r.orphans);
+        assert_eq!(r.skipped_constraints, 0);
+        // every element has positive area and none lies inside the (sheared) hole
+        let hole: Vec<(f64, f64)> = loops
+            .iter()
+            .find(|l| l.contains(&tm.exclusions[0][0]))
+            .unwrap()
+            .iter()
+            .map(|&i| (moved[[i, 0]], moved[[i, 1]]))
+            .collect();
+        let mut total = 0.0;
+        for e in r.elements.rows() {
+            let p = |k: usize| (moved[[e[k], 0]], moved[[e[k], 1]]);
+            let ((ax, ay), (bx, by), (cx, cy)) = (p(0), p(1), p(2));
+            let a = 0.5 * ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay));
+            assert!(a.abs() > 1e-9, "degenerate element {:?} {:?} {:?} area {a}", p(0), p(1), p(2));
+            total += a.abs();
+            assert!(!point_in_polygon_winding((ax + bx + cx) / 3.0, (ay + by + cy) / 3.0, &hole));
+        }
+        // shear preserves area: 100² minus the 40² hole
+        assert!((total - (100.0 * 100.0 - 40.0 * 40.0)).abs() < 1e-6, "area {total}");
+    }
 
     #[test]
     fn equilateral_area_correct() {

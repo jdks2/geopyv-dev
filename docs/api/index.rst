@@ -32,6 +32,20 @@ Loaded images and the regions used to mask or seed a subset/mesh — see
 .. autoclass:: geopyv_dev.PathRegion
    :members:
 
+Synthetic images
+----------------
+
+Speckle and soil image series with a known deformation — see
+:doc:`../tutorials/01_images_and_masks` (sections *The Speckle class* and *Soil images*).
+
+.. autosummary::
+   :nosignatures:
+
+   geopyv_dev.Speckle
+
+.. autoclass:: geopyv_dev.Speckle
+   :members:
+
 Correlation
 -----------
 

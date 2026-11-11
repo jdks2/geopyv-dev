@@ -50,7 +50,7 @@ use ndarray::{Array2, ArrayView2};
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 
-use crate::{image::Image, masks::LocalMask, mesh::SolveMethod, subset::{SolveResult, Subset}, Error};
+use crate::{image::Image, masks::LocalMask, mesh::{SolveMethod, Texture}, subset::{SolveResult, Subset}, Error};
 
 // ---------------------------------------------------------------------------
 // Configuration, levels and records
@@ -1166,11 +1166,12 @@ struct Settings {
     tolerance: f64,
     max_norm: f64,
     max_iterations: usize,
+    texture: Texture,
 }
 
 impl Settings {
     fn of(r: &SolveResult) -> Self {
-        Settings { method: r.method, tolerance: r.tolerance, max_norm: r.max_norm, max_iterations: r.max_iterations }
+        Settings { method: r.method, tolerance: r.tolerance, max_norm: r.max_norm, max_iterations: r.max_iterations, texture: r.texture }
     }
 }
 
@@ -1183,6 +1184,7 @@ struct Builder<'a> {
     settings: Settings,
     time: Option<(f64, f64)>,
     time_source: crate::timing::TimeSource,
+    soil_properties: Option<crate::soil::SoilConfig>,
 }
 
 impl Builder<'_> {
@@ -1196,10 +1198,11 @@ impl Builder<'_> {
         let mut s = Subset::new(coord, &lm, self.global_mask, Arc::clone(&self.f_img), Arc::clone(&self.g_img), order).ok()?;
         s.time = self.time;
         s.time_source = self.time_source.clone();
+        s.soil_properties = self.soil_properties.clone();
         let st = self.settings;
         let r = match st.method {
-            SolveMethod::Icgn => s.solve_icgn(Some(p0), st.tolerance, st.max_norm, st.max_iterations),
-            SolveMethod::Fagn => s.solve_fagn(Some(p0), st.tolerance, st.max_norm, st.max_iterations),
+            SolveMethod::Icgn => s.solve_icgn(Some(p0), st.tolerance, st.max_norm, st.max_iterations, st.texture),
+            SolveMethod::Fagn => s.solve_fagn(Some(p0), st.tolerance, st.max_norm, st.max_iterations, st.texture),
         };
         r.ok()?;
         s.solution().filter(|sol| sol.result.converged)?;
@@ -1465,6 +1468,7 @@ impl Subset {
             settings,
             time: self.time,
             time_source: self.time_source.clone(),
+            soil_properties: self.soil_properties.clone(),
         }
     }
 
@@ -1681,5 +1685,23 @@ mod tests {
         assert!(require_lossless(&img).is_ok());
         img.filepath = Some("a/b/ref.jpg".into());
         assert!(require_lossless(&img).is_err());
+    }
+}
+
+/// `shift_warp` carries an order-1 warp `[u, v, u_x, v_x, u_y, v_y]` along by `d`
+/// (a different value in every slot, so a swapped slot fails).
+#[cfg(test)]
+mod warp_convention_tests {
+    use super::*;
+    use crate::particle::warp_convention_tests::Q;
+
+    #[test]
+    fn shift_warp_every_slot() {
+        let d = [3.0, 5.0];
+        let q = shift_warp(&Q[..6], d);
+        let want = [Q[0] + Q[2] * d[0] + Q[4] * d[1], Q[1] + Q[3] * d[0] + Q[5] * d[1], Q[2], Q[3], Q[4], Q[5]];
+        for k in 0..6 {
+            assert!((q[k] - want[k]).abs() < 1e-14, "slot {k}: {} vs {}", q[k], want[k]);
+        }
     }
 }

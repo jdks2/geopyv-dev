@@ -84,6 +84,120 @@ progression that frame is) is applied analytically to the reference positions, n
 frame-to-frame from the previous image. Image 0 is always the undeformed reference; each
 subsequent image carries progressively more deformation and/or noise.
 
+Soil images
+~~~~~~~~~~~
+
+For tests on soils, ``Speckle`` can instead draw a soil image from what can be measured on
+photographs of the bulk material: the average brightness and spread of the **matrix** and of the
+**seeding** (dyed grains), and the **artificial seeding ratio** — the share of the image that
+shows dye (0 none, 1 all). Give ``"soil"`` in ``speckle_cfg``; ``speckle_size`` and
+``speckle_number`` are then not needed.
+
+- ``"soil": "clay"`` — dyed sand grains scattered on a clay matrix. The clay has its own fine,
+  low-contrast pattern which stretches and shears with the clay; the grains are rigid.
+- ``"soil": "sand"`` — packed sand: grains in several layers, a share ``asr`` of them dyed, so the gaps
+  between surface grains show deeper grains. At each pixel the nearest grain is seen. All layers move together (plane strain).
+
+In both, grains never cross each other (they may touch), keep their shape, move with the
+material at their centre and turn with it. Lens blur and noise can then be added.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Key
+     - Meaning (default)
+   * - ``matrix_brightness``
+     - average brightness of the matrix: the clay, or the natural sand grains (grey levels,
+       0-255; required)
+   * - ``matrix_spread``
+     - clay: strength of the clay's pattern; sand: grain-to-grain spread of the natural grains;
+       a fraction of ``matrix_brightness`` (0.05 clay, 0.15 sand)
+   * - ``seed_brightness``
+     - average brightness of the dyed grains (required)
+   * - ``seed_spread``
+     - grain-to-grain spread of the dyed grains, a fraction of ``seed_brightness`` (0.09)
+   * - ``asr``
+     - artificial seeding ratio, the share of the image showing dye, 0 to 1 (required). Clay:
+       share covered by dyed grains (below 0.55, the most that grains placed at random without
+       crossing can cover); sand: chance that a grain is dyed.
+   * - ``grains``
+     - ``"uniform"`` (default): every grain the same size (``d_p``) and aspect ratio
+       (``aspect_ratio``); ``"distribution"``: sizes from ``psd``, aspect ratios spread by
+       ``aspect_ratio_sd``. In clay the grains are the seeding sand.
+   * - ``psd``
+     - ``"distribution"``: the grains' cumulative size curve, an ``(n, 2)`` array of particle size (any length
+       unit; EQPC, the diameter of a circle with the grain's projected area) and % by mass
+       passing. A full curve, or a few points such as x10, x50 and x90 (extended log-normally
+       past its ends).
+   * - ``d_p``
+     - the median size x50 in pixels (particle diameter / pixel) (6). Grains smaller than a pixel
+       cannot be drawn; deeper layers or the matrix stand in for them. Particle images below
+       about 4 px give peak-locking.
+   * - ``aspect_ratio``
+     - aspect ratio, narrowest / widest width (1). With ``"distribution"``, the mean.
+   * - ``aspect_ratio_sd``
+     - ``"distribution"``: its standard deviation over the grains (0); drawn per grain,
+       independently of size.
+   * - ``outlines``
+     - optional path to a QicPic particle report (.docx): the outline statistics of that sand's
+       single grains (two grains overlapping at a pinch are left out), and its aspect ratio
+       (mean, and with ``"distribution"`` its standard deviation) unless given above. Without it,
+       the statistics of Leighton Buzzard sand are used.
+   * - ``depth_layers``
+     - sand: number of grain layers (6)
+   * - ``pattern_size``
+     - clay: feature size of the clay's pattern in px (10)
+   * - ``blur``
+     - lens blur width in px over the whole image (0, none)
+   * - ``grain_tilt``
+     - brighter towards one side of each grain: median change over one radius, as a fraction of the
+       grain's brightness, in a random direction (0.14)
+   * - ``grain_dome``
+     - spread of each grain's change from edge to centre (mean 0: some brighter in the middle, some
+       darker) (0.17)
+   * - ``grain_rim``
+     - darker by this fraction at each grain's edge (0, none); the lens blur already darkens edges
+   * - ``grain_texture``, ``texture_size``
+     - spread of a patchy texture inside each grain (0.085), and its feature size in grain
+       diameters (0.10)
+
+Each grain's outline is an ellipse (its aspect ratio) times irregularity waves of 3 to 24 bulges, drawn
+from the outline statistics with random phases and redrawn while it has a deeper dent than real grains
+have. Grains of aspect ratio 1 with no spread and no ``outlines`` are circles. Sphericity is not a
+setting: a QicPic sphericity is set mostly by fine surface roughness and pixel steps (a traced perfect
+circle scores 0.948), not by the outline a camera sees.
+
+Inside its outline a grain's brightness varies: the tilt, dome, rim and texture are fixed to the
+grain (they move and turn with it) and keep its mean brightness. The defaults are calibrated so that
+measurements of real Leighton Buzzard grains (tilt 0.16 per radius, dome spread 0.16, texture 5 %)
+come out after a 0.8 px blur and noise of 2 grey levels; the dark rim seen there comes from the lens
+blur alone, so ``grain_rim`` is 0. Set all four to 0 for flat grains.
+
+After ``solve()``, ``grains(i)`` gives the true grains of image ``i``: a table (centre, size, aspect ratio,
+orientation, brightness, dyed, depth layer) and a map of which grain each pixel shows (the grain's
+row + 1 where it covers more than half of the pixel, 0 for the matrix, -1 for a pixel shared along an edge).
+
+Lens blur and noise simulate experimental error and are both optional: by default there is no
+blur, and ``noise_cfg=(0.0, 0.0)`` gives no noise. Noise comes from ``noise_cfg`` as before (an
+intensity of 0.01 is 2 grey levels). The defaults come from measurements on real images of a
+footing test (sand over clay) and a T-bar test in clay with dyed sand.
+
+.. code-block:: python
+
+   clay = gp.Speckle(
+       image_cfg={"image_dir": "images/clay", "name": "clay", "image_size": (1001, 1001),
+                  "file_format": ".png"},
+       speckle_cfg={"soil": "clay", "matrix_brightness": 180, "seed_brightness": 105,
+                    "asr": 0.1, "grains": "distribution",
+                    "psd": np.array([[200, 10], [310, 50], [500, 90]]),
+                    "d_p": 6, "aspect_ratio": 0.74, "aspect_ratio_sd": 0.11},
+       progression="deformation",
+       deformation_cfg={"comp": [0, 0, 0, 0, 0.01, 0, 0, 0, 0, 0, 0, 0]},
+       noise_cfg=(0.0, 0.01),
+       scale_cfg={"scale": "lin", "n": 2},
+   )
+   clay.solve(seed=1)
+
 What a deforming image series looks like
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -105,6 +105,60 @@ pub struct MeshSolution {
     /// uniform solve.
     #[serde(default)]
     pub seams: Option<MeshSeams>,
+    /// What each subset carries through a tracked sequence
+    /// (`solver_options={"topology": "tracked"}`): the material point it
+    /// stays on and that point's history. `None` outside tracked sequences.
+    #[serde(default)]
+    pub tracks: Option<NodeTracks>,
+}
+
+/// Per-subset history in a tracked sequence, one row per node in node order.
+///
+/// In a tracked sequence each subset stays on one material point: at every
+/// reference update the subsets are moved by their own displacements and
+/// re-solved there, and only the connectivity between them is rebuilt. A
+/// subset's material point is its centre before any cut move (adaptive
+/// masking moves a cut subset's centre into the side it keeps; its warp is
+/// carried back to the material point). Warps are first order, in the warp
+/// convention `[u, v, u_x, v_x, u_y, v_y]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NodeTracks {
+    /// Identity of the material point, the same for the whole sequence.
+    pub id: Vec<u64>,
+    /// Position of the material point in the sequence's first image, `(N, 2)`.
+    pub origin: Array2<f64>,
+    /// Position of the material point in this pair's reference image, `(N, 2)`.
+    pub position: Array2<f64>,
+    /// Warp of the material point from the first image to this pair's
+    /// reference image, `(N, 6)`: `u` its displacement, the gradients
+    /// `F - I` with `F = ∂x_reference / ∂x_first`.
+    pub reference_warp: Array2<f64>,
+    /// Warp across this pair (reference to target) at the material point: the
+    /// subset's own warp carried to `position`, `(N, 6)`.
+    pub increment: Array2<f64>,
+    /// Warp of the material point from the first image to this pair's target
+    /// image, `(N, 6)`: `increment` composed with `reference_warp`
+    /// (displacements add, `F_target = (I + ∇u_increment) F_reference`).
+    pub warp: Array2<f64>,
+}
+
+impl NodeTracks {
+    /// Compose a first-order warp `inc` (relative to the reference image) onto
+    /// `reference` (first image to reference image).
+    pub fn compose(reference: &[f64], inc: &[f64]) -> [f64; 6] {
+        // gradient matrices [[u_x, u_y], [v_x, v_y]] in the warp order [.., u_x, v_x, u_y, v_y]
+        let f_ref = [[1.0 + reference[2], reference[4]], [reference[3], 1.0 + reference[5]]];
+        let f_inc = [[1.0 + inc[2], inc[4]], [inc[3], 1.0 + inc[5]]];
+        let f = |i: usize, j: usize| f_inc[i][0] * f_ref[0][j] + f_inc[i][1] * f_ref[1][j];
+        [
+            reference[0] + inc[0],
+            reference[1] + inc[1],
+            f(0, 0) - 1.0,
+            f(1, 0),
+            f(0, 1),
+            f(1, 1) - 1.0,
+        ]
+    }
 }
 
 /// What adaptive masking did to one mesh.
@@ -188,6 +242,9 @@ pub struct SolveConfig {
     /// Uniform (plain) or adaptive masking — see [`Masking`].
     #[serde(default)]
     pub masking: Masking,
+    /// Deformable (classic) or rigid speckle texture — see [`Texture`].
+    #[serde(default)]
+    pub texture: Texture,
 }
 
 impl Default for SolveConfig {
@@ -202,6 +259,7 @@ impl Default for SolveConfig {
             preconditioning: Preconditioning::Rg,
             layer_rg: LayerRgConfig::default(),
             masking: Masking::Uniform,
+            texture: Texture::Deformable,
         }
     }
 }
@@ -256,6 +314,31 @@ pub enum Masking {
     Adaptive,
 }
 
+/// The `texture` axis of `solver_options`: what the subset solver assumes
+/// the speckle does under strain. `Deformable`: the pattern stretches and
+/// shears with the material (painted speckle; the classic DIC assumption).
+/// `RigidSphere` (Python `("rigid", "sphere")`): each speckle is a round
+/// Gaussian lump that moves with the material under its centre but keeps its
+/// shape; the reference is corrected for the mismatch this leaves at the
+/// current strain, from the image's curvature — see [`crate::texture`].
+/// `RigidShape` (`("rigid", "shape")`): rigid grains of any shape that do not
+/// overlap and turn with the material; the reference is split into grains once
+/// and each pixel is corrected about its own grain's centre. Order-0 subsets
+/// carry no strain, so all three agree there. (Variants are stored by
+/// position in `.pyv` files; renaming them does not change saved files.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Texture {
+    #[default]
+    Deformable,
+    RigidSphere,
+    // Appended: older `.pyv` tags are unchanged.
+    RigidShape,
+    /// `("rigid", "edge")`: flat rigid grains in a matrix, corrected at their
+    /// edges from the known grain size, outlines and which side of an edge
+    /// is the grain (needs `Subset::soil_properties`; no grain finding).
+    RigidEdge,
+}
+
 /// Tunables for `Preconditioning::LayerRg` — see
 /// `geopyv_dev_fresh/layer_rg_plan.md` §3.2. Ignored when
 /// `preconditioning == Rg`. `#[serde(default)]` on the `SolveConfig` field
@@ -303,6 +386,9 @@ pub struct Mesh {
     /// Still pair (frames 0 → 1) supplying the noise for adaptive masking;
     /// `None` estimates it from a patch around the seed node.
     still: Option<StillPair>,
+    /// Soil properties handed to every subset (see `Subset::soil_properties`);
+    /// not saved.
+    pub soil_properties: Option<crate::soil::SoilConfig>,
     solution: Option<Arc<MeshSolution>>,
 }
 
@@ -373,14 +459,68 @@ impl Mesh {
             time: None,
             time_source: TimeSource::None,
             still: None,
+            soil_properties: None,
             solution: None,
         })
     }
 
+    /// A mesh over given nodes and order-1 connectivity (a tracked sequence's
+    /// subsets), with the binary mask of the given region polygons, as
+    /// [`Mesh::new`] computes it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_nodes(
+        nodes: Array2<f64>,
+        elements: Array2<usize>,
+        boundary: Vec<usize>,
+        exclusions: Vec<Vec<usize>>,
+        boundary_nodes: ArrayView2<f64>,
+        boundary_hard: bool,
+        exclusion_nodes: &[ArrayView2<f64>],
+        exclusions_hard: &[bool],
+        f_img: Arc<Image>,
+        g_img: Arc<Image>,
+    ) -> Self {
+        let mut mesh = Mesh {
+            nodes,
+            elements,
+            boundary,
+            exclusions,
+            mesh_order: 1,
+            mask: None,
+            f_img,
+            g_img,
+            time: None,
+            time_source: TimeSource::None,
+            still: None,
+            soil_properties: None,
+            solution: None,
+        };
+        mesh.set_region_mask(boundary_nodes, boundary_hard, exclusion_nodes, exclusions_hard);
+        mesh
+    }
+
+    /// Set the binary mask of the region of interest from its polygons, as
+    /// [`Mesh::new`] computes it: pixels outside a hard boundary or inside a
+    /// hard exclusion are left out of every subset template. A reused mesh
+    /// ([`Mesh::from_solution`]) has none until this is called.
+    pub(crate) fn set_region_mask(
+        &mut self,
+        boundary_nodes: ArrayView2<f64>,
+        boundary_hard: bool,
+        exclusion_nodes: &[ArrayView2<f64>],
+        exclusions_hard: &[bool],
+    ) {
+        let img_shape = self.f_img.image_gs.dim();
+        self.mask = meshing::define_roi(boundary_nodes, boundary_hard, exclusion_nodes, exclusions_hard, Some(img_shape)).mask;
+    }
+
     /// Reconstruct a `Mesh` topology from a previous [`MeshSolution`].
     ///
-    /// Used by the sequence solver in `sync` mode. `mask` is `None` because
-    /// the polygon data is not available; subsets are unmasked in this mode.
+    /// Used by the sequence solver in `sync` mode, which then restores the
+    /// region mask from its tracked region ([`Mesh::set_region_mask`]). `mask`
+    /// is `None` here because the polygons and their hard flags are not stored
+    /// in a solution; a mesh re-solved straight from a loaded solution stays
+    /// unmasked.
     /// The resulting mesh is marked as solved (`sol` becomes its stored solution).
     pub fn from_solution(sol: Arc<MeshSolution>, f_img: Arc<Image>, g_img: Arc<Image>) -> Self {
         Mesh {
@@ -395,6 +535,7 @@ impl Mesh {
             time: sol.time,
             time_source: if sol.time.is_some() { TimeSource::Given } else { TimeSource::None },
             still: None,
+            soil_properties: None,
             solution: Some(sol),
         }
     }
@@ -446,14 +587,16 @@ impl Mesh {
         subset_order: usize,
     ) -> Result<Subset, Error> {
         let coord = [self.nodes[[idx, 0]], self.nodes[[idx, 1]]];
-        Subset::new(
+        let mut sub = Subset::new(
             coord,
             local_mask,
             self.mask.as_ref().map(|m| m.view()),
             Arc::clone(&self.f_img),
             Arc::clone(&self.g_img),
             subset_order,
-        )
+        )?;
+        sub.soil_properties = self.soil_properties.clone();
+        Ok(sub)
     }
 
     /// The stored solve result, if any. Cheap to clone (`Arc`).
@@ -716,6 +859,7 @@ impl Mesh {
             template_sizes,
             time: self.time,
             seams: seams_rec,
+            tracks: None,
         }));
         Ok(())
     }
@@ -785,10 +929,11 @@ impl Mesh {
             let coord = [plain_nodes[[i, 0]], plain_nodes[[i, 1]]];
             let mut sub = Subset::new(coord, masks, gm, Arc::clone(&self.f_img), Arc::clone(&self.g_img), 1).ok()?;
             sub.time = self.time;
+            sub.soil_properties = self.soil_properties.clone();
             let p0: Vec<f64> = (0..6).map(|k| p[[i, k]]).collect();
             match cfg.method {
-                SolveMethod::Icgn => sub.solve_icgn(Some(&p0), cfg.tolerance, cfg.max_norm, cfg.max_iterations),
-                SolveMethod::Fagn => sub.solve_fagn(Some(&p0), cfg.tolerance, cfg.max_norm, cfg.max_iterations),
+                SolveMethod::Icgn => sub.solve_icgn(Some(&p0), cfg.tolerance, cfg.max_norm, cfg.max_iterations, cfg.texture),
+                SolveMethod::Fagn => sub.solve_fagn(Some(&p0), cfg.tolerance, cfg.max_norm, cfg.max_iterations, cfg.texture),
             }
             .ok()?;
             let pending = sub.seam_first(masks, gm, Some(h), &seam_cfg).ok()?;
@@ -894,10 +1039,10 @@ impl Mesh {
     ) -> Result<SolveResult, Error> {
         match cfg.method {
             SolveMethod::Icgn => {
-                subset.solve_icgn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations)
+                subset.solve_icgn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations, cfg.texture)
             }
             SolveMethod::Fagn => {
-                subset.solve_fagn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations)
+                subset.solve_fagn_result(Some(warp_0), tolerance, cfg.max_norm, cfg.max_iterations, cfg.texture)
             }
         }
     }
@@ -2945,6 +3090,7 @@ mod tests {
             time_source: TimeSource::None,
             solution: None,
             still: None,
+            soil_properties: None,
         };
 
         // Seeded well clear of the y=50 discontinuity (circle(6) subsets,
@@ -3051,6 +3197,58 @@ mod tests {
                     "edge ({i},{nb}) joins two colour-{} nodes", c1[i]
                 );
             }
+        }
+    }
+}
+
+/// The warp vector convention in the mesh's own element strains and warp
+/// projection, against the exact quadratic field of particle.rs's
+/// `warp_convention_tests` (a different value in every slot).
+#[cfg(test)]
+mod warp_convention_tests {
+    use super::*;
+    use crate::particle::warp_convention_tests::{element, quad_warp};
+
+    #[test]
+    fn element_strains_order2_every_slot() {
+        let nodes = element();
+        let el = Array2::from_shape_vec((1, 6), vec![0usize, 1, 2, 3, 4, 5]).unwrap();
+        let d = Array2::from_shape_fn((6, 2), |(k, j)| quad_warp(nodes[[k, 0]], nodes[[k, 1]])[j]);
+        let w = element_strains(&nodes, &el, &d, 2).unwrap();
+        let c = [(nodes[[0, 0]] + nodes[[1, 0]] + nodes[[2, 0]]) / 3.0, (nodes[[0, 1]] + nodes[[1, 1]] + nodes[[2, 1]]) / 3.0];
+        let want = quad_warp(c[0], c[1]);
+        for k in 0..12 {
+            assert!((w[[0, k]] - want[k]).abs() < 1e-12, "slot {k}: {} vs {}", w[[0, k]], want[k]);
+        }
+    }
+
+    #[test]
+    fn node_tracks_compose_matches_applying_both_warps() {
+        // Applying `reference` (first image -> reference image) and then `inc`
+        // (reference -> target, gradients relative to the reference image)
+        // to a point near the material point must equal applying the composed warp.
+        let reference = [1.5, -0.7, 0.04, -0.02, 0.03, 0.05];
+        let inc = [0.3, 0.2, -0.01, 0.06, 0.02, -0.03];
+        let c = NodeTracks::compose(&reference, &inc);
+        let apply = |w: &[f64], d: [f64; 2]| [w[0] + w[2] * d[0] + w[4] * d[1], w[1] + w[3] * d[0] + w[5] * d[1]];
+        for d in [[3.0, -2.0], [-5.0, 4.0]] {
+            // the neighbour's offset in the reference image is d + (its displacement - the point's)
+            let r = apply(&reference, d);
+            let d_ref = [d[0] + r[0] - reference[0], d[1] + r[1] - reference[1]];
+            let i = apply(&inc, d_ref);
+            let direct = apply(&c, d);
+            assert!((r[0] + i[0] - direct[0]).abs() < 1e-12 && (r[1] + i[1] - direct[1]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn project_warp_every_slot() {
+        let (cx, cy, dx, dy) = (2.0, -1.0, 3.0, 5.0);
+        let p = quad_warp(cx, cy);
+        let w = project_warp(&p, dx, dy);
+        let want = quad_warp(cx + dx, cy + dy);
+        for k in 0..12 {
+            assert!((w[k] - want[k]).abs() < 1e-12, "slot {k}: {} vs {}", w[k], want[k]);
         }
     }
 }

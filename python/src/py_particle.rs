@@ -273,7 +273,8 @@ impl PyMeshlessParams {
 ///
 /// `strain_method=None` (the default) means the core default,
 /// `StrainMethod::Subsets` (the subset average). Passing a `MeshlessParams`
-/// instance selects meshless with those parameters. `StrainMethod::Mesh`
+/// instance selects meshless with those parameters; `"element_warps"` selects
+/// `StrainMethod::ElementWarps`. `StrainMethod::Mesh`
 /// (shape-function differentiation) is retained for comparison purposes and
 /// must be requested explicitly by passing `strain_method=False`.
 pub(crate) fn strain_method_from_py(
@@ -286,19 +287,27 @@ pub(crate) fn strain_method_from_py(
         Some(obj) => {
             if let Ok(p) = obj.extract::<PyRef<'_, PyMeshlessParams>>() {
                 Ok(particle::StrainMethod::Meshless(p.inner.clone()))
+            } else if let Ok(name) = obj.extract::<String>() {
+                match name.as_str() {
+                    "element_warps" => Ok(particle::StrainMethod::ElementWarps),
+                    other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "strain_method {other:?} is not known -- the one named method is \
+                         \"element_warps\""
+                    ))),
+                }
             } else if let Ok(force_mesh) = obj.extract::<bool>() {
                 if force_mesh {
                     Err(pyo3::exceptions::PyValueError::new_err(
                         "strain_method=True is not valid -- pass None (subset average, the \
-                         default), a MeshlessParams instance (meshless fit), or False \
-                         (mesh-element interpolation, StrainMethod::Mesh)",
+                         default), \"element_warps\", a MeshlessParams instance (meshless fit), \
+                         or False (mesh-element interpolation, StrainMethod::Mesh)",
                     ))
                 } else {
                     Ok(particle::StrainMethod::Mesh)
                 }
             } else {
                 Err(pyo3::exceptions::PyTypeError::new_err(
-                    "strain_method must be None, a MeshlessParams instance, or False",
+                    "strain_method must be None, \"element_warps\", a MeshlessParams instance, or False",
                 ))
             }
         }
@@ -370,12 +379,16 @@ impl PyParticle {
     ///     Volumetric correction factor. Default 0.0.
     /// true_incs : bool, optional
     ///     Logarithmic strain increments. Default ``True``.
-    /// strain_method : MeshlessParams or False, optional
+    /// strain_method : MeshlessParams, str or False, optional
     ///     ``None`` (default): the subset average -- the weighted average of
     ///     the warps of every subset whose template holds the particle and
     ///     whose cuts (adaptive masking) keep it, each evaluated at the
-    ///     particle. A ``MeshlessParams`` instance: the meshless fit with those
-    ///     parameters. ``False``: mesh-element (shape-function) interpolation.
+    ///     particle. ``"element_warps"``: the warps of the particle's own mesh
+    ///     element's subsets, evaluated at the particle and blended with the
+    ///     element weights (cut-away subsets and subsets whose template does
+    ///     not reach it left out). A ``MeshlessParams`` instance: the meshless
+    ///     fit with those parameters. ``False``: mesh-element (shape-function)
+    ///     interpolation of node displacements.
     #[pyo3(signature = (factor=0.0, true_incs=true, calibration=None, strain_method=None))]
     fn solve(
         &mut self,

@@ -11,13 +11,19 @@
 //! [4]      version  0x01 (uncompressed, schema v0) | 0x02 (zstd, schema v0)
 //!                    | 0x03 (zstd, schema v1) | 0x07 (zstd, schema v2)
 //!                    | 0x08 (zstd, schema v3) | 0x09 (zstd, schema v4)
-//!                    | 0x0A (zstd, schema v5 — current)
+//!                    | 0x0A (zstd, schema v5) | 0x0B (zstd, schema v6)
+//!                    | 0x0C (zstd, schema v7) | 0x0D (zstd, schema v8)
+//!                    | 0x0E (zstd, schema v9) | 0x0F (zstd, schema v10)
+//!                    | 0x10 (zstd, schema v11) | 0x11 (zstd, schema v12)
+//!                    | 0x12 (zstd, schema v13) | 0x13 (zstd, schema v14)
+//!                    | 0x14 (zstd, schema v15) | 0x15 (zstd, schema v16)
+//!                    | 0x16 (zstd, schema v17) | 0x17 (zstd, schema v18 — current)
 //! [5..]    bincode v2 (standard config) encoded GeopyvObject (schema-version-
 //!          dependent shape — see "Schema versioning" below), zstd-compressed
 //!          (level 3) for every version except 0x01
 //! ```
 //!
-//! New files are always written with version 0x0B (zstd + current schema).
+//! New files are always written with version 0x17 (zstd + current schema).
 //! Bytes 0x04-0x06 were used only by unreleased development builds and are
 //! deliberately rejected as unsupported.
 //!
@@ -68,7 +74,7 @@ use crate::{
     field::{FieldRegion, FieldSolution},
     geometry::region::Region,
     masks::MaskShape,
-    mesh::{MeshSolution, SeedConfig, SolveConfig, SolveMethod},
+    mesh::{MeshSolution, SeedConfig, SolveConfig, SolveMethod, Texture},
     particle::{principal_strains, ParticleConfig, ParticleSolution, StrainMethod},
     sequence::{SequenceOptions, SequenceSolution},
     speckle::{Progression, ScaleType, Speckle, WarpMode},
@@ -110,10 +116,56 @@ const VERSION_ZSTD_V4: u8 = 0x09;
 /// `zonal_masking` (zonal masking removed; a stored record is dropped on
 /// load). Still readable on load, but no longer written.
 const VERSION_ZSTD_V5: u8 = 0x0A;
-/// zstd-compressed, schema v6 (current). Relative to v5: `SubsetSolution`
-/// gains `seams`; `MeshSolution` gains `seams`; `SolveConfig` gains
-/// `masking`. Always written by [`save`].
-const CURRENT_VERSION: u8 = 0x0B;
+/// zstd-compressed, schema v6. Relative to v5: `SubsetSolution` gains
+/// `seams`; `MeshSolution` gains `seams`; `SolveConfig` gains `masking`. Still
+/// readable on load, but no longer written.
+const VERSION_ZSTD_V6: u8 = 0x0B;
+/// zstd-compressed, schema v7. Relative to v6: `MeshSolution` gains
+/// `tracks` (tracked sequences); `StrainMethod` gains `ElementWarps` (appended,
+/// so older tags are unchanged). Still readable on load, but no longer
+/// written.
+const VERSION_ZSTD_V7: u8 = 0x0C;
+/// zstd-compressed, schema v8. Relative to v7: `SolveResult` and
+/// `SolveConfig` gain `texture`. Still readable on load, but no longer
+/// written.
+const VERSION_ZSTD_V8: u8 = 0x0D;
+/// zstd-compressed, schema v9. Relative to v8: `Speckle` gains
+/// `grain_shape` and `grain_rotation`. Still readable on load, but no longer
+/// written.
+const VERSION_ZSTD_V9: u8 = 0x0E;
+/// zstd-compressed, schema v10. Relative to v9: `Speckle` gains
+/// `grain_overlap`. Still readable on load, but no longer written.
+const VERSION_ZSTD_V10: u8 = 0x0F;
+/// zstd-compressed, schema v11. Relative to v10: `Speckle` gains
+/// `no_overlap`. Still readable on load, but no longer written.
+const VERSION_ZSTD_V11: u8 = 0x10;
+/// zstd-compressed, schema v12. Relative to v11: `Speckle` gains `soil`.
+/// Still readable on load, but no longer written.
+const VERSION_ZSTD_V12: u8 = 0x11;
+/// zstd-compressed, schema v13. Relative to v12: `SoilConfig` is specified
+/// by matrix and seeding brightness and spread and the artificial seeding
+/// ratio (was grain brightness, grain spread, coverage, pattern strength).
+/// Still readable on load, but no longer written.
+const VERSION_ZSTD_V13: u8 = 0x12;
+/// zstd-compressed, schema v14. Relative to v13: `SoilConfig` loses
+/// `depth_dimming`. Still readable on load, but no longer written.
+const VERSION_ZSTD_V14: u8 = 0x13;
+/// zstd-compressed, schema v15. Relative to v14: `Speckle` gains `seed`.
+/// Still readable on load, but no longer written.
+const VERSION_ZSTD_V15: u8 = 0x14;
+/// zstd-compressed, schema v16. Relative to v15: `SoilConfig`'s grain size
+/// and shape (`grain_size`, `grain_size_spread`, `grain`) become a
+/// characterisation (`psd`, `d_p`, aspect ratio and sphericity with their
+/// spreads). Still readable on load, but no longer written.
+const VERSION_ZSTD_V16: u8 = 0x15;
+/// zstd-compressed, schema v17. Relative to v16: `SoilConfig` loses
+/// `sphericity` / `sphericity_sd` and gains `outlines` (outline statistics).
+/// Still readable on load, but no longer written.
+const VERSION_ZSTD_V17: u8 = 0x16;
+/// zstd-compressed, schema v18 (current). Relative to v17: `SoilConfig` gains
+/// brightness variation inside grains (`grain_tilt`, `grain_dome`,
+/// `grain_rim`, `grain_texture`, `texture_size`). Always written by [`save`].
+const CURRENT_VERSION: u8 = 0x17;
 
 // ---------------------------------------------------------------------------
 // Tagged union for all serialisable object types
@@ -174,6 +226,7 @@ impl From<LegacySolveResult> for SolveResult {
             max_iterations: 0,
             method: SolveMethod::Icgn,
             eta_omitted: None,
+            texture: Texture::Deformable,
         }
     }
 }
@@ -258,6 +311,7 @@ impl From<LegacyMeshSolution> for MeshSolution {
             template_sizes: None,
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 }
@@ -427,6 +481,7 @@ impl From<LegacySolveResultV1> for SolveResult {
             max_iterations: l.max_iterations,
             method: l.method,
             eta_omitted: None,
+            texture: Texture::Deformable,
         }
     }
 }
@@ -540,6 +595,7 @@ impl From<LegacyMeshSolutionV1> for MeshSolution {
             template_sizes: None,
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 }
@@ -718,6 +774,12 @@ impl From<LegacySpeckleV1> for Speckle {
             scale: l.scale,
             speckle_positions: l.speckle_positions,
             solved: l.solved,
+            grain_shape: crate::speckle::GrainShape::Round,
+            grain_rotation: crate::speckle::GrainRotation::Material,
+            grain_overlap: crate::speckle::GrainOverlap::Add,
+            no_overlap: None,
+            soil: None,
+            seed: None,
         }
     }
 }
@@ -817,7 +879,7 @@ enum LegacyGeopyvObjectV2 {
     Field(LegacyFieldSolutionV2),
     Sequence(LegacySequenceSolutionV3),
     Particle(LegacyParticleSolutionV3),
-    Speckle(Speckle),
+    Speckle(LegacySpeckleV8),
     Calibration(CalibrationSolution),
 }
 
@@ -829,7 +891,7 @@ impl From<LegacyGeopyvObjectV2> for GeopyvObject {
             LegacyGeopyvObjectV2::Field(f) => GeopyvObject::Field(f.into()),
             LegacyGeopyvObjectV2::Sequence(s) => GeopyvObject::Sequence(s.into()),
             LegacyGeopyvObjectV2::Particle(p) => GeopyvObject::Particle(p.into()),
-            LegacyGeopyvObjectV2::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV2::Speckle(s) => GeopyvObject::Speckle(s.into()),
             LegacyGeopyvObjectV2::Calibration(c) => GeopyvObject::Calibration(c),
         }
     }
@@ -852,7 +914,7 @@ struct LegacySubsetSolutionV3 {
     mask: MaskSummary,
     ref_image: PathBuf,
     target_image: PathBuf,
-    result: SolveResult,
+    result: LegacySolveResultV7,
     std_dev: f64,
     sssig: f64,
     delta_f: f64,
@@ -865,7 +927,7 @@ impl From<LegacySubsetSolutionV3> for SubsetSolution {
             mask: l.mask,
             ref_image: l.ref_image,
             target_image: l.target_image,
-            result: l.result,
+            result: l.result.into(),
             std_dev: l.std_dev,
             sssig: l.sssig,
             delta_f: l.delta_f,
@@ -927,6 +989,7 @@ impl From<LegacyMeshSolutionV3> for MeshSolution {
             template_sizes: l.template_sizes,
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 }
@@ -1043,7 +1106,7 @@ enum LegacyGeopyvObjectV3 {
     Field(LegacyFieldSolutionV3),
     Sequence(LegacySequenceSolutionV3),
     Particle(LegacyParticleSolutionV3),
-    Speckle(Speckle),
+    Speckle(LegacySpeckleV8),
     Calibration(CalibrationSolution),
 }
 
@@ -1055,7 +1118,7 @@ impl From<LegacyGeopyvObjectV3> for GeopyvObject {
             LegacyGeopyvObjectV3::Field(f) => GeopyvObject::Field(f.into()),
             LegacyGeopyvObjectV3::Sequence(s) => GeopyvObject::Sequence(s.into()),
             LegacyGeopyvObjectV3::Particle(p) => GeopyvObject::Particle(p.into()),
-            LegacyGeopyvObjectV3::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV3::Speckle(s) => GeopyvObject::Speckle(s.into()),
             LegacyGeopyvObjectV3::Calibration(c) => GeopyvObject::Calibration(c),
         }
     }
@@ -1138,6 +1201,7 @@ impl From<LegacyMeshSolutionV4> for MeshSolution {
             template_sizes: l.template_sizes,
             time: l.time,
             seams: None,
+            tracks: None,
         }
     }
 }
@@ -1188,7 +1252,7 @@ enum LegacyGeopyvObjectV4 {
     Field(FieldSolution),
     Sequence(LegacySequenceSolutionV4),
     Particle(ParticleSolution),
-    Speckle(Speckle),
+    Speckle(LegacySpeckleV8),
     Calibration(CalibrationSolution),
 }
 
@@ -1200,7 +1264,7 @@ impl From<LegacyGeopyvObjectV4> for GeopyvObject {
             LegacyGeopyvObjectV4::Field(f) => GeopyvObject::Field(f),
             LegacyGeopyvObjectV4::Sequence(s) => GeopyvObject::Sequence(s.into()),
             LegacyGeopyvObjectV4::Particle(p) => GeopyvObject::Particle(p),
-            LegacyGeopyvObjectV4::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV4::Speckle(s) => GeopyvObject::Speckle(s.into()),
             LegacyGeopyvObjectV4::Calibration(c) => GeopyvObject::Calibration(c),
         }
     }
@@ -1219,7 +1283,7 @@ struct LegacySubsetSolutionV5 {
     mask: MaskSummary,
     ref_image: PathBuf,
     target_image: PathBuf,
-    result: SolveResult,
+    result: LegacySolveResultV7,
     std_dev: f64,
     sssig: f64,
     delta_f: f64,
@@ -1233,7 +1297,7 @@ impl From<LegacySubsetSolutionV5> for SubsetSolution {
             mask: l.mask,
             ref_image: l.ref_image,
             target_image: l.target_image,
-            result: l.result,
+            result: l.result.into(),
             std_dev: l.std_dev,
             sssig: l.sssig,
             delta_f: l.delta_f,
@@ -1285,6 +1349,7 @@ impl From<LegacySolveConfigV5> for SolveConfig {
             preconditioning: l.preconditioning,
             layer_rg: l.layer_rg,
             masking: crate::mesh::Masking::Uniform,
+            texture: Texture::Deformable,
         }
     }
 }
@@ -1341,6 +1406,7 @@ impl From<LegacyMeshSolutionV5> for MeshSolution {
             template_sizes: l.template_sizes,
             time: l.time,
             seams: None,
+            tracks: None,
         }
     }
 }
@@ -1391,7 +1457,7 @@ enum LegacyGeopyvObjectV5 {
     Field(FieldSolution),
     Sequence(LegacySequenceSolutionV5),
     Particle(ParticleSolution),
-    Speckle(Speckle),
+    Speckle(LegacySpeckleV8),
     Calibration(CalibrationSolution),
 }
 
@@ -1403,11 +1469,1320 @@ impl From<LegacyGeopyvObjectV5> for GeopyvObject {
             LegacyGeopyvObjectV5::Field(f) => GeopyvObject::Field(f),
             LegacyGeopyvObjectV5::Sequence(s) => GeopyvObject::Sequence(s.into()),
             LegacyGeopyvObjectV5::Particle(p) => GeopyvObject::Particle(p),
-            LegacyGeopyvObjectV5::Speckle(s) => GeopyvObject::Speckle(s),
+            LegacyGeopyvObjectV5::Speckle(s) => GeopyvObject::Speckle(s.into()),
             LegacyGeopyvObjectV5::Calibration(c) => GeopyvObject::Calibration(c),
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v6, 0x0B) — before `MeshSolution` gained `tracks`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMeshSolutionV6 {
+    nodes: ndarray::Array2<f64>,
+    elements: ndarray::Array2<usize>,
+    boundary: Vec<usize>,
+    exclusions: Vec<Vec<usize>>,
+    centroids: ndarray::Array2<f64>,
+    areas: ndarray::Array1<f64>,
+    warps: ndarray::Array2<f64>,
+    displacements: ndarray::Array2<f64>,
+    c_zncc: ndarray::Array1<f64>,
+    p: ndarray::Array2<f64>,
+    seed_node: usize,
+    mesh_order: u8,
+    subset_order: u8,
+    iterations: ndarray::Array1<u32>,
+    norms: ndarray::Array1<f64>,
+    f_img_path: PathBuf,
+    g_img_path: PathBuf,
+    solve_config: Option<LegacySolveConfigV7>,
+    seed: Option<SeedConfig>,
+    template_shape: Option<MaskShape>,
+    template_sizes: Option<ndarray::Array1<u32>>,
+    time: Option<(f64, f64)>,
+    seams: Option<crate::mesh::MeshSeams>,
+}
+
+impl From<LegacyMeshSolutionV6> for MeshSolution {
+    fn from(l: LegacyMeshSolutionV6) -> Self {
+        MeshSolution {
+            nodes: l.nodes,
+            elements: l.elements,
+            boundary: l.boundary,
+            exclusions: l.exclusions,
+            centroids: l.centroids,
+            areas: l.areas,
+            warps: l.warps,
+            displacements: l.displacements,
+            c_zncc: l.c_zncc,
+            p: l.p,
+            seed_node: l.seed_node,
+            mesh_order: l.mesh_order,
+            subset_order: l.subset_order,
+            iterations: l.iterations,
+            norms: l.norms,
+            f_img_path: l.f_img_path,
+            g_img_path: l.g_img_path,
+            solve_config: l.solve_config.map(Into::into),
+            seed: l.seed,
+            template_shape: l.template_shape,
+            template_sizes: l.template_sizes,
+            time: l.time,
+            seams: l.seams,
+            tracks: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySequenceSolutionV6 {
+    mesh_solutions: Vec<Arc<LegacyMeshSolutionV6>>,
+    mesh_paths: Vec<PathBuf>,
+    all_converged: bool,
+    unsolvable: bool,
+    override_log: Vec<usize>,
+    reference_updates: Vec<bool>,
+    mesh_order: u8,
+    first_f_img_path: Option<PathBuf>,
+    boundary_region: Region,
+    exclusion_regions: Vec<Region>,
+    options: Option<SequenceOptions>,
+    border: usize,
+    time: Option<Vec<f64>>,
+    time_source: crate::timing::TimeSource,
+}
+
+impl From<LegacySequenceSolutionV6> for SequenceSolution {
+    fn from(l: LegacySequenceSolutionV6) -> Self {
+        SequenceSolution {
+            mesh_solutions: l.mesh_solutions.into_iter().map(arc_into).collect(),
+            mesh_paths: l.mesh_paths,
+            all_converged: l.all_converged,
+            unsolvable: l.unsolvable,
+            override_log: l.override_log,
+            reference_updates: l.reference_updates,
+            mesh_order: l.mesh_order,
+            first_f_img_path: l.first_f_img_path,
+            boundary_region: l.boundary_region,
+            exclusion_regions: l.exclusion_regions,
+            options: l.options,
+            border: l.border,
+            time: l.time,
+            time_source: l.time_source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV6 {
+    Subset(LegacySubsetSolutionV7),
+    Mesh(LegacyMeshSolutionV6),
+    Field(FieldSolution),
+    Sequence(LegacySequenceSolutionV6),
+    Particle(ParticleSolution),
+    Speckle(LegacySpeckleV8),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV6> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV6) -> Self {
+        match l {
+            LegacyGeopyvObjectV6::Subset(s) => GeopyvObject::Subset(s.into()),
+            LegacyGeopyvObjectV6::Mesh(m) => GeopyvObject::Mesh(m.into()),
+            LegacyGeopyvObjectV6::Field(f) => GeopyvObject::Field(f),
+            LegacyGeopyvObjectV6::Sequence(s) => GeopyvObject::Sequence(s.into()),
+            LegacyGeopyvObjectV6::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV6::Speckle(s) => GeopyvObject::Speckle(s.into()),
+            LegacyGeopyvObjectV6::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v7, 0x0C) — before `SolveResult` and `SolveConfig`
+// gained `texture`. Also the `SolveResult` shape of v3–v6 subsets and the
+// `SolveConfig` shape of v6 meshes.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySolveResultV7 {
+    p: Vec<f64>,
+    c_zncc: f64,
+    c_znssd: f64,
+    iterations: usize,
+    converged: bool,
+    quality_ok: bool,
+    history: Vec<(usize, f64, f64, f64)>,
+    max_norm: f64,
+    tolerance: f64,
+    subset_order: usize,
+    max_iterations: usize,
+    method: SolveMethod,
+    eta_omitted: Option<(f64, f64)>,
+}
+
+impl From<LegacySolveResultV7> for SolveResult {
+    fn from(l: LegacySolveResultV7) -> Self {
+        SolveResult {
+            p: l.p,
+            c_zncc: l.c_zncc,
+            c_znssd: l.c_znssd,
+            iterations: l.iterations,
+            converged: l.converged,
+            quality_ok: l.quality_ok,
+            history: l.history,
+            max_norm: l.max_norm,
+            tolerance: l.tolerance,
+            subset_order: l.subset_order,
+            max_iterations: l.max_iterations,
+            method: l.method,
+            eta_omitted: l.eta_omitted,
+            texture: Texture::Deformable,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LegacySolveResultV7 {
+    /// The v7 shape of a current result (tests writing old-format files).
+    fn from_current(r: SolveResult) -> Self {
+        LegacySolveResultV7 {
+            p: r.p,
+            c_zncc: r.c_zncc,
+            c_znssd: r.c_znssd,
+            iterations: r.iterations,
+            converged: r.converged,
+            quality_ok: r.quality_ok,
+            history: r.history,
+            max_norm: r.max_norm,
+            tolerance: r.tolerance,
+            subset_order: r.subset_order,
+            max_iterations: r.max_iterations,
+            method: r.method,
+            eta_omitted: r.eta_omitted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySubsetSolutionV7 {
+    coord: [f64; 2],
+    mask: MaskSummary,
+    ref_image: PathBuf,
+    target_image: PathBuf,
+    result: LegacySolveResultV7,
+    std_dev: f64,
+    sssig: f64,
+    delta_f: f64,
+    time: Option<(f64, f64)>,
+    seams: Option<crate::seam::SeamRecord>,
+}
+
+impl From<LegacySubsetSolutionV7> for SubsetSolution {
+    fn from(l: LegacySubsetSolutionV7) -> Self {
+        SubsetSolution {
+            coord: l.coord,
+            mask: l.mask,
+            ref_image: l.ref_image,
+            target_image: l.target_image,
+            result: l.result.into(),
+            std_dev: l.std_dev,
+            sssig: l.sssig,
+            delta_f: l.delta_f,
+            time: l.time,
+            seams: l.seams,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LegacySubsetSolutionV7 {
+    fn from_current(s: SubsetSolution) -> Self {
+        LegacySubsetSolutionV7 {
+            coord: s.coord,
+            mask: s.mask,
+            ref_image: s.ref_image,
+            target_image: s.target_image,
+            result: LegacySolveResultV7::from_current(s.result),
+            std_dev: s.std_dev,
+            sssig: s.sssig,
+            delta_f: s.delta_f,
+            time: s.time,
+            seams: s.seams,
+        }
+    }
+}
+
+/// `SolveConfig` before `texture` (v8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySolveConfigV7 {
+    max_norm: f64,
+    max_iterations: usize,
+    subset_order: usize,
+    tolerance: f64,
+    method: SolveMethod,
+    override_active: bool,
+    preconditioning: crate::mesh::Preconditioning,
+    layer_rg: crate::mesh::LayerRgConfig,
+    masking: crate::mesh::Masking,
+}
+
+impl From<LegacySolveConfigV7> for SolveConfig {
+    fn from(l: LegacySolveConfigV7) -> Self {
+        SolveConfig {
+            max_norm: l.max_norm,
+            max_iterations: l.max_iterations,
+            subset_order: l.subset_order,
+            tolerance: l.tolerance,
+            method: l.method,
+            override_active: l.override_active,
+            preconditioning: l.preconditioning,
+            layer_rg: l.layer_rg,
+            masking: l.masking,
+            texture: Texture::Deformable,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LegacySolveConfigV7 {
+    fn from_current(c: SolveConfig) -> Self {
+        LegacySolveConfigV7 {
+            max_norm: c.max_norm,
+            max_iterations: c.max_iterations,
+            subset_order: c.subset_order,
+            tolerance: c.tolerance,
+            method: c.method,
+            override_active: c.override_active,
+            preconditioning: c.preconditioning,
+            layer_rg: c.layer_rg,
+            masking: c.masking,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyMeshSolutionV7 {
+    nodes: ndarray::Array2<f64>,
+    elements: ndarray::Array2<usize>,
+    boundary: Vec<usize>,
+    exclusions: Vec<Vec<usize>>,
+    centroids: ndarray::Array2<f64>,
+    areas: ndarray::Array1<f64>,
+    warps: ndarray::Array2<f64>,
+    displacements: ndarray::Array2<f64>,
+    c_zncc: ndarray::Array1<f64>,
+    p: ndarray::Array2<f64>,
+    seed_node: usize,
+    mesh_order: u8,
+    subset_order: u8,
+    iterations: ndarray::Array1<u32>,
+    norms: ndarray::Array1<f64>,
+    f_img_path: PathBuf,
+    g_img_path: PathBuf,
+    solve_config: Option<LegacySolveConfigV7>,
+    seed: Option<SeedConfig>,
+    template_shape: Option<MaskShape>,
+    template_sizes: Option<ndarray::Array1<u32>>,
+    time: Option<(f64, f64)>,
+    seams: Option<crate::mesh::MeshSeams>,
+    tracks: Option<crate::mesh::NodeTracks>,
+}
+
+impl From<LegacyMeshSolutionV7> for MeshSolution {
+    fn from(l: LegacyMeshSolutionV7) -> Self {
+        MeshSolution {
+            nodes: l.nodes,
+            elements: l.elements,
+            boundary: l.boundary,
+            exclusions: l.exclusions,
+            centroids: l.centroids,
+            areas: l.areas,
+            warps: l.warps,
+            displacements: l.displacements,
+            c_zncc: l.c_zncc,
+            p: l.p,
+            seed_node: l.seed_node,
+            mesh_order: l.mesh_order,
+            subset_order: l.subset_order,
+            iterations: l.iterations,
+            norms: l.norms,
+            f_img_path: l.f_img_path,
+            g_img_path: l.g_img_path,
+            solve_config: l.solve_config.map(Into::into),
+            seed: l.seed,
+            template_shape: l.template_shape,
+            template_sizes: l.template_sizes,
+            time: l.time,
+            seams: l.seams,
+            tracks: l.tracks,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LegacyMeshSolutionV7 {
+    fn from_current(m: MeshSolution) -> Self {
+        LegacyMeshSolutionV7 {
+            nodes: m.nodes,
+            elements: m.elements,
+            boundary: m.boundary,
+            exclusions: m.exclusions,
+            centroids: m.centroids,
+            areas: m.areas,
+            warps: m.warps,
+            displacements: m.displacements,
+            c_zncc: m.c_zncc,
+            p: m.p,
+            seed_node: m.seed_node,
+            mesh_order: m.mesh_order,
+            subset_order: m.subset_order,
+            iterations: m.iterations,
+            norms: m.norms,
+            f_img_path: m.f_img_path,
+            g_img_path: m.g_img_path,
+            solve_config: m.solve_config.map(LegacySolveConfigV7::from_current),
+            seed: m.seed,
+            template_shape: m.template_shape,
+            template_sizes: m.template_sizes,
+            time: m.time,
+            seams: m.seams,
+            tracks: m.tracks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySequenceSolutionV7 {
+    mesh_solutions: Vec<Arc<LegacyMeshSolutionV7>>,
+    mesh_paths: Vec<PathBuf>,
+    all_converged: bool,
+    unsolvable: bool,
+    override_log: Vec<usize>,
+    reference_updates: Vec<bool>,
+    mesh_order: u8,
+    first_f_img_path: Option<PathBuf>,
+    boundary_region: Region,
+    exclusion_regions: Vec<Region>,
+    options: Option<SequenceOptions>,
+    border: usize,
+    time: Option<Vec<f64>>,
+    time_source: crate::timing::TimeSource,
+}
+
+impl From<LegacySequenceSolutionV7> for SequenceSolution {
+    fn from(l: LegacySequenceSolutionV7) -> Self {
+        SequenceSolution {
+            mesh_solutions: l.mesh_solutions.into_iter().map(arc_into).collect(),
+            mesh_paths: l.mesh_paths,
+            all_converged: l.all_converged,
+            unsolvable: l.unsolvable,
+            override_log: l.override_log,
+            reference_updates: l.reference_updates,
+            mesh_order: l.mesh_order,
+            first_f_img_path: l.first_f_img_path,
+            boundary_region: l.boundary_region,
+            exclusion_regions: l.exclusion_regions,
+            options: l.options,
+            border: l.border,
+            time: l.time,
+            time_source: l.time_source,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV7 {
+    Subset(LegacySubsetSolutionV7),
+    Mesh(LegacyMeshSolutionV7),
+    Field(FieldSolution),
+    Sequence(LegacySequenceSolutionV7),
+    Particle(ParticleSolution),
+    Speckle(LegacySpeckleV8),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV7> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV7) -> Self {
+        match l {
+            LegacyGeopyvObjectV7::Subset(s) => GeopyvObject::Subset(s.into()),
+            LegacyGeopyvObjectV7::Mesh(m) => GeopyvObject::Mesh(m.into()),
+            LegacyGeopyvObjectV7::Field(f) => GeopyvObject::Field(f),
+            LegacyGeopyvObjectV7::Sequence(s) => GeopyvObject::Sequence(s.into()),
+            LegacyGeopyvObjectV7::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV7::Speckle(s) => GeopyvObject::Speckle(s.into()),
+            LegacyGeopyvObjectV7::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v8, 0x0D) — before `Speckle` gained grain shapes.
+// Also the `Speckle` shape of v2–v7 files.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV8 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+}
+
+impl From<LegacySpeckleV8> for Speckle {
+    fn from(l: LegacySpeckleV8) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: crate::speckle::GrainShape::Round,
+            grain_rotation: crate::speckle::GrainRotation::Material,
+            grain_overlap: crate::speckle::GrainOverlap::Add,
+            no_overlap: None,
+            soil: None,
+            seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum LegacyGeopyvObjectV8 {
+    Subset(SubsetSolution),
+    Mesh(MeshSolution),
+    Field(FieldSolution),
+    Sequence(SequenceSolution),
+    Particle(ParticleSolution),
+    Speckle(LegacySpeckleV8),
+    Calibration(CalibrationSolution),
+}
+
+impl From<LegacyGeopyvObjectV8> for GeopyvObject {
+    fn from(l: LegacyGeopyvObjectV8) -> Self {
+        match l {
+            LegacyGeopyvObjectV8::Subset(s) => GeopyvObject::Subset(s),
+            LegacyGeopyvObjectV8::Mesh(m) => GeopyvObject::Mesh(m),
+            LegacyGeopyvObjectV8::Field(f) => GeopyvObject::Field(f),
+            LegacyGeopyvObjectV8::Sequence(s) => GeopyvObject::Sequence(s),
+            LegacyGeopyvObjectV8::Particle(p) => GeopyvObject::Particle(p),
+            LegacyGeopyvObjectV8::Speckle(s) => GeopyvObject::Speckle(s.into()),
+            LegacyGeopyvObjectV8::Calibration(c) => GeopyvObject::Calibration(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy shapes (schema v9, 0x0E, and v10, 0x0F) — `Speckle` before
+// `grain_overlap` (v9) and before `no_overlap` (v10).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV10 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+}
+
+impl From<LegacySpeckleV10> for Speckle {
+    fn from(l: LegacySpeckleV10) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: None,
+            soil: None,
+            seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV9 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+}
+
+impl From<LegacySpeckleV9> for Speckle {
+    fn from(l: LegacySpeckleV9) -> Self {
+        LegacySpeckleV10 {
+            image_dir: l.image_dir, name: l.name, file_format: l.file_format, image_size: l.image_size,
+            speckle_size: l.speckle_size, speckle_number: l.speckle_number, speckle_limit: l.speckle_limit,
+            progression: l.progression, comp: l.comp, origin: l.origin, mode: l.mode,
+            noise_pos: l.noise_pos, noise_int: l.noise_int, image_no: l.image_no, scale: l.scale,
+            speckle_positions: l.speckle_positions, solved: l.solved,
+            grain_shape: l.grain_shape, grain_rotation: l.grain_rotation,
+            grain_overlap: crate::speckle::GrainOverlap::Add,
+        }
+        .into()
+    }
+}
+
+macro_rules! legacy_object_with_speckle {
+    ($name:ident, $speckle:ty) => {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        enum $name {
+            Subset(SubsetSolution),
+            Mesh(MeshSolution),
+            Field(FieldSolution),
+            Sequence(SequenceSolution),
+            Particle(ParticleSolution),
+            Speckle($speckle),
+            Calibration(CalibrationSolution),
+        }
+
+        impl From<$name> for GeopyvObject {
+            fn from(l: $name) -> Self {
+                match l {
+                    $name::Subset(s) => GeopyvObject::Subset(s),
+                    $name::Mesh(m) => GeopyvObject::Mesh(m),
+                    $name::Field(f) => GeopyvObject::Field(f),
+                    $name::Sequence(s) => GeopyvObject::Sequence(s),
+                    $name::Particle(p) => GeopyvObject::Particle(p),
+                    $name::Speckle(s) => GeopyvObject::Speckle(s.into()),
+                    $name::Calibration(c) => GeopyvObject::Calibration(c),
+                }
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV11 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+}
+
+impl From<LegacySpeckleV11> for Speckle {
+    fn from(l: LegacySpeckleV11) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: None,
+            seed: None,
+        }
+    }
+}
+
+/// `SoilConfig` as of v12 (0x11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySoilConfigV12 {
+    kind: crate::soil::SoilKind,
+    matrix_brightness: f64,
+    grain_brightness: f64,
+    grain_spread: f64,
+    grain_size: f64,
+    grain_size_spread: f64,
+    grain: LegacySoilGrain,
+    coverage: f64,
+    depth_layers: usize,
+    depth_dimming: f64,
+    pattern_strength: f64,
+    pattern_size: f64,
+    blur: f64,
+}
+
+impl From<LegacySoilConfigV12> for LegacySoilConfigV15 {
+    /// Clay converts exactly. Sand had no dyed grains: its grains become the
+    /// matrix (no seeding); the brightness behind all layers is no longer
+    /// stored separately and follows from the matrix brightness. Depth
+    /// dimming is dropped (removed in v14).
+    fn from(l: LegacySoilConfigV12) -> Self {
+        let (matrix_brightness, matrix_spread, asr) = match l.kind {
+            crate::soil::SoilKind::Clay => (l.matrix_brightness, l.pattern_strength, l.coverage),
+            crate::soil::SoilKind::Sand => (l.grain_brightness, l.grain_spread, 0.0),
+        };
+        LegacySoilConfigV15 {
+            kind: l.kind,
+            matrix_brightness,
+            matrix_spread,
+            seed_brightness: l.grain_brightness,
+            seed_spread: l.grain_spread,
+            asr,
+            grain_size: l.grain_size,
+            grain_size_spread: l.grain_size_spread,
+            grain: l.grain,
+            depth_layers: l.depth_layers,
+            pattern_size: l.pattern_size,
+            blur: l.blur,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV12 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+    soil: Option<LegacySoilConfigV12>,
+}
+
+impl From<LegacySpeckleV12> for Speckle {
+    fn from(l: LegacySpeckleV12) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: l.soil.map(|c| LegacySoilConfigV15::from(c).into()),
+            seed: None,
+        }
+    }
+}
+
+/// `SoilConfig` as of v13 (0x12).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySoilConfigV13 {
+    kind: crate::soil::SoilKind,
+    matrix_brightness: f64,
+    matrix_spread: f64,
+    seed_brightness: f64,
+    seed_spread: f64,
+    asr: f64,
+    grain_size: f64,
+    grain_size_spread: f64,
+    grain: LegacySoilGrain,
+    depth_layers: usize,
+    depth_dimming: f64,
+    pattern_size: f64,
+    blur: f64,
+}
+
+impl From<LegacySoilConfigV13> for LegacySoilConfigV15 {
+    /// Depth dimming is dropped (removed in v14); everything else is kept.
+    fn from(l: LegacySoilConfigV13) -> Self {
+        LegacySoilConfigV15 {
+            kind: l.kind,
+            matrix_brightness: l.matrix_brightness,
+            matrix_spread: l.matrix_spread,
+            seed_brightness: l.seed_brightness,
+            seed_spread: l.seed_spread,
+            asr: l.asr,
+            grain_size: l.grain_size,
+            grain_size_spread: l.grain_size_spread,
+            grain: l.grain,
+            depth_layers: l.depth_layers,
+            pattern_size: l.pattern_size,
+            blur: l.blur,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV13 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+    soil: Option<LegacySoilConfigV13>,
+}
+
+impl From<LegacySpeckleV13> for Speckle {
+    fn from(l: LegacySpeckleV13) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: l.soil.map(|c| LegacySoilConfigV15::from(c).into()),
+            seed: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV14 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+    soil: Option<LegacySoilConfigV15>,
+}
+
+impl From<LegacySpeckleV14> for Speckle {
+    fn from(l: LegacySpeckleV14) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: l.soil.map(Into::into),
+            seed: None,
+        }
+    }
+}
+
+/// Grain outline of `SoilConfig` up to v15 (0x14).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum LegacySoilGrain {
+    Sphere,
+    Elongated { aspect: f64 },
+    Cluster { roundness: f64 },
+}
+
+/// `SoilConfig` as of v14-v15 (0x13-0x14).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySoilConfigV15 {
+    kind: crate::soil::SoilKind,
+    matrix_brightness: f64,
+    matrix_spread: f64,
+    seed_brightness: f64,
+    seed_spread: f64,
+    asr: f64,
+    grain_size: f64,
+    grain_size_spread: f64,
+    grain: LegacySoilGrain,
+    depth_layers: usize,
+    pattern_size: f64,
+    blur: f64,
+}
+
+impl From<LegacySoilConfigV15> for crate::soil::SoilConfig {
+    /// Grain size and shape become a characterisation. The log-normal sizes
+    /// (by count: median `grain_size`, 90th percentile `grain_size_spread` x
+    /// median) become a size curve in px whose median by area is `d_p`.
+    /// Spheres and clusters: aspect ratio 1; ellipses of long/short `aspect`:
+    /// aspect ratio 1 / aspect; default outline statistics (the images were
+    /// drawn with older outlines). Brightness, asr, layers, pattern and blur
+    /// are kept.
+    fn from(l: LegacySoilConfigV15) -> Self {
+        let sigma = l.grain_size_spread.ln() / 1.2816;
+        let x50 = l.grain_size * (2.0 * sigma * sigma).exp(); // area-weighted median
+        let psd = if sigma > 0.0 {
+            (-6..=6)
+                .map(|k| {
+                    let z = 0.5 * k as f64;
+                    [x50 * (sigma * z).exp(), 50.0 * libm::erfc(-z / std::f64::consts::SQRT_2)]
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let aspect_ratio = match l.grain {
+            LegacySoilGrain::Sphere | LegacySoilGrain::Cluster { .. } => 1.0,
+            LegacySoilGrain::Elongated { aspect } => 1.0 / aspect,
+        };
+        crate::soil::SoilConfig {
+            kind: l.kind,
+            matrix_brightness: l.matrix_brightness,
+            matrix_spread: l.matrix_spread,
+            seed_brightness: l.seed_brightness,
+            seed_spread: l.seed_spread,
+            asr: l.asr,
+            psd,
+            d_p: x50,
+            aspect_ratio,
+            aspect_ratio_sd: 0.0,
+            outlines: None,
+            depth_layers: l.depth_layers,
+            pattern_size: l.pattern_size,
+            blur: l.blur,
+            // drawn before brightness inside grains existed: flat grains
+            grain_tilt: 0.0,
+            grain_dome: 0.0,
+            grain_rim: 0.0,
+            grain_texture: 0.0,
+            texture_size: 0.10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV15 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+    soil: Option<LegacySoilConfigV15>,
+    seed: Option<u64>,
+}
+
+impl From<LegacySpeckleV15> for Speckle {
+    fn from(l: LegacySpeckleV15) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: l.soil.map(Into::into),
+            seed: l.seed,
+        }
+    }
+}
+
+/// `SoilConfig` as of v16 (0x15).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySoilConfigV16 {
+    kind: crate::soil::SoilKind,
+    matrix_brightness: f64,
+    matrix_spread: f64,
+    seed_brightness: f64,
+    seed_spread: f64,
+    asr: f64,
+    psd: Vec<[f64; 2]>,
+    d_p: f64,
+    aspect_ratio: f64,
+    aspect_ratio_sd: f64,
+    sphericity: f64,
+    sphericity_sd: f64,
+    depth_layers: usize,
+    pattern_size: f64,
+    blur: f64,
+}
+
+impl From<LegacySoilConfigV16> for crate::soil::SoilConfig {
+    /// Sphericity is dropped (no longer an input); default outline statistics
+    /// (the images were drawn with older outlines).
+    fn from(l: LegacySoilConfigV16) -> Self {
+        crate::soil::SoilConfig {
+            kind: l.kind,
+            matrix_brightness: l.matrix_brightness,
+            matrix_spread: l.matrix_spread,
+            seed_brightness: l.seed_brightness,
+            seed_spread: l.seed_spread,
+            asr: l.asr,
+            psd: l.psd,
+            d_p: l.d_p,
+            aspect_ratio: l.aspect_ratio,
+            aspect_ratio_sd: l.aspect_ratio_sd,
+            outlines: None,
+            depth_layers: l.depth_layers,
+            pattern_size: l.pattern_size,
+            blur: l.blur,
+            // drawn before brightness inside grains existed: flat grains
+            grain_tilt: 0.0,
+            grain_dome: 0.0,
+            grain_rim: 0.0,
+            grain_texture: 0.0,
+            texture_size: 0.10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV16 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+    soil: Option<LegacySoilConfigV16>,
+    seed: Option<u64>,
+}
+
+impl From<LegacySpeckleV16> for Speckle {
+    fn from(l: LegacySpeckleV16) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: l.soil.map(Into::into),
+            seed: l.seed,
+        }
+    }
+}
+
+/// `SoilConfig` as of v17 (0x16).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySoilConfigV17 {
+    kind: crate::soil::SoilKind,
+    matrix_brightness: f64,
+    matrix_spread: f64,
+    seed_brightness: f64,
+    seed_spread: f64,
+    asr: f64,
+    psd: Vec<[f64; 2]>,
+    d_p: f64,
+    aspect_ratio: f64,
+    aspect_ratio_sd: f64,
+    outlines: Option<crate::soil::OutlineStats>,
+    depth_layers: usize,
+    pattern_size: f64,
+    blur: f64,
+}
+
+impl From<LegacySoilConfigV17> for crate::soil::SoilConfig {
+    /// No brightness variation inside grains (the images were drawn without).
+    fn from(l: LegacySoilConfigV17) -> Self {
+        crate::soil::SoilConfig {
+            kind: l.kind,
+            matrix_brightness: l.matrix_brightness,
+            matrix_spread: l.matrix_spread,
+            seed_brightness: l.seed_brightness,
+            seed_spread: l.seed_spread,
+            asr: l.asr,
+            psd: l.psd,
+            d_p: l.d_p,
+            aspect_ratio: l.aspect_ratio,
+            aspect_ratio_sd: l.aspect_ratio_sd,
+            outlines: l.outlines,
+            depth_layers: l.depth_layers,
+            pattern_size: l.pattern_size,
+            blur: l.blur,
+            // drawn before brightness inside grains existed: flat grains
+            grain_tilt: 0.0,
+            grain_dome: 0.0,
+            grain_rim: 0.0,
+            grain_texture: 0.0,
+            texture_size: 0.10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacySpeckleV17 {
+    image_dir: String,
+    name: String,
+    file_format: String,
+    image_size: (usize, usize),
+    speckle_size: f64,
+    speckle_number: usize,
+    speckle_limit: bool,
+    progression: Progression,
+    comp: [f64; 12],
+    origin: [f64; 2],
+    mode: WarpMode,
+    noise_pos: f64,
+    noise_int: f64,
+    image_no: usize,
+    scale: ScaleType,
+    speckle_positions: Option<ndarray::Array2<f64>>,
+    solved: bool,
+    grain_shape: crate::speckle::GrainShape,
+    grain_rotation: crate::speckle::GrainRotation,
+    grain_overlap: crate::speckle::GrainOverlap,
+    no_overlap: Option<f64>,
+    soil: Option<LegacySoilConfigV17>,
+    seed: Option<u64>,
+}
+
+impl From<LegacySpeckleV17> for Speckle {
+    fn from(l: LegacySpeckleV17) -> Self {
+        Speckle {
+            image_dir: l.image_dir,
+            name: l.name,
+            file_format: l.file_format,
+            image_size: l.image_size,
+            speckle_size: l.speckle_size,
+            speckle_number: l.speckle_number,
+            speckle_limit: l.speckle_limit,
+            progression: l.progression,
+            comp: l.comp,
+            origin: l.origin,
+            mode: l.mode,
+            noise_pos: l.noise_pos,
+            noise_int: l.noise_int,
+            image_no: l.image_no,
+            scale: l.scale,
+            speckle_positions: l.speckle_positions,
+            solved: l.solved,
+            grain_shape: l.grain_shape,
+            grain_rotation: l.grain_rotation,
+            grain_overlap: l.grain_overlap,
+            no_overlap: l.no_overlap,
+            soil: l.soil.map(Into::into),
+            seed: l.seed,
+        }
+    }
+}
+
+legacy_object_with_speckle!(LegacyGeopyvObjectV9, LegacySpeckleV9);
+legacy_object_with_speckle!(LegacyGeopyvObjectV10, LegacySpeckleV10);
+legacy_object_with_speckle!(LegacyGeopyvObjectV11, LegacySpeckleV11);
+legacy_object_with_speckle!(LegacyGeopyvObjectV12, LegacySpeckleV12);
+legacy_object_with_speckle!(LegacyGeopyvObjectV13, LegacySpeckleV13);
+legacy_object_with_speckle!(LegacyGeopyvObjectV14, LegacySpeckleV14);
+legacy_object_with_speckle!(LegacyGeopyvObjectV15, LegacySpeckleV15);
+legacy_object_with_speckle!(LegacyGeopyvObjectV16, LegacySpeckleV16);
+legacy_object_with_speckle!(LegacyGeopyvObjectV17, LegacySpeckleV17);
 
 // ---------------------------------------------------------------------------
 // save / load
@@ -1437,7 +2812,7 @@ pub fn save<P: AsRef<Path>>(path: P, object: &GeopyvObject) -> Result<(), Error>
 /// Returns [`Error::UnsupportedVersion`] for any unrecognised version byte.
 ///
 /// Files with version `0x01`/`0x02` (schema v0), `0x03` (schema v1, the
-/// released package's format), `0x07` (schema v2), `0x08` (schema v3), `0x09` (schema v4) or `0x0A` (schema v5) are decoded via the frozen `Legacy*` /
+/// released package's format), `0x07` (schema v2), `0x08` (schema v3), `0x09` (schema v4), `0x0A` (schema v5) or `0x0B` (schema v6) are decoded via the frozen `Legacy*` /
 /// `Legacy*V1` types and migrated into the current shapes — see "Schema
 /// versioning" in the module docs.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
@@ -1460,7 +2835,9 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
     let data = match ver_buf[0] {
         VERSION_UNCOMPRESSED => raw,
         VERSION_ZSTD_V0 | VERSION_ZSTD_V1 | VERSION_ZSTD_V2 | VERSION_ZSTD_V3 | VERSION_ZSTD_V4
-        | VERSION_ZSTD_V5 | CURRENT_VERSION => {
+        | VERSION_ZSTD_V5 | VERSION_ZSTD_V6 | VERSION_ZSTD_V7 | VERSION_ZSTD_V8
+        | VERSION_ZSTD_V9 | VERSION_ZSTD_V10 | VERSION_ZSTD_V11 | VERSION_ZSTD_V12
+        | VERSION_ZSTD_V13 | VERSION_ZSTD_V14 | VERSION_ZSTD_V15 | VERSION_ZSTD_V16 | VERSION_ZSTD_V17 | CURRENT_VERSION => {
             zstd::decode_all(raw.as_slice()).map_err(|e| Error::Io(e.to_string()))?
         }
         v => return Err(Error::UnsupportedVersion(v)),
@@ -1475,6 +2852,87 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
                 )
                 .map_err(|e| Error::Io(e.to_string()))?;
             Ok(object)
+        }
+        VERSION_ZSTD_V17 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV17, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V16 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV16, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V15 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV15, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V14 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV14, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V13 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV13, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V12 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV12, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V11 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV11, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V10 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV10, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V9 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV9, _>(&data, bincode::config::standard())
+                    .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V8 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV8, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V7 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV7, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
+        }
+        VERSION_ZSTD_V6 => {
+            let (legacy, _) =
+                bincode::serde::decode_from_slice::<LegacyGeopyvObjectV6, _>(
+                    &data,
+                    bincode::config::standard(),
+                )
+                .map_err(|e| Error::Io(e.to_string()))?;
+            Ok(legacy.into())
         }
         VERSION_ZSTD_V5 => {
             let (legacy, _) =
@@ -1593,6 +3051,7 @@ mod tests {
             template_sizes: Some(ndarray::array![8u32, 8, 8]),
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 
@@ -2225,6 +3684,7 @@ mod tests {
                 max_iterations: 50,
                 method: crate::mesh::SolveMethod::Icgn,
                 eta_omitted: Some((0.0123, 0.0456)),
+                texture: Texture::Deformable,
             },
             std_dev: 71.5,
             sssig: 430193.5,
@@ -2259,6 +3719,7 @@ mod tests {
                 converged: true, quality_ok: true, history: vec![], max_norm: 1e-5, tolerance: 0.0,
                 subset_order: 1, max_iterations: 80, method: crate::mesh::SolveMethod::Icgn,
                 eta_omitted: None,
+                texture: Texture::Deformable,
             },
             std_dev: 50.0,
             sssig: 1.0e5,
@@ -2301,7 +3762,7 @@ mod tests {
             mask: sol.mask.clone(),
             ref_image: sol.ref_image.clone(),
             target_image: sol.target_image.clone(),
-            result: sol.result.clone(),
+            result: LegacySolveResultV7::from_current(sol.result.clone()),
             std_dev: sol.std_dev,
             sssig: sol.sssig,
             delta_f: sol.delta_f,
@@ -2382,6 +3843,489 @@ mod tests {
                 assert_eq!(l.solve_config.map(|c| c.masking), m.solve_config.as_ref().map(|_| crate::mesh::Masking::Uniform));
             }
             _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v6 (0x0B) mesh file loads with no tracks.
+    #[test]
+    fn test_schema_v6_mesh_file_loads_via_legacy_path() {
+        let m = make_mesh_solution();
+        let legacy = LegacyGeopyvObjectV6::Mesh(LegacyMeshSolutionV6 {
+            nodes: m.nodes.clone(),
+            elements: m.elements.clone(),
+            boundary: m.boundary.clone(),
+            exclusions: m.exclusions.clone(),
+            centroids: m.centroids.clone(),
+            areas: m.areas.clone(),
+            warps: m.warps.clone(),
+            displacements: m.displacements.clone(),
+            c_zncc: m.c_zncc.clone(),
+            p: m.p.clone(),
+            seed_node: m.seed_node,
+            mesh_order: m.mesh_order,
+            subset_order: m.subset_order,
+            iterations: m.iterations.clone(),
+            norms: m.norms.clone(),
+            f_img_path: m.f_img_path.clone(),
+            g_img_path: m.g_img_path.clone(),
+            solve_config: m.solve_config.clone().map(LegacySolveConfigV7::from_current),
+            seed: m.seed.clone(),
+            template_shape: m.template_shape.clone(),
+            template_sizes: m.template_sizes.clone(),
+            time: Some((0.0, 2.0)),
+            seams: None,
+        });
+        let tmp = write_versioned("geopyv_test_v6_mesh.pyv", VERSION_ZSTD_V6, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => {
+                assert_eq!(l.displacements, m.displacements);
+                assert_eq!(l.time, Some((0.0, 2.0)));
+                assert!(l.tracks.is_none());
+            }
+            _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A tracked mesh's per-subset history survives a save/load round trip.
+    #[test]
+    fn test_mesh_tracks_round_trip() {
+        let mut m = make_mesh_solution();
+        let n = m.nodes.nrows();
+        let w = ndarray::Array2::from_shape_fn((n, 6), |(i, k)| 0.01 * (i * 6 + k) as f64);
+        m.tracks = Some(crate::mesh::NodeTracks {
+            id: (0..n as u64).map(|i| 10 + i).collect(),
+            origin: m.nodes.clone(),
+            position: m.nodes.clone() + 0.5,
+            reference_warp: w.clone(),
+            increment: w.clone() * 2.0,
+            warp: w * 3.0,
+        });
+        let tmp = std::env::temp_dir().join("geopyv_test_tracks.pyv");
+        save(&tmp, &GeopyvObject::Mesh(m.clone())).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => assert_eq!(l.tracks, m.tracks),
+            _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v7 (0x0C) subset file loads with the deformable texture.
+    #[test]
+    fn test_schema_v7_subset_file_loads_via_legacy_path() {
+        let sol = seam_subset_solution();
+        let legacy = LegacyGeopyvObjectV7::Subset(LegacySubsetSolutionV7::from_current(sol.clone()));
+        let tmp = write_versioned("geopyv_test_v7_subset.pyv", VERSION_ZSTD_V7, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Subset(s) => {
+                assert_eq!(s.result.p, sol.result.p);
+                assert_eq!(s.result.texture, Texture::Deformable);
+                assert_eq!(s.seams, sol.seams);
+            }
+            _ => panic!("expected Subset variant"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v7 (0x0C) mesh file loads with the deformable texture and
+    /// keeps its tracks.
+    #[test]
+    fn test_schema_v7_mesh_file_loads_via_legacy_path() {
+        let mut m = make_mesh_solution();
+        let n = m.nodes.nrows();
+        let w = ndarray::Array2::from_shape_fn((n, 6), |(i, k)| 0.01 * (i * 6 + k) as f64);
+        m.tracks = Some(crate::mesh::NodeTracks {
+            id: (0..n as u64).collect(),
+            origin: m.nodes.clone(),
+            position: m.nodes.clone(),
+            reference_warp: w.clone(),
+            increment: w.clone(),
+            warp: w,
+        });
+        assert!(m.solve_config.is_some());
+        let legacy = LegacyGeopyvObjectV7::Mesh(LegacyMeshSolutionV7::from_current(m.clone()));
+        let tmp = write_versioned("geopyv_test_v7_mesh.pyv", VERSION_ZSTD_V7, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => {
+                assert_eq!(l.displacements, m.displacements);
+                assert_eq!(l.tracks, m.tracks);
+                assert_eq!(l.solve_config.map(|c| c.texture), Some(Texture::Deformable));
+            }
+            _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// The rigid texture survives a current-format round trip on a subset
+    /// result and a mesh config.
+    #[test]
+    fn test_texture_round_trip() {
+        let mut sol = seam_subset_solution();
+        sol.result.texture = Texture::RigidSphere;
+        let tmp = std::env::temp_dir().join("geopyv_test_texture_subset.pyv");
+        save(&tmp, &GeopyvObject::Subset(sol)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Subset(s) => assert_eq!(s.result.texture, Texture::RigidSphere),
+            _ => panic!("expected Subset variant"),
+        }
+        let _ = std::fs::remove_file(tmp);
+        let mut m = make_mesh_solution();
+        m.solve_config.as_mut().unwrap().texture = Texture::RigidSphere;
+        let tmp = std::env::temp_dir().join("geopyv_test_texture_mesh.pyv");
+        save(&tmp, &GeopyvObject::Mesh(m)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Mesh(l) => assert_eq!(l.solve_config.map(|c| c.texture), Some(Texture::RigidSphere)),
+            _ => panic!("expected Mesh"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    fn a_speckle() -> Speckle {
+        Speckle::new(
+            "/tmp".into(), "s".into(), ".png".into(), (64, 48), 10.0, 30, true,
+            crate::speckle::Progression::Deformation, [0.0; 12], [32.0, 24.0], 0.0, 0.0,
+            WarpMode::None, 2, crate::speckle::ScaleType::Lin,
+        ).unwrap()
+    }
+
+    /// A schema v8 (0x0D) speckle file loads as round grains.
+    #[test]
+    fn test_schema_v8_speckle_loads_round() {
+        let sp = a_speckle();
+        let legacy = LegacyGeopyvObjectV8::Speckle(LegacySpeckleV8 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+        });
+        let tmp = write_versioned("geopyv_test_v8_speckle.pyv", VERSION_ZSTD_V8, &legacy);
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                assert_eq!(s.grain_shape, crate::speckle::GrainShape::Round);
+                assert_eq!(s.speckle_number, 30);
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// Grain settings survive a current-format round trip.
+    #[test]
+    fn test_speckle_grains_round_trip() {
+        use crate::speckle::{GrainRotation, GrainShape};
+        let sp = a_speckle().with_grains(GrainShape::Ellipse { aspect: 4.0 }, GrainRotation::None).unwrap()
+            .with_overlap(crate::speckle::GrainOverlap::Opaque).with_no_overlap(0.4).unwrap();
+        let tmp = std::env::temp_dir().join("geopyv_test_speckle_grains.pyv");
+        save(&tmp, &GeopyvObject::Speckle(sp)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                assert_eq!(s.grain_shape, GrainShape::Ellipse { aspect: 4.0 });
+                assert_eq!(s.grain_rotation, GrainRotation::None);
+                assert_eq!(s.grain_overlap, crate::speckle::GrainOverlap::Opaque);
+                assert_eq!(s.no_overlap, Some(0.4));
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// Schema v9 (0x0E) and v10 (0x0F) speckle files load with their grain
+    /// settings and the later fields at their defaults.
+    #[test]
+    fn test_schema_v9_v10_speckle_load() {
+        use crate::speckle::{GrainOverlap, GrainRotation, GrainShape};
+        let sp = a_speckle();
+        let v10 = LegacySpeckleV10 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: GrainShape::Ellipse { aspect: 2.0 }, grain_rotation: GrainRotation::None,
+            grain_overlap: GrainOverlap::Opaque,
+        };
+        let tmp = write_versioned("geopyv_test_v10_speckle.pyv", VERSION_ZSTD_V10, &LegacyGeopyvObjectV10::Speckle(v10));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                assert_eq!(s.grain_overlap, GrainOverlap::Opaque);
+                assert_eq!(s.no_overlap, None);
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+        let v9 = LegacySpeckleV9 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: GrainShape::Cluster { n: 4 }, grain_rotation: GrainRotation::Material,
+        };
+        let tmp = write_versioned("geopyv_test_v9_speckle.pyv", VERSION_ZSTD_V9, &LegacyGeopyvObjectV9::Speckle(v9));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                assert_eq!(s.grain_shape, GrainShape::Cluster { n: 4 });
+                assert_eq!(s.grain_overlap, GrainOverlap::Add);
+                assert_eq!(s.no_overlap, None);
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v11 (0x10) speckle file loads with no soil; a soil setting
+    /// survives a current-format round trip.
+    #[test]
+    fn test_speckle_soil_versions() {
+        let sp = a_speckle().with_no_overlap(0.3).unwrap();
+        let v11 = LegacySpeckleV11 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: sp.no_overlap,
+        };
+        let tmp = write_versioned("geopyv_test_v11_speckle.pyv", VERSION_ZSTD_V11, &LegacyGeopyvObjectV11::Speckle(v11));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                assert_eq!(s.no_overlap, Some(0.3));
+                assert!(s.soil.is_none());
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+        let soil = crate::soil::SoilConfig::clay(180.0, 135.0, 0.2);
+        let sp = a_speckle().with_soil(soil.clone()).unwrap();
+        let tmp = std::env::temp_dir().join("geopyv_test_speckle_soil.pyv");
+        save(&tmp, &GeopyvObject::Speckle(sp)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => assert_eq!(s.soil, Some(soil)),
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v12 (0x11) soil file loads with its settings converted.
+    #[test]
+    fn test_schema_v12_soil_converts() {
+        let sp = a_speckle();
+        let old = LegacySoilConfigV12 {
+            kind: crate::soil::SoilKind::Clay, matrix_brightness: 180.0, grain_brightness: 135.0, grain_spread: 0.04,
+            grain_size: 6.0, grain_size_spread: 1.8, grain: LegacySoilGrain::Sphere, coverage: 0.15,
+            depth_layers: 1, depth_dimming: 1.0, pattern_strength: 0.05, pattern_size: 10.0, blur: 1.0,
+        };
+        let v12 = LegacySpeckleV12 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: None, soil: Some(old),
+        };
+        let tmp = write_versioned("geopyv_test_v12_soil.pyv", VERSION_ZSTD_V12, &LegacyGeopyvObjectV12::Speckle(v12));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                let c = s.soil.unwrap();
+                assert_eq!((c.matrix_brightness, c.matrix_spread, c.seed_brightness, c.seed_spread, c.asr), (180.0, 0.05, 135.0, 0.04, 0.15));
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v13 (0x12) soil file loads with depth dimming dropped.
+    #[test]
+    fn test_schema_v13_soil_drops_dimming() {
+        let sp = a_speckle();
+        let old = LegacySoilConfigV13 {
+            kind: crate::soil::SoilKind::Sand, matrix_brightness: 107.0, matrix_spread: 0.09, seed_brightness: 68.0,
+            seed_spread: 0.09, asr: 0.26, grain_size: 6.0, grain_size_spread: 1.8, grain: LegacySoilGrain::Sphere,
+            depth_layers: 4, depth_dimming: 0.8, pattern_size: 10.0, blur: 1.0,
+        };
+        let v13 = LegacySpeckleV13 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: None, soil: Some(old),
+        };
+        let tmp = write_versioned("geopyv_test_v13_soil.pyv", VERSION_ZSTD_V13, &LegacyGeopyvObjectV13::Speckle(v13));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                let c = s.soil.unwrap();
+                assert_eq!((c.matrix_brightness, c.matrix_spread, c.asr, c.depth_layers, c.blur), (107.0, 0.09, 0.26, 4, 1.0));
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v14 (0x13) soil file loads with no seed kept; a current file
+    /// keeps the seed of its solve.
+    #[test]
+    fn test_schema_v14_speckle_seed() {
+        let sp = a_speckle();
+        let v14 = LegacySpeckleV14 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: None, soil: Some(old_soil()),
+        };
+        let tmp = write_versioned("geopyv_test_v14_seed.pyv", VERSION_ZSTD_V14, &LegacyGeopyvObjectV14::Speckle(v14));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => assert!(s.seed.is_none() && s.soil.unwrap().d_p > 6.0),
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+        let mut sp = a_speckle();
+        sp.seed = Some(17);
+        let tmp = std::env::temp_dir().join("geopyv_test_v15_seed.pyv");
+        save(&tmp, &GeopyvObject::Speckle(sp)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => assert_eq!(s.seed, Some(17)),
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    fn old_soil() -> LegacySoilConfigV15 {
+        LegacySoilConfigV15 {
+            kind: crate::soil::SoilKind::Clay, matrix_brightness: 180.0, matrix_spread: 0.05, seed_brightness: 105.0,
+            seed_spread: 0.09, asr: 0.1, grain_size: 6.0, grain_size_spread: 1.8,
+            grain: LegacySoilGrain::Elongated { aspect: 2.0 }, depth_layers: 1, pattern_size: 10.0, blur: 0.0,
+        }
+    }
+
+    /// A schema v15 (0x14) soil file loads with its grain size and shape
+    /// turned into a characterisation; the seed is kept.
+    #[test]
+    fn test_schema_v15_soil_characterisation() {
+        let sp = a_speckle();
+        let v15 = LegacySpeckleV15 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: None, soil: Some(old_soil()), seed: Some(5),
+        };
+        let tmp = write_versioned("geopyv_test_v15_soil.pyv", VERSION_ZSTD_V15, &LegacyGeopyvObjectV15::Speckle(v15));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                assert_eq!(s.seed, Some(5));
+                let c = s.soil.unwrap();
+                let sigma = 1.8f64.ln() / 1.2816;
+                assert!((c.d_p - 6.0 * (2.0 * sigma * sigma).exp()).abs() < 1e-9);
+                assert!((c.aspect_ratio - 0.5).abs() < 1e-12 && c.outlines.is_none());
+                assert!(c.validate().is_ok());
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v16 (0x15) soil file loads with its sphericity dropped and the
+    /// default outline statistics; a current file keeps given statistics.
+    #[test]
+    fn test_schema_v16_soil_drops_sphericity() {
+        let sp = a_speckle();
+        let v16 = LegacySpeckleV16 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: None, seed: Some(5),
+            soil: Some(LegacySoilConfigV16 {
+                kind: crate::soil::SoilKind::Sand, matrix_brightness: 106.0, matrix_spread: 0.15,
+                seed_brightness: 62.0, seed_spread: 0.09, asr: 0.18, psd: Vec::new(), d_p: 6.0,
+                aspect_ratio: 0.7, aspect_ratio_sd: 0.1, sphericity: 0.84, sphericity_sd: 0.06,
+                depth_layers: 6, pattern_size: 10.0, blur: 0.0,
+            }),
+        };
+        let tmp = write_versioned("geopyv_test_v16_soil.pyv", VERSION_ZSTD_V16, &LegacyGeopyvObjectV16::Speckle(v16));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                let c = s.soil.unwrap();
+                assert!((c.aspect_ratio - 0.7).abs() < 1e-12 && (c.aspect_ratio_sd - 0.1).abs() < 1e-12);
+                assert!(c.outlines.is_none() && c.validate().is_ok());
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+        let mut sp = a_speckle();
+        let mut soil = crate::soil::SoilConfig::sand(106.0, 62.0, 0.18);
+        let mut stats = crate::soil::OutlineStats::leighton_buzzard();
+        stats.irregularity = 0.05;
+        soil.outlines = Some(stats.clone());
+        sp.soil = Some(soil);
+        let tmp = std::env::temp_dir().join("geopyv_test_v17_outlines.pyv");
+        save(&tmp, &GeopyvObject::Speckle(sp)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => assert_eq!(s.soil.unwrap().outlines, Some(stats)),
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// A schema v17 (0x16) soil file loads with its outline statistics and no
+    /// brightness variation inside grains; a current file keeps the settings.
+    #[test]
+    fn test_schema_v17_soil_has_no_grain_texture() {
+        let sp = a_speckle();
+        let stats = crate::soil::OutlineStats::leighton_buzzard();
+        let v17 = LegacySpeckleV17 {
+            image_dir: sp.image_dir.clone(), name: sp.name.clone(), file_format: sp.file_format.clone(),
+            image_size: sp.image_size, speckle_size: sp.speckle_size, speckle_number: sp.speckle_number,
+            speckle_limit: sp.speckle_limit, progression: sp.progression.clone(), comp: sp.comp,
+            origin: sp.origin, mode: sp.mode.clone(), noise_pos: sp.noise_pos, noise_int: sp.noise_int,
+            image_no: sp.image_no, scale: sp.scale.clone(), speckle_positions: None, solved: false,
+            grain_shape: sp.grain_shape, grain_rotation: sp.grain_rotation, grain_overlap: sp.grain_overlap,
+            no_overlap: None, seed: Some(5),
+            soil: Some(LegacySoilConfigV17 {
+                kind: crate::soil::SoilKind::Sand, matrix_brightness: 106.0, matrix_spread: 0.15,
+                seed_brightness: 62.0, seed_spread: 0.09, asr: 0.18, psd: Vec::new(), d_p: 6.0,
+                aspect_ratio: 0.7, aspect_ratio_sd: 0.1, outlines: Some(stats.clone()),
+                depth_layers: 6, pattern_size: 10.0, blur: 0.8,
+            }),
+        };
+        let tmp = write_versioned("geopyv_test_v17_soil.pyv", VERSION_ZSTD_V17, &LegacyGeopyvObjectV17::Speckle(v17));
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                let c = s.soil.unwrap();
+                assert_eq!(c.outlines, Some(stats));
+                assert!(c.grain_tilt == 0.0 && c.grain_dome == 0.0 && c.grain_rim == 0.0 && c.grain_texture == 0.0);
+                assert!((c.blur - 0.8).abs() < 1e-12 && c.validate().is_ok());
+            }
+            _ => panic!("expected Speckle"),
+        }
+        let _ = std::fs::remove_file(tmp);
+        let mut sp = a_speckle();
+        sp.soil = Some(crate::soil::SoilConfig {
+            grain_tilt: 0.16, grain_dome: 0.15, grain_rim: 0.05, grain_texture: 0.06, texture_size: 0.08,
+            ..crate::soil::SoilConfig::sand(106.0, 62.0, 0.18)
+        });
+        let tmp = std::env::temp_dir().join("geopyv_test_v18_texture.pyv");
+        save(&tmp, &GeopyvObject::Speckle(sp)).unwrap();
+        match load(&tmp).unwrap() {
+            GeopyvObject::Speckle(s) => {
+                let c = s.soil.unwrap();
+                assert_eq!((c.grain_tilt, c.grain_dome, c.grain_rim, c.grain_texture, c.texture_size),
+                           (0.16, 0.15, 0.05, 0.06, 0.08));
+            }
+            _ => panic!("expected Speckle"),
         }
         let _ = std::fs::remove_file(tmp);
     }
