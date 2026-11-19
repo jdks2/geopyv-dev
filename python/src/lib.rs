@@ -11,6 +11,8 @@ mod py_field;
 mod py_sequence;
 mod py_io;
 mod py_validation;
+#[cfg(feature = "gui")]
+#[cfg(feature = "gui")]
 mod py_gui;
 
 use pyo3::exceptions::PyRuntimeError;
@@ -51,6 +53,7 @@ fn _geopyv_dev(m: &Bound<'_, PyModule>) -> PyResult<()> {
     py_io::register(m)?;
     py_validation::register(m)?;
     py_speckle::register(m)?;
+    #[cfg(feature = "gui")]
     py_gui::register(m)?;
     Ok(())
 }

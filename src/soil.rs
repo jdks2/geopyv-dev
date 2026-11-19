@@ -183,21 +183,6 @@ impl SoilConfig {
         Ok(d2 * factor / 16.0)
     }
 
-    /// Mean distance (px) from a grain's centre to its outline's tangent,
-    /// for the edge correction: perimeter / 2 pi for a convex grain (Cauchy),
-    /// i.e. d / (2 sphericity), with d the area-weighted root-mean-square
-    /// equal-area diameter and the sphericity the mean over the outlines the
-    /// images would draw.
-    pub fn grain_edge_distance(&self) -> Result<f64, Error> {
-        let lib = shape_library(self, 0);
-        let sph = if lib.is_empty() {
-            1.0
-        } else {
-            lib.iter().map(|(s, _, _)| sphericity_of(&s.polygon())).sum::<f64>() / lib.len() as f64
-        };
-        Ok(SizeDraw::new(self)?.area_mean_d2().sqrt() / (2.0 * sph))
-    }
-
     pub fn validate(&self) -> Result<(), Error> {
         let bad = |m: &str| Err(Error::InvalidInput(m.into()));
         if !(0.0..=255.0).contains(&self.matrix_brightness) || !(0.0..=255.0).contains(&self.seed_brightness) {
@@ -578,12 +563,6 @@ fn area_perimeter(pts: &[[f64; 2]]) -> (f64, f64) {
         per += (q[0] - p[0]).hypot(q[1] - p[1]);
     }
     (a, per)
-}
-
-/// Sphericity: perimeter of the equal-area circle / perimeter.
-fn sphericity_of(pts: &[[f64; 2]]) -> f64 {
-    let (a, per) = area_perimeter(pts);
-    2.0 * (std::f64::consts::PI * a).sqrt() / per
 }
 
 /// Aspect ratio: narrowest / widest Feret width (over 180 directions).

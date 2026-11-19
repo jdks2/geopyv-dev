@@ -19,9 +19,14 @@ python demo/0_images.py
 | `6_validation.py` | Measured against the known applied deformation | `5_field.py` |
 | `7_calibration.py` | ChArUco camera calibration; pixels to mm | `pip install geopyv_dev[calibration]` |
 
-`images/shear/` holds five synthetic images under 1 % simple shear, made with
-`gp.Speckle`; `speckle_shear.pyv` holds their true deformation, which
-`6_validation.py` compares against. `images/calibration/` holds 25 photographs
+New to PIV? Start with `0_images.py`: each script explains what it does as it
+runs.
+
+`images/shear/` holds five synthetic photographs of Leighton Buzzard sand
+(measured grain sizes and shapes, brightness fitted to real photographs, no
+camera noise), sheared by 1 % about the centre; `speckle_shear.pyv` holds the
+true deformation, which `6_validation.py` compares against.
+`images/make_shear_images.py` regenerates them with `gp.Speckle`. `images/calibration/` holds 25 photographs
 of a ChArUco board (29 x 18 squares, 10 mm squares, 8 mm markers) for
 `7_calibration.py`; replace them with your own board images for a real test.
 

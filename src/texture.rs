@@ -16,19 +16,6 @@
 //! taken once per reference image with a Gaussian derivative filter of width
 //! `SMOOTH` and scaled by `((s²/2 + σ²)/(s²/2))²` to undo the extra smoothing.
 //! The rigid solve fits `g` to the template `f + G(E(p))`.
-//!
-//! `texture="grains"` drops the round-Gaussian assumption. For opaque rigid
-//! grains of any shape that turn with the material, every pixel moves with
-//! its grain's centre `c`, so to first order
-//!
-//! ```text
-//! g(x + u(x)) - f(x) ≈ ∇f(x) · (U - I)(x - c(x))
-//! ```
-//!
-//! with `U` the stretch of the polar decomposition `F = R U` (zero for any
-//! rotation). The grain centre of every pixel comes from splitting the
-//! reference into grains once ([`GrainCentres`]). Where grains add rather than
-//! hide each other, a pixel's gradient mixes grains and this does not hold.
 
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
@@ -256,215 +243,24 @@ pub(crate) fn grain_template(
     }
 }
 
-/// Grain centre of every pixel of a reference image (`NaN` where no grain).
-pub(crate) struct GrainCentres {
-    pub cx: Array2<f32>,
-    pub cy: Array2<f32>,
-    pub n_grains: usize,
-    /// Grain number of every pixel (1..=n_grains), 0 where no grain.
-    pub label: Array2<i64>,
-    /// Centre `[x, y]` of grain number k + 1.
-    pub centres: Vec<[f64; 2]>,
-}
-
-impl GrainCentres {
-    /// Split the image into grains: smooth with the `SMOOTH` Gaussian, let
-    /// every pixel climb to its brightest 3 x 3 neighbour until it reaches a
-    /// peak, and take that peak's grain. Peaks no higher than a quarter of the
-    /// way from the image's dark to its bright level (1st to 99th percentile)
-    /// are background: no grain. Each
-    /// grain's centre is the brightness-weighted centroid of its pixels at
-    /// least half as bright as its brightest one. `None` if no grain is found.
-    pub(crate) fn build(img: &Image) -> Option<Self> {
-        let a = &img.image_gs;
-        let (rows, cols) = a.dim();
-        if rows < 3 || cols < 3 {
-            return None;
-        }
-        let k0 = kernel(0);
-        let sm = filter_1d(&filter_1d(a, &k0, true), &k0, false);
-        let n = rows * cols;
-        let mut ptr: Vec<usize> = (0..n)
-            .into_par_iter()
-            .map(|q| {
-                let (r, c) = (q / cols, q % cols);
-                let mut best = (sm[[r, c]], q);
-                for dr in -1i64..=1 {
-                    for dc in -1i64..=1 {
-                        let (rr, cc) = (r as i64 + dr, c as i64 + dc);
-                        if rr < 0 || cc < 0 || rr >= rows as i64 || cc >= cols as i64 {
-                            continue;
-                        }
-                        let v = sm[[rr as usize, cc as usize]];
-                        if v > best.0 {
-                            best = (v, rr as usize * cols + cc as usize);
-                        }
-                    }
-                }
-                best.1
-            })
-            .collect();
-        loop {
-            let next: Vec<usize> = ptr.par_iter().map(|&q| ptr[q]).collect();
-            if next == ptr {
-                break;
-            }
-            ptr = next;
-        }
-        let mut sorted: Vec<f64> = sm.iter().copied().collect();
-        sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let (lo, hi) = (sorted[((n as f64) * 0.01) as usize], sorted[((n as f64) * 0.99) as usize]);
-        if !(hi > lo) {
-            return None;
-        }
-        let floor = lo + 0.25 * (hi - lo);
-        // one slot per root pixel
-        let mut peak = vec![f64::NEG_INFINITY; n];
-        for q in 0..n {
-            let root = ptr[q];
-            peak[root] = peak[root].max(a[[q / cols, q % cols]]);
-        }
-        let mut acc = vec![[0.0f64; 3]; n];
-        for q in 0..n {
-            let root = ptr[q];
-            if sm[[root / cols, root % cols]] <= floor {
-                continue;
-            }
-            let v = a[[q / cols, q % cols]];
-            if v >= 0.5 * peak[root] {
-                acc[root][0] += v;
-                acc[root][1] += v * (q % cols) as f64;
-                acc[root][2] += v * (q / cols) as f64;
-            }
-        }
-        let n_grains = acc.iter().filter(|w| w[0] > 0.0).count();
-        if n_grains == 0 {
-            return None;
-        }
-        let centre = |q: usize, axis: usize| -> f32 {
-            let w = &acc[ptr[q]];
-            if w[0] > 0.0 { (w[axis] / w[0]) as f32 } else { f32::NAN }
-        };
-        let cx = Array2::from_shape_fn((rows, cols), |(r, c)| centre(r * cols + c, 1));
-        let cy = Array2::from_shape_fn((rows, cols), |(r, c)| centre(r * cols + c, 2));
-        // number the grains in order of their peak pixel
-        let mut number = vec![0i64; n];
-        let mut centres = Vec::with_capacity(n_grains);
-        for (root, w) in acc.iter().enumerate() {
-            if w[0] > 0.0 {
-                centres.push([w[1] / w[0], w[2] / w[0]]);
-                number[root] = centres.len() as i64;
-            }
-        }
-        let label = Array2::from_shape_fn((rows, cols), |(r, c)| number[ptr[r * cols + c]]);
-        Some(Self { cx, cy, n_grains, label, centres })
-    }
-
-    /// Offset `x - c(x)` of each of `coords` from its grain centre (nearest
-    /// pixel; `[0, 0]`, i.e. no correction, where there is no grain).
-    pub(crate) fn offsets(&self, coords: &Array2<f64>) -> Vec<[f64; 2]> {
-        let (rows, cols) = self.cx.dim();
-        (0..coords.nrows())
-            .map(|i| {
-                let (x, y) = (coords[[i, 0]], coords[[i, 1]]);
-                let (c, r) = ((x.round().max(0.0) as usize).min(cols - 1), (y.round().max(0.0) as usize).min(rows - 1));
-                let (gx, gy) = (self.cx[[r, c]], self.cy[[r, c]]);
-                if gx.is_nan() { [0.0, 0.0] } else { [x - gx as f64, y - gy as f64] }
-            })
-            .collect()
-    }
-}
-
-/// Displacement gradients `(ux, vx, uy, vy)` of warp `p` at subset pixel `i`.
-#[inline]
-fn warp_gradient(p: &[f64], i: usize, coord: [f64; 2], f_coords: &Array2<f64>) -> (f64, f64, f64, f64) {
-    if p.len() <= 7 {
-        return (p[2], p[3], p[4], p[5]);
-    }
-    let (dx, dy) = (f_coords[[i, 0]] - coord[0], f_coords[[i, 1]] - coord[1]);
-    (p[2] + p[6] * dx + p[8] * dy, p[3] + p[7] * dx + p[9] * dy,
-     p[4] + p[8] * dx + p[10] * dy, p[5] + p[9] * dx + p[11] * dy)
-}
-
-/// `U - I` for `F = I + grad u = R U` (2-D polar decomposition), as
-/// `[[k00, k01], [k10, k11]]`.
-#[inline]
-fn stretch_minus_identity(ux: f64, vx: f64, uy: f64, vy: f64) -> [[f64; 2]; 2] {
-    let f = [[1.0 + ux, uy], [vx, 1.0 + vy]];
-    let th = (f[1][0] - f[0][1]).atan2(f[0][0] + f[1][1]);
-    let (c, s) = (th.cos(), th.sin());
-    // U = R^T F
-    [[c * f[0][0] + s * f[1][0] - 1.0, c * f[0][1] + s * f[1][1]],
-     [-s * f[0][0] + c * f[1][0], -s * f[0][1] + c * f[1][1] - 1.0]]
-}
-
-/// The grains template `f + grad f . (U - I)(x - c)` for warp `p`; `off`
-/// holds `x - c` and `grad` the reference gradient at each subset pixel.
-/// Order 0 returns `f` unchanged.
-pub(crate) fn grains_template(
-    f: &Array1<f64>,
-    grad: &Array2<f64>,
-    off: &[[f64; 2]],
-    p: &[f64],
-    coord: [f64; 2],
-    f_coords: &Array2<f64>,
-) -> Array1<f64> {
-    if p.len() == 2 {
-        return f.clone();
-    }
-    let uniform = (p.len() <= 7).then(|| stretch_minus_identity(p[2], p[3], p[4], p[5]));
-    Array1::from_shape_fn(f.len(), |i| {
-        let k = uniform.unwrap_or_else(|| {
-            let (ux, vx, uy, vy) = warp_gradient(p, i, coord, f_coords);
-            stretch_minus_identity(ux, vx, uy, vy)
-        });
-        let (dx, dy) = (off[i][0], off[i][1]);
-        f[i] + grad[[i, 0]] * (k[0][0] * dx + k[0][1] * dy) + grad[[i, 1]] * (k[1][0] * dx + k[1][1] * dy)
-    })
-}
-
 /// The template a rigid-texture solve builds at every iteration.
 pub(crate) enum TemplateModel {
     /// Round Gaussian speckle: curvature `[fxx, fyy, fxy]` and `s^2`;
     /// `base`: what the area term measures brightness from at each pixel
     /// (`None`: the subset mean).
     Curvature { h: Vec<[f64; 3]>, s2: f64, base: Option<Vec<f64>> },
-    /// Opaque grains of any shape: `x - c` and the reference gradient.
-    Grains { off: Vec<[f64; 2]>, grad: Array2<f64> },
-    /// Flat grains in a matrix, from their edges ([`edge_offsets`]): `x - c`
-    /// and the reference gradient, as `Grains`.
-    Edges { off: Vec<[f64; 2]>, grad: Array2<f64> },
-}
-
-/// `x - c` at each subset pixel for flat grains seen at their edges: the grain
-/// centre lies across the edge, on the grain's side, at the grains' mean
-/// edge distance `rho`. `dark`: the grains are darker than the matrix (so the
-/// centre lies down the gradient). Zero where the brightness is flat (no edge,
-/// no correction).
-pub(crate) fn edge_offsets(grad: &Array2<f64>, rho: f64, dark: bool) -> Vec<[f64; 2]> {
-    let sign = if dark { rho } else { -rho };
-    (0..grad.nrows())
-        .map(|i| {
-            let (gx, gy) = (grad[[i, 0]], grad[[i, 1]]);
-            let n = gx.hypot(gy);
-            if n > 1e-9 { [sign * gx / n, sign * gy / n] } else { [0.0, 0.0] }
-        })
-        .collect()
 }
 
 impl TemplateModel {
     pub(crate) fn template(&self, f: &Array1<f64>, f_m: f64, p: &[f64], coord: [f64; 2], f_coords: &Array2<f64>) -> Array1<f64> {
         match self {
             Self::Curvature { h, s2, base } => grain_template(f, f_m, base.as_deref(), h, *s2, p, coord, f_coords),
-            Self::Grains { off, grad } | Self::Edges { off, grad } => grains_template(f, grad, off, p, coord, f_coords),
         }
     }
 
     pub(crate) fn texture(&self) -> crate::mesh::Texture {
         match self {
-            Self::Curvature { .. } => crate::mesh::Texture::RigidSphere,
-            Self::Grains { .. } => crate::mesh::Texture::RigidShape,
-            Self::Edges { .. } => crate::mesh::Texture::RigidEdge,
+            Self::Curvature { .. } => crate::mesh::Texture::Rigid,
         }
     }
 }
@@ -651,7 +447,7 @@ mod tests {
         let (fi, gi) = shear_pair(gamma);
         let mask = LocalMask::circle(15).unwrap();
         let mut out = [(0.0, 0.0, 0.0, true); 2];
-        for (k, tex) in [Texture::Deformable, Texture::RigidSphere].into_iter().enumerate() {
+        for (k, tex) in [Texture::Deformable, Texture::Rigid].into_iter().enumerate() {
             let mut cnt = 0.0;
             for yi in 0..4 {
                 for xi in 0..5 {
@@ -743,7 +539,7 @@ mod tests {
         let mask = LocalMask::circle(15).unwrap();
         let c = [100.3, 100.6];
         let mut rms = [0.0; 2];
-        for (k, tex) in [Texture::Deformable, Texture::RigidSphere].into_iter().enumerate() {
+        for (k, tex) in [Texture::Deformable, Texture::Rigid].into_iter().enumerate() {
             let mut sub = Subset::new(c, &mask, None, fi.clone(), gi.clone(), 1).unwrap();
             sub.solve_icgn(None, 0.75, 1e-6, 100, tex).unwrap();
             assert_eq!(sub.solution().unwrap().result.texture, tex);
@@ -765,188 +561,14 @@ mod tests {
         let img = std::sync::Arc::new(Image::from_array(small, 8));
         assert!(img.grain().is_none());
         let sub = Subset::new([7.0, 7.0], &LocalMask::circle(3).unwrap(), None, img.clone(), img.clone(), 1).unwrap();
-        let r = sub.solve_icgn_result(None, 0.0, 1e-5, 20, Texture::RigidSphere).unwrap();
+        let r = sub.solve_icgn_result(None, 0.0, 1e-5, 20, Texture::Rigid).unwrap();
         assert_eq!(r.texture, Texture::Deformable);
         let mask = LocalMask::circle(10).unwrap();
         let (fi, gi) = shear_pair(0.0);
         let sub0 = Subset::new([100.0, 100.0], &mask, None, fi, gi, 0).unwrap();
-        let r0 = sub0.solve_icgn_result(None, 0.75, 1e-6, 50, Texture::RigidSphere).unwrap();
+        let r0 = sub0.solve_icgn_result(None, 0.75, 1e-6, 50, Texture::Rigid).unwrap();
         assert!(r0.converged);
         assert_eq!(r0.texture, Texture::Deformable);
-    }
-
-    // ---- texture="grains" ----
-
-    /// Opaque elliptical grains (aspect 2, random orientation) on a jittered
-    /// grid, each drawn as `exp(-(e1^2/a^2 + e2^2/b^2))` (x200) and read at
-    /// `Ud` about its own centre (`U = I` for the reference); a pixel shows its
-    /// brightest grain. Returns (image, centres).
-    fn ellipse_grains(u: [[f64; 2]; 2]) -> (Array2<f64>, Vec<[f64; 2]>) {
-        let mut state = 99u64;
-        let mut rnd = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        };
-        let (a, b) = (5.0 * 2f64.sqrt(), 5.0 / 2f64.sqrt());
-        let mut grains = Vec::new();
-        for gy in 0..9 {
-            for gx in 0..9 {
-                let c = [12.0 + 22.0 * gx as f64 + 4.0 * (rnd() - 0.5), 12.0 + 22.0 * gy as f64 + 4.0 * (rnd() - 0.5)];
-                grains.push((c, rnd() * std::f64::consts::PI));
-            }
-        }
-        let img = Array2::from_shape_fn((200, 200), |(r, col)| {
-            grains.iter().fold(0.0f64, |m, &(c, phi)| {
-                let (dx, dy) = (col as f64 - c[0], r as f64 - c[1]);
-                let (qx, qy) = (u[0][0] * dx + u[0][1] * dy, u[1][0] * dx + u[1][1] * dy);
-                let (e1, e2) = (phi.cos() * qx + phi.sin() * qy, -phi.sin() * qx + phi.cos() * qy);
-                m.max(200.0 * (-(e1 * e1 / (a * a) + e2 * e2 / (b * b))).exp())
-            })
-        });
-        (img, grains.into_iter().map(|g| g.0).collect())
-    }
-
-    /// The grain split finds every grain's centre.
-    #[test]
-    fn grain_centres_found() {
-        let (f, centres) = ellipse_grains([[1.0, 0.0], [0.0, 1.0]]);
-        let img = Image::from_array(f, 8);
-        let gc = GrainCentres::build(&img).expect("grains found");
-        let mut worst = 0.0f64;
-        for c in &centres {
-            let (r, col) = (c[1].round() as usize, c[0].round() as usize);
-            let e = (gc.cx[[r, col]] as f64 - c[0]).hypot(gc.cy[[r, col]] as f64 - c[1]);
-            worst = worst.max(e);
-        }
-        assert!(gc.n_grains >= centres.len() && worst < 0.3, "{} grains, worst centre error {worst} px", gc.n_grains);
-        // numbering: every pixel's centre is its numbered grain's centre
-        assert_eq!(gc.centres.len(), gc.n_grains);
-        for ((r, col), &k) in gc.label.indexed_iter() {
-            if k > 0 {
-                let c = gc.centres[k as usize - 1];
-                assert!((c[0] as f32 - gc.cx[[r, col]]).abs() < 1e-3 && (c[1] as f32 - gc.cy[[r, col]]).abs() < 1e-3);
-            } else {
-                assert!(gc.cx[[r, col]].is_nan());
-            }
-        }
-    }
-
-    /// The grains template matches the exact mismatch of rigid turning grains
-    /// under shear and stretch, and is zero for a rotation.
-    #[test]
-    fn grains_template_matches_exact() {
-        let (f0, _) = ellipse_grains([[1.0, 0.0], [0.0, 1.0]]);
-        let img = Image::from_array(f0.clone(), 8);
-        let gc = GrainCentres::build(&img).unwrap();
-        let pts: Vec<[f64; 2]> = (30..170).flat_map(|y| (30..170).map(move |x| [x as f64, y as f64])).collect();
-        let coords = Array2::from_shape_fn((pts.len(), 2), |(i, j)| pts[i][j]);
-        let f = Array1::from_shape_fn(pts.len(), |i| f0[[pts[i][1] as usize, pts[i][0] as usize]]);
-        let grad = Array2::from_shape_fn((pts.len(), 2), |(i, j)| {
-            let (x, y) = (pts[i][0] as usize, pts[i][1] as usize);
-            if j == 0 { 0.5 * (f0[[y, x + 1]] - f0[[y, x - 1]]) } else { 0.5 * (f0[[y + 1, x]] - f0[[y - 1, x]]) }
-        });
-        let off = gc.offsets(&coords);
-        for (name, p) in [("shear", [0.0, 0.0, 0.0, 0.0, 0.05, 0.0]), ("stretch", [0.0, 0.0, 0.05, 0.0, 0.0, 0.0])] {
-            let k = stretch_minus_identity(p[2], p[3], p[4], p[5]);
-            let (exact_img, _) = ellipse_grains([[1.0 + k[0][0], k[0][1]], [k[1][0], 1.0 + k[1][1]]]);
-            let t = grains_template(&f, &grad, &off, &p, [100.0, 100.0], &coords);
-            let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
-            for (i, q) in pts.iter().enumerate() {
-                let e = exact_img[[q[1] as usize, q[0] as usize]] - f[i];
-                let m = t[i] - f[i];
-                sxy += e * m;
-                sxx += e * e;
-                syy += m * m;
-            }
-            let corr = sxy / (sxx * syy).sqrt();
-            let ratio = (syy / sxx).sqrt();
-            eprintln!("grains {name} 0.05: correlation {corr:.3}, size ratio {ratio:.3}");
-            assert!(corr > 0.9 && (ratio - 1.0).abs() < 0.2, "{name}: correlation {corr}, size ratio {ratio}");
-        }
-        let th = 0.05f64;
-        let p = [0.0, 0.0, th.cos() - 1.0, th.sin(), -th.sin(), th.cos() - 1.0];
-        let t = grains_template(&f, &grad, &off, &p, [100.0, 100.0], &coords);
-        assert!((&t - &f).iter().all(|v| v.abs() < 1e-9), "rotation must give no correction");
-    }
-
-    /// No grains in a flat image: `None`, and a grains solve falls back.
-    #[test]
-    fn grains_flat_image_has_no_grains() {
-        use crate::masks::LocalMask;
-        use crate::mesh::Texture;
-        use crate::subset::Subset;
-        let flat = Image::from_array(Array2::from_elem((40, 40), 128.0), 8);
-        assert!(GrainCentres::build(&flat).is_none());
-        let (f0, _) = ellipse_grains([[1.0, 0.0], [0.0, 1.0]]);
-        let img = std::sync::Arc::new(Image::from_array(f0, 8));
-        let sub = Subset::new([100.0, 100.0], &LocalMask::circle(15).unwrap(), None, img.clone(), img.clone(), 0).unwrap();
-        let r = sub.solve_icgn_result(None, 0.0, 1e-5, 20, Texture::RigidShape).unwrap();
-        assert_eq!(r.texture, Texture::Deformable, "order 0: no correction");
-    }
-
-    /// On rigid elliptical grains under shear, the grains texture recovers the
-    /// shear better than both the deformable and the rigid (round) template.
-    #[test]
-    fn grains_icgn_beats_deformable_and_rigid_on_ellipses() {
-        use crate::masks::LocalMask;
-        use crate::mesh::Texture;
-        use crate::subset::Subset;
-        let gamma = 0.05;
-        // reference: grains at their centres; target: grains moved by the shear
-        // about the image centre, each turned with the material (shape U about
-        // its moved centre). Drawn analytically.
-        let (f0, centres) = ellipse_grains([[1.0, 0.0], [0.0, 1.0]]);
-        let k = stretch_minus_identity(0.0, 0.0, gamma, 0.0);
-        let th = (-gamma).atan2(2.0);
-        let rot = |d: [f64; 2]| [th.cos() * d[0] - th.sin() * d[1], th.sin() * d[0] + th.cos() * d[1]];
-        let _ = rot;
-        let g0 = {
-            // target pixel y: grain k at c_k + u(c_k); its own frame offset is R^T (y - c_k - u(c_k))
-            let mut state = 99u64;
-            let mut rnd = || {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                (state >> 11) as f64 / (1u64 << 53) as f64
-            };
-            let (a, b) = (5.0 * 2f64.sqrt(), 5.0 / 2f64.sqrt());
-            let mut grains = Vec::new();
-            for gy in 0..9 {
-                for gx in 0..9 {
-                    let c = [12.0 + 22.0 * gx as f64 + 4.0 * (rnd() - 0.5), 12.0 + 22.0 * gy as f64 + 4.0 * (rnd() - 0.5)];
-                    grains.push((c, rnd() * std::f64::consts::PI));
-                }
-            }
-            let _ = (&centres, k);
-            Array2::from_shape_fn((200, 200), |(r, col)| {
-                grains.iter().fold(0.0f64, |m, &(c, phi)| {
-                    let moved = [c[0] + gamma * (c[1] - 100.0), c[1]];
-                    let (dx, dy) = (col as f64 - moved[0], r as f64 - moved[1]);
-                    // back to the grain's own frame: undo the turn, then the grain's orientation
-                    let (qx, qy) = (th.cos() * dx + th.sin() * dy, -th.sin() * dx + th.cos() * dy);
-                    let (e1, e2) = (phi.cos() * qx + phi.sin() * qy, -phi.sin() * qx + phi.cos() * qy);
-                    m.max(200.0 * (-(e1 * e1 / (a * a) + e2 * e2 / (b * b))).exp())
-                })
-            })
-        };
-        let fi = std::sync::Arc::new(Image::from_array(f0, 8));
-        let gi = std::sync::Arc::new(Image::from_array(g0, 8));
-        let mask = LocalMask::circle(25).unwrap();
-        let mut err = [0.0f64; 3];
-        let mut used = Vec::new();
-        for (t, tex) in [Texture::Deformable, Texture::RigidSphere, Texture::RigidShape].into_iter().enumerate() {
-            for yi in 0..4 {
-                for xi in 0..4 {
-                    let c = [55.0 + 30.0 * xi as f64 + 0.3, 55.0 + 30.0 * yi as f64 + 0.6];
-                    let sub = Subset::new(c, &mask, None, fi.clone(), gi.clone(), 1).unwrap();
-                    let p0 = [gamma * (c[1] - 100.0), 0.0, 0.0, 0.0, 0.0, 0.0];
-                    let r = sub.solve_icgn_result(Some(&p0), 0.0, 1e-6, 100, tex).unwrap();
-                    err[t] += (r.p[4] - gamma).abs() / 16.0;
-                    used.push(r.texture);
-                }
-            }
-        }
-        eprintln!("shear error: deformable {:.2e}, rigid {:.2e}, grains {:.2e}", err[0], err[1], err[2]);
-        assert!(used[32..].iter().all(|&t| t == Texture::RigidShape));
-        assert!(err[2] < 0.6 * err[0] && err[2] < err[1], "{err:?}");
     }
 
     /// The coarse part of a linear ramp is the ramp, with no curvature; of a
@@ -966,35 +588,5 @@ mod tests {
         }), 8);
         let (low, _) = coarse_part(&grain, &ndarray::array![[40.0, 40.0]], 5.0);
         assert!(low[0] > 180.0 && low[0] < 200.0, "{}", low[0]);
-    }
-
-    /// Edge offsets point from the grain's centre to the pixel, at the given
-    /// distance, for a dark grain; the other way for a bright one.
-    #[test]
-    fn edge_offsets_point_to_the_grain() {
-        let (c, r) = ([40.3, 39.6], 6.0);
-        let img = |x: f64, y: f64, dark: bool| {
-            let inside = 0.5 * libm::erfc(((x - c[0]).hypot(y - c[1]) - r) / 0.8);
-            if dark { 200.0 - 100.0 * inside } else { 100.0 + 100.0 * inside }
-        };
-        for dark in [true, false] {
-            let pts: Vec<[f64; 2]> = (0..80).flat_map(|y| (0..80).map(move |x| [x as f64, y as f64])).collect();
-            let grad = Array2::from_shape_fn((pts.len(), 2), |(i, j)| {
-                let (x, y) = (pts[i][0], pts[i][1]);
-                let h = 1e-3;
-                if j == 0 { (img(x + h, y, dark) - img(x - h, y, dark)) / (2.0 * h) } else { (img(x, y + h, dark) - img(x, y - h, dark)) / (2.0 * h) }
-            });
-            let off = edge_offsets(&grad, r, dark);
-            let gmax = (0..pts.len()).map(|i| grad[[i, 0]].hypot(grad[[i, 1]])).fold(0.0, f64::max);
-            for (i, p) in pts.iter().enumerate() {
-                if grad[[i, 0]].hypot(grad[[i, 1]]) < 0.5 * gmax {
-                    continue;
-                }
-                let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
-                let cos = (off[i][0] * dx + off[i][1] * dy) / (off[i][0].hypot(off[i][1]) * dx.hypot(dy));
-                assert!(cos > 0.999, "pixel {p:?}: offset {:?} not along x - c", off[i]);
-                assert!((off[i][0].hypot(off[i][1]) - r).abs() < 1e-9);
-            }
-        }
     }
 }

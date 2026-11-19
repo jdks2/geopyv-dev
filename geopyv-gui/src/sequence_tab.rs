@@ -24,6 +24,8 @@ use crate::mesh_tab::{
     displacement_values, extract_nodal_values, format_sci, mesh_coord_from_bounds, plot_label, render_colorbar,
     render_mesh_overlay, MeshGenConfig, MeshOrder, MeshPlotType, RangeMode,
 };
+use crate::calibration_tab::calibration_combo;
+use crate::overlay::{frame_row, nice_range, ViewFrame};
 use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
 
 // ---------------------------------------------------------------------------
@@ -32,18 +34,31 @@ use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
 
 /// Per-node values of `plot` for frame `m`: displacements measured per
 /// `mode` (and ÷ Δt with `rate`), or the frame's quality values.
+/// With `cal`, displacements are in its board units: each increment is
+/// mapped from where it starts (the nodes moved by the pair's displacement
+/// less the increment).
 fn sequence_nodal_values(
     sol: &SequenceSolution,
     m: usize,
     plot: MeshPlotType,
     mode: IncrementMode,
     rate: bool,
+    cal: Option<&geopyv_dev::calibration::CalibrationParams>,
 ) -> Vec<f64> {
     if !matches!(plot, MeshPlotType::Ux | MeshPlotType::Uy | MeshPlotType::UMag) {
-        return sol.load_mesh_at(m).map(|ms| extract_nodal_values(&ms, plot, false)).unwrap_or_default();
+        return sol.load_mesh_at(m).map(|ms| extract_nodal_values(&ms, plot, false, None)).unwrap_or_default();
     }
     match sol.increment_displacements(m, mode) {
-        Ok((_, disp, dt)) => displacement_values(&disp, plot, rate.then(|| dt.unwrap_or(f64::NAN))),
+        Ok((mesh, disp, dt)) => {
+            let dt = rate.then(|| dt.unwrap_or(f64::NAN));
+            match cal {
+                Some(c) => {
+                    let start = &mesh.nodes + &mesh.displacements - &disp;
+                    displacement_values(&c.object_displacements(start.view(), disp.view()), plot, dt)
+                }
+                None => displacement_values(&disp, plot, dt),
+            }
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -174,6 +189,13 @@ pub struct SequenceViewState {
     pub rate: bool,
     pub show_wireframe: bool,
     pub show_node_indices: bool,
+    /// Draw over each pair's reference image (mesh as built) or its target
+    /// image (mesh moved by the displacements).
+    pub frame: ViewFrame,
+    /// Contour opacity, 0-1.
+    pub opacity: f32,
+    /// Displacements in a calibration's board units instead of px.
+    pub calibration: Option<(PathBuf, geopyv_dev::calibration::CalibrationParams)>,
     /// Cached (frame_index, plot_type, values) — invalidated on frame/type change.
     pub nodal_cache: Option<(usize, MeshPlotType, Vec<f64>)>,
     /// Cached (frame_index, that frame's mesh if solved with adaptive masking),
@@ -202,6 +224,9 @@ impl SequenceViewState {
             rate: false,
             show_wireframe: false,
             show_node_indices: false,
+            frame: ViewFrame::default(),
+            opacity: 0.8,
+            calibration: None,
             nodal_cache: None,
             adaptive_frame: None,
         }
@@ -443,12 +468,21 @@ impl SequenceTabState {
             viewer_rect.max,
         );
 
-        // Target image for the current frame is image_paths[frame + 1].
-        let target_path = self.view.image_paths.get(current_frame + 1).cloned();
-        let show_image = target_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        // The pair's reference or target image (by frame), as stored in its
+        // mesh solution; the target falls back to image_paths[frame + 1].
+        let mesh_paths = self.view.solution.as_ref()
+            .and_then(|s| s.mesh_solutions.get(current_frame))
+            .map(|m| (m.f_img_path.clone(), m.g_img_path.clone()));
+        let frame_path = match (self.view.frame, mesh_paths) {
+            (ViewFrame::Reference, Some((f, _))) => Some(f),
+            (ViewFrame::Target, Some((_, g))) if !g.as_os_str().is_empty() => Some(g),
+            (ViewFrame::Target, _) => self.view.image_paths.get(current_frame + 1).cloned(),
+            _ => None,
+        };
+        let show_image = frame_path.as_ref().map(|p| p.exists()).unwrap_or(false);
 
         let hover = if show_image {
-            let path = target_path.unwrap();
+            let path = frame_path.unwrap();
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(image_rect), |ui| {
                 self.image_viewer.show(ui, &path, cache, None)
             })
@@ -490,6 +524,7 @@ impl SequenceTabState {
                 if let Some(sol) = self.view.solution.as_ref() {
                     let vals = sequence_nodal_values(
                         sol, current_frame, plot_type, self.view.increment_mode, self.view.rate,
+                        self.view.calibration.as_ref().map(|c| &c.1),
                     );
                     self.view.nodal_cache = Some((current_frame, plot_type, vals));
                 }
@@ -499,9 +534,9 @@ impl SequenceTabState {
                 let (vmin, vmax) = match range_mode {
                     RangeMode::Manual => (manual_min, manual_max),
                     RangeMode::Auto => {
-                        let mn = vals.iter().cloned().fold(f64::INFINITY, f64::min);
-                        let mx = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                        (mn, mx)
+                        let mn = vals.iter().cloned().filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min);
+                        let mx = vals.iter().cloned().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+                        nice_range(mn, mx)
                     }
                 };
 
@@ -526,8 +561,10 @@ impl SequenceTabState {
                         show_wireframe,
                         show_node_indices,
                         &coord,
+                        self.view.frame == ViewFrame::Target,
+                        (self.view.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
                     );
-                    render_colorbar(&painter, image_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate));
+                    render_colorbar(&painter, image_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate, self.view.calibration.is_some()));
                 }
             }
         }
@@ -587,7 +624,7 @@ impl SequenceTabState {
     // Right pane — view mode (§10.3)
     // -----------------------------------------------------------------------
 
-    pub fn show_right_view(&mut self, ui: &mut egui::Ui, selected_path: Option<&Path>) {
+    pub fn show_right_view(&mut self, ui: &mut egui::Ui, selected_path: Option<&Path>, calibrations: &[PathBuf]) {
         if self.view.loaded_path.as_deref() != selected_path {
             self.view.loaded_path = selected_path.map(|p| p.to_path_buf());
             self.view.adaptive_frame = None;
@@ -767,6 +804,9 @@ impl SequenceTabState {
         if r.changed() {
             self.view.nodal_cache = None;
         }
+        if calibration_combo(ui, "seq_units", "Units:", "px", calibrations, &mut self.view.calibration) {
+            self.view.nodal_cache = None;
+        }
 
         ui.add_space(3.0);
         ui.label(
@@ -812,6 +852,8 @@ impl SequenceTabState {
                 .size(15.0)
                 .color(ui.visuals().weak_text_color()),
         );
+        frame_row(ui, &mut self.view.frame);
+        ui.add(egui::Slider::new(&mut self.view.opacity, 0.0..=1.0).text("opacity"));
         ui.checkbox(&mut self.view.show_wireframe, "Show wireframe");
         ui.checkbox(&mut self.view.show_node_indices, "Show node indices");
 

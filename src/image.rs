@@ -56,8 +56,6 @@ pub struct Image {
     /// Rigid-texture curvature maps, built on the first rigid solve against
     /// this reference (`None` inside: no measurable speckle).
     pub(crate) grain: OnceLock<Option<crate::texture::GrainMaps>>,
-    /// Grain centre of every pixel for `texture="grains"`, built on first use.
-    pub(crate) grain_centres: OnceLock<Option<crate::texture::GrainCentres>>,
 }
 
 impl Image {
@@ -84,7 +82,7 @@ impl Image {
     /// performed loading and Gaussian pre-filtering on the Python side.
     pub fn from_array(image_gs: Array2<f64>, border: usize) -> Self {
         let coef = get_c(&image_gs, border);
-        Self { image_gs, coef, border, filepath: None, grain: OnceLock::new(), grain_centres: OnceLock::new() }
+        Self { image_gs, coef, border, filepath: None, grain: OnceLock::new() }
     }
 
     /// Rigid-texture curvature maps of this image as a reference, built once
@@ -98,29 +96,6 @@ impl Image {
                     eprintln!("geopyv: no measurable speckle in the reference image; texture=\"rigid\" falls back to \"deformable\"");
                 }
                 maps
-            })
-            .as_ref()
-    }
-
-    /// Grain centre of every pixel of this image as a reference, built once
-    /// on first use; `None` (with one warning) when no grains are found, and
-    /// the grains solve then falls back to the deformable one.
-    /// The grains the "shape" correction finds in this image as a reference:
-    /// the centre `[x, y]` of each grain, and the grain number of every pixel
-    /// `(rows, cols)` (row of the centres + 1; 0 where no grain, so no
-    /// correction). `None` when no grains are found.
-    pub fn grains(&self) -> Option<(Vec<[f64; 2]>, Array2<i64>)> {
-        self.grain_centres().map(|g| (g.centres.clone(), g.label.clone()))
-    }
-
-    pub(crate) fn grain_centres(&self) -> Option<&crate::texture::GrainCentres> {
-        self.grain_centres
-            .get_or_init(|| {
-                let c = crate::texture::GrainCentres::build(self);
-                if c.is_none() {
-                    eprintln!("geopyv: no grains found in the reference image; texture=\"grains\" falls back to \"deformable\"");
-                }
-                c
             })
             .as_ref()
     }

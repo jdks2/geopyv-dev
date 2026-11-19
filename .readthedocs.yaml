@@ -5,12 +5,15 @@ build:
   tools:
     python: "3.12"
     rust: "1.91"
+  jobs:
+    # Build the extension without the desktop GUI: the docs do not need it,
+    # and its dependencies more than double the compile time.
+    post_create_environment:
+      - MATURIN_PEP517_ARGS="--no-default-features" python -m pip install .
 
 sphinx:
   configuration: docs/conf.py
 
 python:
   install:
-    - method: pip
-      path: .
     - requirements: docs/requirements-docs.txt

@@ -151,17 +151,6 @@ impl PySubset {
 // pymethods
 // ---------------------------------------------------------------------------
 
-impl PySubset {
-    /// The texture option, checking that grain='edge' has soil properties.
-    fn check_texture(&self, texture: &str, grain: Option<&str>) -> PyResult<geopyv_dev::mesh::Texture> {
-        let t = crate::py_mesh::check_texture(texture, grain)?;
-        if t == geopyv_dev::mesh::Texture::RigidEdge && self.inner.soil_properties.is_none() {
-            return Err(PyValueError::new_err("grain='edge' needs the subset's soil_properties"));
-        }
-        Ok(t)
-    }
-}
-
 #[pymethods]
 impl PySubset {
     #[new]
@@ -227,7 +216,7 @@ impl PySubset {
     // -----------------------------------------------------------------------
 
     /// Inverse Compositional Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform", texture = "deformable", grain = None))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform", texture = "deformable"))]
     #[allow(clippy::too_many_arguments)]
     fn solve_icgn(
         &mut self,
@@ -238,9 +227,8 @@ impl PySubset {
         tolerance: f64,
         masking: &str,
         texture: &str,
-        grain: Option<&str>,
     ) -> PyResult<()> {
-        let texture = self.check_texture(texture, grain)?;
+        let texture = crate::py_mesh::check_texture(texture)?;
         self.inner
             .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations, texture)
             .map_err(Error::from)?;
@@ -251,7 +239,7 @@ impl PySubset {
     }
 
     /// Forward Additive Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform", texture = "deformable", grain = None))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform", texture = "deformable"))]
     #[allow(clippy::too_many_arguments)]
     fn solve_fagn(
         &mut self,
@@ -262,9 +250,8 @@ impl PySubset {
         tolerance: f64,
         masking: &str,
         texture: &str,
-        grain: Option<&str>,
     ) -> PyResult<()> {
-        let texture = self.check_texture(texture, grain)?;
+        let texture = crate::py_mesh::check_texture(texture)?;
         self.inner
             .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations, texture)
             .map_err(Error::from)?;
@@ -439,13 +426,12 @@ impl PySubset {
     #[getter]
     fn tolerance(&self) -> Option<f64> { self.result().map(|r| r.tolerance) }
 
-    /// Correction the solve used: ``("deformable", None)``,
-    /// ``("rigid", "sphere")`` or ``("rigid", "shape")``. A rigid solve records
-    /// ``("deformable", None)`` when it fell back (order 0, or a reference with
-    /// no measurable speckle / no grains). ``None`` if unsolved.
+    /// Correction the solve used: ``"deformable"`` or ``"rigid"``. A rigid
+    /// solve records ``"deformable"`` when it fell back (order 0, or a
+    /// reference with no measurable speckle). ``None`` if unsolved.
     #[getter]
-    fn texture(&self) -> Option<(&'static str, Option<&'static str>)> {
-        self.result().map(|r| crate::py_mesh::texture_pair(Some(r.texture)))
+    fn texture(&self) -> Option<&'static str> {
+        self.result().map(|r| crate::py_mesh::texture_name(Some(r.texture)))
     }
 
     /// Gradient-weighted omitted-mode warp-adequacy score for the omitted

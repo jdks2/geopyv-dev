@@ -317,26 +317,18 @@ pub enum Masking {
 /// The `texture` axis of `solver_options`: what the subset solver assumes
 /// the speckle does under strain. `Deformable`: the pattern stretches and
 /// shears with the material (painted speckle; the classic DIC assumption).
-/// `RigidSphere` (Python `("rigid", "sphere")`): each speckle is a round
-/// Gaussian lump that moves with the material under its centre but keeps its
-/// shape; the reference is corrected for the mismatch this leaves at the
-/// current strain, from the image's curvature — see [`crate::texture`].
-/// `RigidShape` (`("rigid", "shape")`): rigid grains of any shape that do not
-/// overlap and turn with the material; the reference is split into grains once
-/// and each pixel is corrected about its own grain's centre. Order-0 subsets
-/// carry no strain, so all three agree there. (Variants are stored by
-/// position in `.pyv` files; renaming them does not change saved files.)
+/// `Rigid` (Python `"rigid"`): each speckle is a round Gaussian lump that
+/// moves with the material under its centre but keeps its shape; the
+/// reference is corrected for the mismatch this leaves at the current
+/// strain, from the image's curvature — see [`crate::texture`]. Order-0
+/// subsets carry no strain, so both agree there. (Variants are stored by
+/// position in `.pyv` files: `Rigid` keeps the old `RigidSphere` tag 1; tags
+/// 2 and 3, the removed grain-splitting and edge corrections, no longer load.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Texture {
     #[default]
     Deformable,
-    RigidSphere,
-    // Appended: older `.pyv` tags are unchanged.
-    RigidShape,
-    /// `("rigid", "edge")`: flat rigid grains in a matrix, corrected at their
-    /// edges from the known grain size, outlines and which side of an edge
-    /// is the grain (needs `Subset::soil_properties`; no grain finding).
-    RigidEdge,
+    Rigid,
 }
 
 /// Tunables for `Preconditioning::LayerRg` — see

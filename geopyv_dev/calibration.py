@@ -353,7 +353,12 @@ class Calibration:
         inspect/visualise/contour/error) to a .pyv file."""
         if not self.solved:
             raise RuntimeError("Calibration has not been solved; cannot save.")
-        sol = _core.CalibrationSolution(
+        self._solution().save(path)
+
+    def _solution(self):
+        """The solved calibration as a core ``CalibrationSolution`` (what
+        ``save`` writes; also how the GUI receives a solve)."""
+        return _core.CalibrationSolution(
             np.asarray(self._intmat, dtype=np.float64),
             np.asarray(self._extmat, dtype=np.float64),
             np.asarray(self._dist, dtype=np.float64),
@@ -363,7 +368,6 @@ class Calibration:
             tuple(self._imsize),
             [np.asarray(r).astype(np.float64) for r in self._reimgpnts],
         )
-        sol.save(path)
 
     @classmethod
     def _from_solution(cls, raw):

@@ -41,11 +41,23 @@ cargo build -p geopyv-gui
 cargo run -p geopyv-gui
 ```
 
-`geopyv-gui` is a library (`geopyv_gui::run`) plus a thin binary. The Python
-extension links it and exposes `run_gui`; `pyproject.toml` installs a
-`geopyv-gui` console script (`geopyv_dev/gui.py`), so after `maturin develop`
-or `pip install geopyv-dev` users just run `geopyv-gui`. The GUI is a thin
-front-end: solving, defaults and derived quantities belong in the core.
+`geopyv-gui` is a library (`geopyv_gui::run` / `run_with`) plus a thin binary.
+The Python extension links it (cargo feature `gui`, on by default) and exposes
+`run_gui`, which calls `run_with` with a `CalibrationBackend` that solves
+ChArUco calibrations through `geopyv_dev.calibration.Calibration` (OpenCV);
+the standalone binary (`cargo run`) can only import calibrations.
+`pyproject.toml` installs a `geopyv-gui` console script (`geopyv_dev/gui.py`),
+so after `maturin develop` or `pip install geopyv-dev` users just run
+`geopyv-gui`. The GUI is a thin front-end: solving, defaults and derived
+quantities belong in the core.
+
+Read the Docs builds the extension without the GUI
+(`MATURIN_PEP517_ARGS="--no-default-features"`, see `.readthedocs.yaml`) to
+stay inside its 15-minute limit; the GUI's dependencies are most of the
+compile time.
+
+Rust tests: `cargo test -p geopyv-dev -p geopyv-gui` (not `--workspace`: the
+PyO3 extension crate cannot link a test binary).
 
 ### Publishing a release to PyPI
 
@@ -113,7 +125,7 @@ Error bridging: `geopyv_dev::Error` cannot implement `From<PyErr>` directly (orp
 
 ### Data flow: DIC solve
 
-`Image::from_file` → FFT → B-spline coefficients (QCQT matrix, stored on `Image`) → `Subset::new` takes QCQT + template coordinates + centre → computes `f`, `f_m`, `delta_f`, `grad_f` → `solve_icgn` / `solve_fagn` takes target QCQT + initial warp → returns `SolveResult`.
+`Image::from_file` → FFT → B-spline coefficients C (stored on `Image`; the per-pixel QCQT blocks are applied on the fly) → `Subset::new` takes the reference image + template coordinates + centre → computes `f`, `f_m`, `delta_f`, `grad_f` → `solve_icgn` / `solve_fagn` takes the target image + initial warp → returns `SolveResult`.
 
 At the Python level: `gp.Image(filepath=...)` → `gp.Template(...)` → `gp.Subset(coord, template, f_img)` → `subset.solve(g_img, p_0)`.
 
