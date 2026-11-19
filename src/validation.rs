@@ -12,10 +12,24 @@ use crate::{field::FieldSolution, speckle::Speckle, Error};
 // ValidationResult
 // ---------------------------------------------------------------------------
 
+/// `applied` and `observed` are `(frames, particles, 12)` in the warp order
+/// `[u, v, u_x, v_x, u_y, v_y, ...]`, both in the particle's own measure: a
+/// particle accumulates its normal slots logarithmically (`ln(1 + u_x)`,
+/// `ln(1 + v_y)`) and the rest additively, so the applied warp's slots 2 and 5
+/// are taken to `ln(1 + .)` before the two are compared.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
     pub applied:  Array3<f64>,
     pub observed: Array3<f64>,
+}
+
+/// An applied warp `(n, 12)` in the particle's accumulation measure: slots 2
+/// and 5 (`u_x`, `v_y`) become `ln(1 + .)`, as `Particle` accumulates them.
+fn particle_measure(mut w: Array2<f64>) -> Array2<f64> {
+    for k in [2, 5] {
+        w.column_mut(k).mapv_inplace(|x| x.ln_1p());
+    }
+    w
 }
 
 // ---------------------------------------------------------------------------
@@ -95,17 +109,17 @@ impl Validation {
             // Initial particle coordinates for warp evaluation
             let init_coords = field_sol.initial_coordinates.view();
 
-            // Applied: ground-truth warp from Speckle
+            // Applied: ground-truth warp from Speckle, in the particle's measure
             if cumulative {
                 for i in 1..=n_frames {
-                    let w = self.speckle.warp(i, init_coords)?;
+                    let w = particle_measure(self.speckle.warp(i, init_coords)?);
                     applied.slice_mut(s![i - 1, .., ..]).assign(&w);
                 }
             } else {
                 // warp(0) = zero-warp (reference image)
-                let mut prev = self.speckle.warp(0, init_coords)?;
+                let mut prev = particle_measure(self.speckle.warp(0, init_coords)?);
                 for i in 1..=n_frames {
-                    let curr = self.speckle.warp(i, init_coords)?;
+                    let curr = particle_measure(self.speckle.warp(i, init_coords)?);
                     let diff = &curr - &prev;
                     applied.slice_mut(s![i - 1, .., ..]).assign(&diff);
                     prev = curr;
@@ -459,6 +473,38 @@ mod tests {
                 let diff = (fd.result.applied[[i, j, 0]] - fd.result.observed[[i, j, 0]]).abs();
                 assert!(diff < 1e-8, "frame {i} particle {j} diff={diff}");
             }
+        }
+    }
+
+    #[test]
+    fn test_validation_applied_is_in_the_particle_measure() {
+        // Stretch u_x = 0.3 and shear u_y = 0.2 at full deformation, linear over
+        // 4 images (mult = i/3). A particle accumulates ln(1 + u_x) and plain
+        // u_y, so applied slot 2 is ln(1 + 0.3 i/3) and slot 4 is 0.2 i/3.
+        let image_no = 4usize;
+        let n_frames = image_no - 1;
+        let mut comp = [0.0f64; 12];
+        comp[2] = 0.3;
+        comp[4] = 0.2;
+        let speckle = Speckle::new(
+            "/tmp".into(), "vs".into(), ".jpg".into(), (200, 200), 1.0, 10, false,
+            Progression::Deformation, comp, [100.0, 100.0], 0.0, 0.0, WarpMode::None,
+            image_no, ScaleType::Lin,
+        ).unwrap();
+        let validation = Validation::new(
+            Arc::new(speckle), vec![make_field_sol(n_frames, 0.0, 1)], vec!["m".to_string()],
+        ).unwrap();
+        let cum = validation.solve(true, None).unwrap();
+        let inc = validation.solve(false, None).unwrap();
+        for i in 1..=n_frames {
+            let m = i as f64 / 3.0;
+            let a = &cum.fields[0].result.applied;
+            assert!((a[[i - 1, 0, 2]] - (0.3 * m).ln_1p()).abs() < 1e-12, "cumulative u_x, frame {i}");
+            assert!((a[[i - 1, 0, 4]] - 0.2 * m).abs() < 1e-12, "cumulative u_y, frame {i}");
+            let d = &inc.fields[0].result.applied;
+            let m0 = (i - 1) as f64 / 3.0;
+            assert!((d[[i - 1, 0, 2]] - ((0.3 * m).ln_1p() - (0.3 * m0).ln_1p())).abs() < 1e-12,
+                    "incremental u_x, frame {i}");
         }
     }
 

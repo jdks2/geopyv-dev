@@ -7,7 +7,7 @@ name = "geopyv_dev"
 version = "0.2.3"
 description = "A PIV/DIC analysis package for geotechnics."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = ["numpy", "matplotlib", "scipy"]
 authors = [
     { name = "Sam Stanier", email = "sas229@cam.ac.uk" },
@@ -26,6 +26,7 @@ classifiers = [
 geopyv-gui = "geopyv_dev.gui:main"
 
 [project.optional-dependencies]
+calibration = ["opencv-python"]
 docs = [
     "sphinx>=7.0",
     "pydata-sphinx-theme>=0.15",
@@ -40,3 +41,8 @@ manifest-path = "python/Cargo.toml"
 python-source = "."
 module-name = "geopyv_dev._geopyv_dev"
 features = ["pyo3/extension-module"]
+# Demo and test images are on GitHub; keep them out of the source distribution.
+exclude = [
+    { path = "demo/**/*", format = "sdist" },
+    { path = "images/**/*", format = "sdist" },
+]

@@ -151,10 +151,22 @@ impl PySubset {
 // pymethods
 // ---------------------------------------------------------------------------
 
+impl PySubset {
+    /// The texture option, checking that grain='edge' has soil properties.
+    fn check_texture(&self, texture: &str, grain: Option<&str>) -> PyResult<geopyv_dev::mesh::Texture> {
+        let t = crate::py_mesh::check_texture(texture, grain)?;
+        if t == geopyv_dev::mesh::Texture::RigidEdge && self.inner.soil_properties.is_none() {
+            return Err(PyValueError::new_err("grain='edge' needs the subset's soil_properties"));
+        }
+        Ok(t)
+    }
+}
+
 #[pymethods]
 impl PySubset {
     #[new]
-    #[pyo3(signature = (coord, local_mask, f_img, g_img, subset_order = 1, global_mask = None, time = None))]
+    #[pyo3(signature = (coord, local_mask, f_img, g_img, subset_order = 1, global_mask = None, time = None, soil_properties = None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         coord: [f64; 2],
@@ -164,8 +176,10 @@ impl PySubset {
         subset_order: usize,
         global_mask: Option<Py<PyMask>>,
         time: Option<&Bound<'_, PyAny>>,
+        soil_properties: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let time = crate::utils::extract_time_input(time)?;
+        let soil = crate::py_speckle::soil_properties_arg(soil_properties)?;
         if subset_order > 2 {
             return Err(PyValueError::new_err(format!(
                 "subset_order must be 0, 1, or 2, got {subset_order}"
@@ -193,6 +207,7 @@ impl PySubset {
             ).map_err(Error::from)?
         };
         inner.set_time(time.as_ref()).map_err(Error::from)?;
+        inner.soil_properties = soil;
 
         let lm_py: Py<PyMask> = lm_bound.clone().unbind();
         let f_img_py: Py<PyImage> = f_img.clone().unbind();
@@ -212,7 +227,8 @@ impl PySubset {
     // -----------------------------------------------------------------------
 
     /// Inverse Compositional Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform"))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform", texture = "deformable", grain = None))]
+    #[allow(clippy::too_many_arguments)]
     fn solve_icgn(
         &mut self,
         py: Python<'_>,
@@ -221,9 +237,12 @@ impl PySubset {
         max_iterations: usize,
         tolerance: f64,
         masking: &str,
+        texture: &str,
+        grain: Option<&str>,
     ) -> PyResult<()> {
+        let texture = self.check_texture(texture, grain)?;
         self.inner
-            .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations)
+            .solve_icgn(p_0.as_deref(), tolerance, max_norm, max_iterations, texture)
             .map_err(Error::from)?;
         if crate::py_mesh::check_masking(masking)? == geopyv_dev::mesh::Masking::Adaptive {
             self.correct_seams(py)?;
@@ -232,7 +251,8 @@ impl PySubset {
     }
 
     /// Forward Additive Gauss-Newton solver. Mutates object; returns None.
-    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform"))]
+    #[pyo3(signature = (p_0 = None, max_norm = 1e-3, max_iterations = 50, tolerance = 0.75, masking = "uniform", texture = "deformable", grain = None))]
+    #[allow(clippy::too_many_arguments)]
     fn solve_fagn(
         &mut self,
         py: Python<'_>,
@@ -241,9 +261,12 @@ impl PySubset {
         max_iterations: usize,
         tolerance: f64,
         masking: &str,
+        texture: &str,
+        grain: Option<&str>,
     ) -> PyResult<()> {
+        let texture = self.check_texture(texture, grain)?;
         self.inner
-            .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations)
+            .solve_fagn(p_0.as_deref(), tolerance, max_norm, max_iterations, texture)
             .map_err(Error::from)?;
         if crate::py_mesh::check_masking(masking)? == geopyv_dev::mesh::Masking::Adaptive {
             self.correct_seams(py)?;
@@ -287,6 +310,13 @@ impl PySubset {
     // -----------------------------------------------------------------------
     // Always-available getters
     // -----------------------------------------------------------------------
+
+    /// The soil properties given at instantiation (the grain and brightness
+    /// settings, as a dict), or ``None``.
+    #[getter]
+    fn soil_properties<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.inner.soil_properties.as_ref().map(|c| crate::py_speckle::soil_properties_dict(py, c)).transpose()
+    }
 
     #[getter]
     fn coord(&self) -> [f64; 2] { self.inner.coord }
@@ -408,6 +438,15 @@ impl PySubset {
 
     #[getter]
     fn tolerance(&self) -> Option<f64> { self.result().map(|r| r.tolerance) }
+
+    /// Correction the solve used: ``("deformable", None)``,
+    /// ``("rigid", "sphere")`` or ``("rigid", "shape")``. A rigid solve records
+    /// ``("deformable", None)`` when it fell back (order 0, or a reference with
+    /// no measurable speckle / no grains). ``None`` if unsolved.
+    #[getter]
+    fn texture(&self) -> Option<(&'static str, Option<&'static str>)> {
+        self.result().map(|r| crate::py_mesh::texture_pair(Some(r.texture)))
+    }
 
     /// Gradient-weighted omitted-mode warp-adequacy score for the omitted
     /// `u` (horizontal) displacement modes. Available for `subset_order` 0,

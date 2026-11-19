@@ -6,6 +6,7 @@ use std::sync::Arc;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2}; // IntoPyArray brings into_pyarray_bound into scope
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use geopyv_dev::image::Image;
 
@@ -104,6 +105,28 @@ impl PyImage {
     #[getter]
     fn filepath(&self) -> Option<String> {
         self.filepath.clone()
+    }
+
+    /// The grains the ``"shape"`` rigid-texture correction finds in this image
+    /// when it is the reference.
+    ///
+    /// Returns
+    /// -------
+    /// (dict, numpy.ndarray) or None
+    ///     A table with arrays ``x``, ``y`` (each grain's centre, px) and
+    ///     ``size`` (diameter of a circle with the grain's pixel count, px), and
+    ///     a ``(rows, cols)`` int map of which grain each pixel belongs to (the
+    ///     grain's row + 1; 0 where no grain, so no correction). ``None`` when
+    ///     no grains are found.
+    fn grains<'py>(&self, py: Python<'py>) -> PyResult<Option<(Bound<'py, PyDict>, Bound<'py, PyArray2<i64>>)>> {
+        let Some((centres, label)) = self.inner.grains() else { return Ok(None) };
+        let mut count = vec![0usize; centres.len()];
+        label.iter().filter(|&&k| k > 0).for_each(|&k| count[k as usize - 1] += 1);
+        let d = PyDict::new_bound(py);
+        d.set_item("x", centres.iter().map(|c| c[0]).collect::<Vec<f64>>().into_pyarray_bound(py))?;
+        d.set_item("y", centres.iter().map(|c| c[1]).collect::<Vec<f64>>().into_pyarray_bound(py))?;
+        d.set_item("size", count.iter().map(|&n| 2.0 * (n as f64 / std::f64::consts::PI).sqrt()).collect::<Vec<f64>>().into_pyarray_bound(py))?;
+        Ok(Some((d, label.into_pyarray_bound(py))))
     }
 
     fn __repr__(&self) -> String {

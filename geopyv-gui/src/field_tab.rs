@@ -992,6 +992,7 @@ mod tests {
             options: SequenceOptions::default(),
             border: geopyv_dev::image::DEFAULT_BORDER,
             save: None,
+            topology: Default::default(),
         };
         seq.solve(&cfg, Some(&())).unwrap();
 

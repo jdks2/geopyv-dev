@@ -108,11 +108,13 @@ def load(path):
 # ---------------------------------------------------------------------------
 
 _SOLVER_OPTION_AXES = {
-    "topology": {"uniform", "adaptive"},
+    "topology": {"uniform", "adaptive", "tracked"},
     "masking": {"uniform", "adaptive"},
     "preconditioning": {"RG", "layer-RG"},
+    "texture": {"deformable", "rigid"},
 }
-_SOLVER_OPTION_DEFAULTS = {"topology": "uniform", "masking": "uniform", "preconditioning": "RG"}
+_SOLVER_OPTION_DEFAULTS = {"topology": "uniform", "masking": "uniform", "preconditioning": "RG",
+                           "texture": "deformable"}
 _SOLVER_OPTION_SUBDICTS = {"layer_rg"}
 # (axis, value) -> (subdict key, subdict allowed keys) -- which sub-dict, if
 # any, is legal only when that axis is at that non-default value.
@@ -138,20 +140,42 @@ _NOT_YET_IMPLEMENTED = {
 }
 
 
-def _subset_masking(solver_options):
-    """`Subset.solve`'s solver_options: only the masking axis applies."""
+# `grain` qualifies texture="rigid" only: "shape" (default) or "sphere".
+_GRAIN_VALUES = {"sphere", "shape", "edge"}
+
+
+def _check_grain(solver_options, texture):
+    """The `grain` key: only with texture='rigid'; `None` lets the solver use its
+    default ("shape")."""
+    if "grain" not in solver_options:
+        return None
+    grain = solver_options["grain"]
+    if texture != "rigid":
+        raise ValueError("solver_options['grain'] applies only to solver_options['texture']='rigid'")
+    if grain not in _GRAIN_VALUES:
+        raise ValueError(f"solver_options['grain'] must be one of {sorted(_GRAIN_VALUES)!r}, got {grain!r}")
+    return grain
+
+
+def _subset_options(solver_options):
+    """`Subset.solve`'s solver_options: only the masking and texture axes (and
+    `grain` with texture='rigid') apply. Returns (masking, texture, grain)."""
     if solver_options is None:
-        return "uniform"
+        solver_options = {}
     if not isinstance(solver_options, dict):
         raise TypeError(f"solver_options must be a dict, got {type(solver_options).__name__}")
-    unknown = set(solver_options) - {"masking"}
+    unknown = set(solver_options) - {"masking", "texture", "grain"}
     if unknown:
-        raise ValueError(f"Subset.solve accepts only solver_options['masking'], got {sorted(unknown)!r}")
-    masking = solver_options.get("masking", "uniform")
-    if masking not in _SOLVER_OPTION_AXES["masking"]:
-        raise ValueError(f"solver_options['masking'] must be one of "
-                         f"{sorted(_SOLVER_OPTION_AXES['masking'])!r}, got {masking!r}")
-    return masking
+        raise ValueError(f"Subset.solve accepts only solver_options['masking'], ['texture'] "
+                         f"and ['grain'], got {sorted(unknown)!r}")
+    values = []
+    for axis in ("masking", "texture"):
+        value = solver_options.get(axis, _SOLVER_OPTION_DEFAULTS[axis])
+        if value not in _SOLVER_OPTION_AXES[axis]:
+            raise ValueError(f"solver_options[{axis!r}] must be one of "
+                             f"{sorted(_SOLVER_OPTION_AXES[axis])!r}, got {value!r}")
+        values.append(value)
+    return (*values, _check_grain(solver_options, values[1]))
 
 
 def _adaptive_subset_order(masking, kwargs):
@@ -167,7 +191,7 @@ def _adaptive_subset_order(masking, kwargs):
 def _validate_solver_options(solver_options):
     """Validate + normalise a `solver_options` dict per
     solver_options_restructure.md §6. Returns
-    (topology, masking, preconditioning, layer_rg_opts) --
+    (topology, masking, preconditioning, texture, grain, layer_rg_opts) --
     every axis filled with its default if absent, every sub-dict {} if
     absent. Raises ValueError for any unrecognised key/value or a sub-dict
     supplied for an axis not at the value it belongs to; NotImplementedError
@@ -179,7 +203,7 @@ def _validate_solver_options(solver_options):
     if solver_options.get("masking") == "zonal" or "zonal" in solver_options:
         raise ValueError(_ZONAL_REMOVED)
 
-    allowed_top = set(_SOLVER_OPTION_AXES) | _SOLVER_OPTION_SUBDICTS
+    allowed_top = set(_SOLVER_OPTION_AXES) | _SOLVER_OPTION_SUBDICTS | {"grain"}
     unknown_top = set(solver_options) - allowed_top
     if unknown_top:
         raise ValueError(
@@ -222,6 +246,7 @@ def _validate_solver_options(solver_options):
             )
 
     return (axis_values["topology"], axis_values["masking"], axis_values["preconditioning"],
+            axis_values["texture"], _check_grain(solver_options, axis_values["texture"]),
             sub_opts["layer_rg"])
 
 
@@ -298,11 +323,21 @@ class Subset:
     (date-time, unix epoch or time of day; a bare frame counter is never taken
     as a time). Stored as ``.time`` (source in ``.time_source``); plot rates
     (``rate=True``) need it.
+
+    ``soil_properties`` (dict, optional): what is known about the soil from lab
+    characterisation, with the same keys as ``gp.Speckle``'s soil settings
+    (``soil``, ``grains``, ``psd``, ``d_p``, ``aspect_ratio``, ``aspect_ratio_sd``,
+    ``outlines``, ``matrix_brightness``, ``matrix_spread``,
+    ``seed_brightness``, ``seed_spread``, ``asr``); image-only keys are ignored, so a
+    Speckle's ``speckle_cfg`` can be passed as it is. Used by the rigid-texture
+    corrections: with it, ``grain="sphere"`` takes its blob width from the grains
+    (their spread about their centres, plus the 1.1 px blur applied when an image
+    is loaded from a file) instead of the image's correlation length.
     """
 
-    def __init__(self, coord, local_mask, f_img, g_img, subset_order=1, time=None):
+    def __init__(self, coord, local_mask, f_img, g_img, subset_order=1, time=None, soil_properties=None):
         self._inner = _core.Subset(coord, local_mask, f_img, g_img, subset_order=subset_order,
-                                   time=time)
+                                   time=time, soil_properties=soil_properties)
         if time is None:
             _report_time_source(self._inner)
 
@@ -346,9 +381,13 @@ class Subset:
             the line, or re-solve at order 2). Lossless images only. Needs an
             order-1 subset (an order-2 one is rebuilt at order 1, with a
             warning). The plain solve is kept in ``.seams``.
+            ``{"texture": "rigid", "grain": "shape" | "sphere"}``: the
+            speckle moves with the material but keeps its shape -- see
+            `Mesh.solve`. Default ``"deformable"``. Read back via
+            ``.texture`` as a pair, e.g. ``("rigid", "shape")``.
         """
         algo = _checked_solver(_resolve_solver(solver, extra_kwargs, "algorithm"))
-        masking = _subset_masking(solver_options)
+        masking, texture, grain = _subset_options(solver_options)
         if masking == "adaptive" and self._inner.subset_order != 1:
             warnings.warn("solver_options['masking']='adaptive' needs subset_order=1; rebuilding "
                           "the subset at order 1 (order 2 is applied where bending is found)",
@@ -357,7 +396,8 @@ class Subset:
             self._inner = _core.Subset(i.coord, i.local_mask, i.f_img, i.g_img, subset_order=1,
                                        time=i.time)
         kwargs = dict(p_0=p_0, max_norm=max_norm,
-                      max_iterations=max_iterations, tolerance=tolerance, masking=masking)
+                      max_iterations=max_iterations, tolerance=tolerance, masking=masking,
+                      texture=texture, grain=grain)
         if algo == "fagn":
             self._inner.solve_fagn(**kwargs)
         else:
@@ -383,15 +423,19 @@ class Mesh:
     (date-time, unix epoch or time of day; a bare frame counter is never taken
     as a time). Stored as ``.time`` (source in ``.time_source``); plot rates
     (``rate=True``) need it.
+
+    ``soil_properties`` (dict, optional): the soil's lab characterisation, as
+    for `Subset`; handed to every subset (read back via ``.soil_properties``).
     """
 
     def __init__(self, boundary, target_nodes, f_img, g_img,
                  size=(1, 1000), exclusions=None, exclusions_hard=None, mesh_order=1,
-                 time=None, noise=None):
+                 time=None, noise=None, soil_properties=None):
         self._inner = _core.Mesh(
             boundary, target_nodes, f_img, g_img,
             size=size, exclusions=exclusions, exclusions_hard=exclusions_hard,
             mesh_order=mesh_order, time=time, noise=getattr(noise, "_inner", noise),
+            soil_properties=soil_properties,
         )
         if time is None:
             _report_time_source(self._inner)
@@ -420,9 +464,9 @@ class Mesh:
             "adaptive".
 
         solver_options : dict, optional
-            Three orthogonal pipeline axes, each defaulting to its first
+            Four orthogonal pipeline axes, each defaulting to its first
             (today's-behaviour) value: ``{"topology": "uniform", "masking":
-            "uniform", "preconditioning": "RG"}``. Note this configures the
+            "uniform", "preconditioning": "RG", "texture": "deformable"}``. Note this configures the
             *pipeline*, not the numerical kernel -- which subset solver
             runs per node is ``solver=`` alone, never a key in this dict.
             See `geopyv_dev_fresh/solver_options_restructure.md` for the
@@ -431,6 +475,8 @@ class Mesh:
             - ``topology`` : ``"uniform"`` (default) or ``"adaptive"``
               (mesh-relocation pipeline -- not yet implemented, raises
               ``NotImplementedError``; see `geopyv_dev_fresh/to_do.md` Step 3).
+              ``"tracked"`` applies to `Sequence.solve` only and raises
+              ``ValueError`` here.
             - ``masking`` : ``"uniform"`` (default) or ``"adaptive"``:
               after the plain solve, nodes whose neighbours disagree beyond
               noise are investigated and corrected (moved off a line through
@@ -445,20 +491,54 @@ class Mesh:
               `geopyv_dev_fresh/layer_rg_plan.md`). Sub-options via
               ``solver_options["layer_rg"]``: ``batch_factor``,
               ``root_rel_eps``, ``max_workers``.
+            - ``texture`` : ``"deformable"`` (default): the speckle
+              stretches and shears with the material (painted speckle).
+              ``"rigid"``: each grain moves with the material under its
+              centre but keeps its shape (sand grains, PIV tracer
+              particles). At each solver iteration the reference is
+              corrected for the mismatch this leaves at the current strain.
+              Wrong for painted speckle, which does deform. Which correction
+              is set by ``grain``:
+
+              - ``"grain": "shape"`` (default): grains of any shape that do
+                not overlap and turn with the material. The reference is
+                split into grains once (each pixel climbs to its brightest
+                neighbour until it reaches a peak) and each pixel is
+                corrected about its own grain's centre. Not for speckle that
+                overlaps.
+              - ``"grain": "sphere"``: round, Gaussian-shaped speckle; the
+                correction uses the reference image's curvature and its
+                measured speckle size (or, given ``soil_properties``, the
+                grains' size).
+              - ``"grain": "edge"``: flat grains in a matrix (sand grains in
+                clay), corrected at their edges: each edge pixel is moved
+                about a grain centre that lies across the edge, on the grain
+                side, at the grains' mean edge distance d / (2 sphericity),
+                the sphericity that of the outlines Speckle would draw.
+                Needs ``soil_properties`` (size, outlines, and matrix / dye
+                brightness for which side is the grain), given when the
+                subset, mesh or sequence is made.
+
+              Order 0 carries no strain, so it is the same as
+              ``"deformable"``; an image with no measurable speckle or no
+              grains falls back to ``"deformable"`` with a warning. Read
+              back via ``.texture`` as a pair: ``("deformable", None)``,
+              ``("rigid", "sphere")``, ``("rigid", "shape")`` or ``("rigid", "edge")``.
 
         ``method="adaptive"`` (and the ``adaptive_*`` kwargs) is not
         available and raises ``ValueError``."""
         _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
-        topology, masking, preconditioning, layer_rg_opts = \
+        topology, masking, preconditioning, texture, grain, layer_rg_opts = \
             _validate_solver_options(solver_options)
-        # topology has no implemented non-default value yet (rejected inside
-        # _validate_solver_options) -- only "uniform" ever reaches here.
+        if topology == "tracked":
+            raise ValueError("solver_options['topology']='tracked' carries subsets between "
+                             "reference images, so it applies to Sequence.solve only")
         _adaptive_subset_order(masking, kwargs)
         self._inner.solve(
             local_mask, seed_coord, seed_warp=seed_warp,
             method=resolved_solver, preconditioning=preconditioning, masking=masking,
-            **_layer_rg_kwargs(layer_rg_opts), **kwargs,
+            texture=texture, grain=grain, **_layer_rg_kwargs(layer_rg_opts), **kwargs,
         )
 
     def save(self, path):
@@ -500,13 +580,19 @@ class Sequence:
     (date-time, unix epoch or time of day; a bare frame counter is never taken
     as a time). Stored as ``.time`` (source in ``.time_source``); plot rates
     (``rate=True``) need it.
+
+    ``soil_properties`` (dict, optional): the soil's lab characterisation, as
+    for `Subset`; handed to every pair's subsets (read back via
+    ``.soil_properties``).
     """
 
     def __init__(self, image_dir, boundary, target_nodes,
-                 size=(1.0, 1000.0), exclusions=None, mesh_order=1, time=None):
+                 size=(1.0, 1000.0), exclusions=None, mesh_order=1, time=None,
+                 soil_properties=None):
         self._inner = _core.Sequence(
             image_dir, boundary, target_nodes,
             size=size, exclusions=exclusions, mesh_order=mesh_order, time=time,
+            soil_properties=soil_properties,
         )
         if time is None:
             _report_time_source(self._inner)
@@ -533,21 +619,28 @@ class Sequence:
             and falls back to "icgn". ``method=`` is a deprecated alias --
             see `geopyv_dev_fresh/solver_options_restructure.md`.
         solver_options : dict, optional
-            Same three axes as `Mesh.solve` -- see that method's docstring
+            Same four axes as `Mesh.solve` -- see that method's docstring
             and `geopyv_dev_fresh/solver_options_restructure.md`.
             ``masking="adaptive"`` takes frames 0 -> 1 as a still pair:
             that pair is solved plain and supplies the noise for every
             later pair. Needs ``subset_order=1`` (forced, with a warning).
+            ``topology="tracked"``: the same subsets throughout -- at each
+            reference update every subset is moved by its own displacement
+            and only the connectivity is rebuilt (Delaunay); every mesh
+            solution then carries each subset's history (``tracks``: ``id``,
+            ``origin``, ``position``, ``reference_warp``, ``increment``,
+            ``warp``). Subsets leaving the region or image are dropped and
+            holes are left open. Needs ``mesh_order=1``.
 
         ``method="adaptive"`` is not available and raises ``ValueError``."""
         _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
-        topology, masking, preconditioning, layer_rg_opts = \
+        topology, masking, preconditioning, texture, grain, layer_rg_opts = \
             _validate_solver_options(solver_options)
         _adaptive_subset_order(masking, kwargs)
         self._inner.solve(
             *args, method=resolved_solver, preconditioning=preconditioning, masking=masking,
-            **_layer_rg_kwargs(layer_rg_opts), **kwargs,
+            texture=texture, grain=grain, topology=topology, **_layer_rg_kwargs(layer_rg_opts), **kwargs,
         )
 
     @property

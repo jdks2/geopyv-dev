@@ -455,7 +455,7 @@ impl Field {
         // available until finalize() has already run for every particle.
         let gradient_params = match &cfg.strain_method {
             StrainMethod::Meshless(params) => Some(params.clone()),
-            StrainMethod::Subsets => Some(crate::particle::MeshlessParams::default()),
+            StrainMethod::Subsets | StrainMethod::ElementWarps => Some(crate::particle::MeshlessParams::default()),
             StrainMethod::Mesh => None,
         };
         if let Some(params) = gradient_params.as_ref() {
@@ -948,6 +948,7 @@ mod tests {
             template_sizes: None,
             time: None,
             seams: None,
+            tracks: None,
         }
     }
 
@@ -1541,6 +1542,7 @@ mod tests {
             template_sizes: None,
             time: None,
             seams: None,
+            tracks: None,
         };
         let seq = make_seq(vec![mesh_sol], vec![false]);
         let mut field = make_field_from_seq(seq, true);

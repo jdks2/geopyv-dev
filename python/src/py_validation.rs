@@ -41,6 +41,9 @@ pub struct PyValidationFieldData {
 
 #[pymethods]
 impl PyValidationFieldData {
+    /// Applied warps ``(frames, particles, 12)`` in the particles' own measure:
+    /// slots 2 and 5 (``du/dx``, ``dv/dy``) as ``ln(1 + .)``, the way particles
+    /// accumulate them; the other slots as applied.
     #[getter]
     fn applied<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<f64>> {
         self.inner.result.applied.clone().into_pyarray_bound(py)

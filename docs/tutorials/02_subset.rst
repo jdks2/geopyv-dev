@@ -155,7 +155,7 @@ explicit:
    * - ``p_0``
      - Initial warp vector to start iterating from
      - ``None`` — zeros matching ``subset_order``
-   * - ``algorithm``
+   * - ``solver``
      - ``"icgn"`` (Inverse Compositional Gauss-Newton — Hessian computed once,
        typically 5–10x faster) or ``"fagn"`` (Forward Additive Gauss-Newton —
        Hessian rebuilt every iteration, slower but can sometimes recover from a
@@ -183,7 +183,7 @@ explicit:
    )
    subset.solve(
        p_0            = None,       # initial warp guess; None -> zeros
-       algorithm      = "icgn",     # "icgn" or "fagn"
+       solver         = "icgn",     # "icgn" or "fagn"
        max_norm       = 1e-3,       # convergence threshold on ||Δp||
        max_iterations = 50,         # iteration limit
        tolerance      = 0.75,       # minimum C_ZNCC to mark solved=True

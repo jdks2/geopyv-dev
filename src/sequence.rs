@@ -31,6 +31,7 @@
 //! - GUI selectors (`gp.gui.selectors.coordinate.CoordinateSelector`)
 //! - Adaptive remeshing — deferred; use `adaptive_iterations=0`
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -39,11 +40,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     geometry::region::{Region, RegionOption},
+    geometry::triangulation::{boundary_loops, retriangulate},
     image::Image,
     io::{load as io_load, save as io_save, GeopyvObject},
-    mesh::{Masking, Mesh, MeshSolution, SeedConfig, SolveConfig},
+    mesh::{Masking, Mesh, MeshSolution, NodeTracks, SeedConfig, SolveConfig},
     screen::StillPair,
-    particle::{element_locator, warp_increment, Particle, ParticleSource},
+    particle::{element_locator, warp_at, warp_increment, Particle, ParticleSource},
     masks::LocalMask,
     progress::{SolveProgress, TerminalProgress},
     subset::Subset,
@@ -164,6 +166,136 @@ pub struct SequenceSolveConfig {
     /// When `None` (default), accumulate all solutions in
     /// `SequenceSolution::mesh_solutions`.
     pub save: Option<PathBuf>,
+    /// How the subsets of successive reference images relate to each other.
+    pub topology: Topology,
+}
+
+/// How a sequence places its subsets after a reference update
+/// (`solver_options["topology"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Topology {
+    /// A fresh mesh over the tracked region at every reference update.
+    #[default]
+    Uniform,
+    /// The same subsets throughout: at a reference update every subset is
+    /// moved by its own displacement and only the connectivity is rebuilt
+    /// (Delaunay, constrained along the previous mesh's boundary); each subset
+    /// keeps its history in [`MeshSolution::tracks`]. Subsets that leave the
+    /// region or the image are dropped, and holes are left to open. Order-1
+    /// meshes only.
+    Tracked,
+}
+
+/// Identity, first-image position and warp up to the reference image of the
+/// subsets a tracked mesh is built on, in node order.
+struct Carried {
+    id: Vec<u64>,
+    origin: Array2<f64>,
+    reference_warp: Array2<f64>,
+}
+
+/// The next pair's mesh in a tracked sequence, from the last solved pair
+/// `last`: the same subsets at the same points when the reference image is
+/// unchanged, otherwise every subset moved by its own displacement over the
+/// last pair and the connectivity rebuilt.
+fn tracked_mesh(
+    last: &MeshSolution,
+    reference_changed: bool,
+    boundary_region: &Region,
+    exclusion_regions: &[Region],
+    f_img: Arc<Image>,
+    g_img: Arc<Image>,
+) -> Result<(Mesh, Carried), Error> {
+    let tr = last.tracks.as_ref().ok_or_else(|| Error::InvalidInput("tracked pair without tracks".into()))?;
+    let excl_views: Vec<_> = exclusion_regions.iter().map(|r| r.current_nodes.view()).collect();
+    let excl_hard: Vec<bool> = exclusion_regions.iter().map(|r| r.hard).collect();
+    let build = |nodes, elements, boundary, exclusions, f_img, g_img| {
+        Mesh::from_nodes(
+            nodes, elements, boundary, exclusions,
+            boundary_region.current_nodes.view(), boundary_region.hard, &excl_views, &excl_hard, f_img, g_img,
+        )
+    };
+    if !reference_changed {
+        let mesh = build(tr.position.clone(), last.elements.clone(), last.boundary.clone(), last.exclusions.clone(), f_img, g_img);
+        let carried = Carried { id: tr.id.clone(), origin: tr.origin.clone(), reference_warp: tr.reference_warp.clone() };
+        return Ok((mesh, carried));
+    }
+    let n = tr.position.nrows();
+    let mut moved = tr.position.clone();
+    for i in 0..n {
+        moved[[i, 0]] += tr.increment[[i, 0]];
+        moved[[i, 1]] += tr.increment[[i, 1]];
+    }
+    let r = retriangulate(moved.view(), &boundary_loops(&last.elements))?;
+    // Drop subsets that left the image, the elements using them, and any
+    // subset that no element uses any more.
+    let (h, w) = f_img.image_gs.dim();
+    let mut drop: HashSet<usize> = r.orphans.iter().copied().collect();
+    drop.extend((0..n).filter(|&i| {
+        let (x, y) = (moved[[i, 0]], moved[[i, 1]]);
+        !(x >= 0.0 && y >= 0.0 && x <= (w - 1) as f64 && y <= (h - 1) as f64)
+    }));
+    let mut rows: Vec<[usize; 3]> = r.elements.rows().into_iter().map(|e| [e[0], e[1], e[2]]).collect();
+    loop {
+        rows.retain(|e| e.iter().all(|i| !drop.contains(i)));
+        let used: HashSet<usize> = rows.iter().flatten().copied().collect();
+        let newly: Vec<usize> = (0..n).filter(|i| !used.contains(i) && !drop.contains(i)).collect();
+        if newly.is_empty() {
+            break;
+        }
+        drop.extend(newly);
+    }
+    if let Some(v) = last.boundary.iter().chain(last.exclusions.iter().flatten()).find(|i| drop.contains(i)) {
+        return Err(Error::InvalidInput(format!(
+            "tracked topology: region vertex subset {v} left the region or the image"
+        )));
+    }
+    let keep: Vec<usize> = (0..n).filter(|i| !drop.contains(i)).collect();
+    let mut new_index = vec![usize::MAX; n];
+    for (k, &i) in keep.iter().enumerate() {
+        new_index[i] = k;
+    }
+    let elements = Array2::from_shape_fn((rows.len(), 3), |(e, k)| new_index[rows[e][k]]);
+    let boundary = last.boundary.iter().map(|&i| new_index[i]).collect();
+    let exclusions = last.exclusions.iter().map(|g| g.iter().map(|&i| new_index[i]).collect()).collect();
+    let mesh = build(moved.select(Axis(0), &keep), elements, boundary, exclusions, f_img, g_img);
+    let carried = Carried {
+        id: keep.iter().map(|&i| tr.id[i]).collect(),
+        origin: tr.origin.select(Axis(0), &keep),
+        reference_warp: tr.warp.select(Axis(0), &keep),
+    };
+    Ok((mesh, carried))
+}
+
+/// `sol` with each subset's history attached: its material point (the centre
+/// before any cut move), its warp over this pair carried to that point, and
+/// that warp composed onto what it `carried` from earlier pairs (nothing for
+/// the first pair: the points start here).
+fn attach_tracks(sol: &MeshSolution, carried: Option<Carried>) -> MeshSolution {
+    let n = sol.nodes.nrows();
+    let position = sol.seams.as_ref().map(|s| s.plain_nodes.clone()).unwrap_or_else(|| sol.nodes.clone());
+    let mut increment = Array2::<f64>::zeros((n, 6));
+    for i in 0..n {
+        let w = warp_at(sol.p.row(i), position[[i, 0]] - sol.nodes[[i, 0]], position[[i, 1]] - sol.nodes[[i, 1]]);
+        for k in 0..6 {
+            increment[[i, k]] = w[k];
+        }
+    }
+    let c = carried.unwrap_or_else(|| Carried {
+        id: (0..n as u64).collect(),
+        origin: position.clone(),
+        reference_warp: Array2::zeros((n, 6)),
+    });
+    let mut warp = Array2::<f64>::zeros((n, 6));
+    for i in 0..n {
+        let w = NodeTracks::compose(&c.reference_warp.row(i).to_vec(), &increment.row(i).to_vec());
+        for k in 0..6 {
+            warp[[i, k]] = w[k];
+        }
+    }
+    let mut out = sol.clone();
+    out.tracks = Some(NodeTracks { id: c.id, origin: c.origin, position, reference_warp: c.reference_warp, increment, warp });
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +492,9 @@ pub struct Sequence {
     /// Time of each image, seconds; `None` until [`Sequence::set_time`].
     pub time: Option<Vec<f64>>,
     pub time_source: TimeSource,
+    /// Soil properties handed to every pair's mesh (see `Mesh::soil_properties`);
+    /// not saved.
+    pub soil_properties: Option<crate::soil::SoilConfig>,
     solution: Option<SequenceSolution>,
 }
 
@@ -393,7 +528,7 @@ impl Sequence {
                 "target_nodes must be >= 1".to_string(),
             ));
         }
-        Ok(Sequence { image_paths, mesh_cfg, time: None, time_source: TimeSource::None, solution: None })
+        Ok(Sequence { image_paths, mesh_cfg, time: None, time_source: TimeSource::None, soil_properties: None, solution: None })
     }
 
     /// Reconstruct a `Sequence` shell from a saved [`SequenceSolution`].
@@ -411,6 +546,7 @@ impl Sequence {
             mesh_cfg,
             time: sol.time.clone(),
             time_source: sol.time_source.clone(),
+            soil_properties: None,
             solution: Some(sol),
         }
     }
@@ -491,6 +627,15 @@ impl Sequence {
         progress: Option<&dyn SolveProgress>,
     ) -> Result<(), Error> {
         let n_images = self.image_paths.len();
+        let tracked = cfg.topology == Topology::Tracked;
+        if tracked && self.mesh_cfg.mesh_order != 1 {
+            return Err(Error::InvalidInput(
+                "topology 'tracked' needs mesh_order=1: mid-side nodes stop being mid-sides once the \
+                 connectivity is rebuilt".into(),
+            ));
+        }
+        // Tracked topology: the last solved pair and its reference image.
+        let mut tracker: Option<(Arc<MeshSolution>, usize)> = None;
         let terminal;
         let progress: &dyn SolveProgress = match progress {
             Some(p) => p,
@@ -568,10 +713,24 @@ impl Sequence {
             // In sync mode, reuse previous pair's geometry when available.
             let excl_views: Vec<_> = exclusion_regions.iter().map(|r| r.current_nodes.view()).collect();
             let excl_hard: Vec<bool> = exclusion_regions.iter().map(|r| r.hard).collect();
+            let mut carried: Option<Carried> = None;
             let mut mesh = match (cfg.options.sync, &sync_sol) {
-                (true, Some(prev)) => {
+                _ if tracked && tracker.is_some() => {
+                    let (last, last_f) = tracker.as_ref().expect("checked");
+                    let (m, c) = tracked_mesh(
+                        last, *last_f != f_index, &boundary_region, &exclusion_regions,
+                        Arc::clone(&f_img), Arc::clone(&g_img),
+                    )?;
+                    carried = Some(c);
+                    m
+                }
+                (true, Some(prev)) if !tracked => {
                     let mut m = Mesh::from_solution(Arc::clone(prev), Arc::clone(&f_img), Arc::clone(&g_img));
                     m.reset_plain_nodes();
+                    // the region as it stands in this reference image: the same
+                    // within a reference period, deformed with the specimen
+                    // after a reference update
+                    m.set_region_mask(boundary_region.current_nodes.view(), boundary_region.hard, &excl_views, &excl_hard);
                     m
                 }
                 _ => Mesh::new(
@@ -588,6 +747,7 @@ impl Sequence {
             };
 
             mesh.time = self.time.as_ref().map(|t| (t[f_index], t[g_index]));
+            mesh.soil_properties = self.soil_properties.clone();
 
             // Override: relax tolerance to 0 and bypass the post-corrections
             // quality gate (mirrors `mesh.py`'s `self._override` bypass for
@@ -674,6 +834,15 @@ impl Sequence {
                         return Ok(());
                     }
                 }
+            };
+
+            // --- Tracked topology: each subset's history. -------------------
+            let mesh_sol = if tracked {
+                let s = Arc::new(attach_tracks(&mesh_sol, carried.take()));
+                tracker = Some((Arc::clone(&s), f_index));
+                s
+            } else {
+                mesh_sol
             };
 
             if still_pair {
@@ -849,7 +1018,8 @@ fn store_region_step(
                 let mut warp_0 = vec![0.0f64; 6 * subset_order];
                 warp_0[0] = mean[0];
                 warp_0[1] = mean[1];
-                let result = subset.solve_icgn_result(Some(&warp_0), 0.9, 1e-5, 50)?;
+                // Rigid inclusion registration: always the deformable template.
+                let result = subset.solve_icgn_result(Some(&warp_0), 0.9, 1e-5, 50, crate::mesh::Texture::Deformable)?;
                 if !result.quality_ok {
                     // Registration failed: skip storing entirely for this pair.
                     return Ok(());
@@ -900,16 +1070,18 @@ pub fn deformation_preconditioning(
         Ok(p) => p,
         Err(_) => return ([0.0; 2], vec![0.0; 6 * subset_order as usize]),
     };
-    // Pinned to mesh-element interpolation (not the meshless default):
-    // keeps reference-update preconditioning numerically unchanged.
+    // Pinned to mesh-element interpolation (not the meshless default).
     let cfg = crate::particle::ParticleConfig {
         strain_method: crate::particle::StrainMethod::Mesh,
         ..Default::default()
     };
     particle.solve_increment(0, sol, &cfg, None);
 
+    // The increment itself, in the warp convention. `particle.warps` holds the
+    // accumulated history, whose normal slots are logarithmic (ln(1 + u_x)),
+    // so it is not a warp to seed a subset with.
     let p_len = 6 * mesh_order as usize;
-    let warp_1: Vec<f64> = (0..p_len).map(|j| particle.warps[[1, j]]).collect();
+    let warp_1: Vec<f64> = (0..p_len).map(|j| particle.incs[[1, j]]).collect();
     let disp = [
         warp_1.first().copied().unwrap_or(0.0),
         warp_1.get(1).copied().unwrap_or(0.0),
@@ -1086,6 +1258,25 @@ mod tests {
             template_sizes: None,
             time: None,
             seams: None,
+            tracks: None,
+        }
+    }
+
+    #[test]
+    fn test_deformation_preconditioning_seed_warp_is_the_warp() {
+        // u = 0.1 x + 0.03 y, v = 0.02 x - 0.05 y: the seed warp must carry the
+        // gradients in [u_x, v_x, u_y, v_y] order and as plain gradients (not
+        // the particle's logarithmic accumulation, ln(1 + 0.1) for u_x).
+        let mut sol = unit_square_solution(0.0, 0.0);
+        let g = [0.1, 0.02, 0.03, -0.05];
+        for k in 0..4 {
+            let (x, y) = (sol.nodes[[k, 0]], sol.nodes[[k, 1]]);
+            sol.displacements[[k, 0]] = g[0] * x + g[2] * y;
+            sol.displacements[[k, 1]] = g[1] * x + g[3] * y;
+        }
+        let (_, warp) = deformation_preconditioning(&sol, [0.4, 0.3], 1, 1);
+        for k in 0..4 {
+            assert!((warp[2 + k] - g[k]).abs() < 1e-12, "slot {}: {} vs {}", 2 + k, warp[2 + k], g[k]);
         }
     }
 
@@ -1497,6 +1688,7 @@ mod tests {
             options: SequenceOptions::default(),
             border: 20,
             save: None,
+            topology: Default::default(),
         };
         (seq, cfg)
     }

@@ -38,7 +38,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::SolveMethod, seam::SeamRecord, timing::{resolve_pair_time, TimeInput, TimeSource}, Error};
+use crate::{image::Image, masks::{LocalMask, MaskShape}, mesh::{SolveMethod, Texture}, texture::TemplateModel, seam::SeamRecord, timing::{resolve_pair_time, TimeInput, TimeSource}, Error};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -99,6 +99,13 @@ pub struct Subset {
     pub grad_f: Option<Array2<f64>>,
     /// Standard deviation of reference intensities.
     pub sigma_intensity: Option<f64>,
+
+    /// Known properties of the soil (as a lab characterisation gives them;
+    /// the grain and brightness settings of [`crate::soil::SoilConfig`]).
+    /// Used by the rigid-texture corrections: with them, the Gaussian
+    /// correction takes its blob width from the grains instead of the image's
+    /// correlation length. Not saved with the solution (yet).
+    pub soil_properties: Option<crate::soil::SoilConfig>,
 
     /// Result of the most recent [`Subset::solve_icgn`]/[`Subset::solve_fagn`]
     /// call. `None` until solved.
@@ -176,6 +183,11 @@ pub struct SolveResult {
     /// pre-existing `.pyv` saved before this field existed.
     #[serde(default)]
     pub eta_omitted: Option<(f64, f64)>,
+    /// Template the solve fitted: [`Texture::RigidSphere`] only when a rigid solve
+    /// actually used the rigid-texture template (not for order 0 or a
+    /// reference without measurable speckle, which fall back).
+    #[serde(default)]
+    pub texture: Texture,
 }
 
 fn default_solve_method() -> SolveMethod {
@@ -526,7 +538,12 @@ fn compose_icgn(p: &[f64], delta_p: &[f64]) -> Vec<f64> {
             delta_p[9], delta_p[10], delta_p[11],
         );
 
-        /// Compute the 18 auxiliary terms for the 6×6 homogeneous warp matrix.
+        /// Compute the 18 auxiliary terms for the 6×6 homogeneous warp matrix:
+        /// rows x'², x'y', y'² of the lifted warp acting on [x², xy, y², x, y, 1].
+        /// S7 (the x² coefficient of x'y') is (1+u_x)v_x + ½(v u_xx + u v_xx);
+        /// `_p_new_ICGN` in `_subset.cpp` drops the bracket and doubles the first
+        /// and last of these, which `compose_order2_inverse_is_second_order`
+        /// catches.
         fn s_terms(
             u: f64, v: f64, ux: f64, vx: f64, uy: f64, vy: f64,
             uxx: f64, vxx: f64, uxy: f64, vxy: f64, uyy: f64, vyy: f64,
@@ -538,7 +555,7 @@ fn compose_icgn(p: &[f64], delta_p: &[f64]) -> Vec<f64> {
                 2.0 * u * (1.0 + ux),                                  // S4
                 2.0 * u * uy,                                          // S5
                 u * u,                                                 // S6
-                0.5 * v * uxx + 2.0 * (1.0 + ux) * vx + u * vxx,    // S7
+                0.5 * (v * uxx + 2.0 * (1.0 + ux) * vx + u * vxx),  // S7
                 uy * vx + ux * vy + v * uxy + u * vxy + vy + ux,     // S8
                 0.5 * (v * uyy + 2.0 * uy * (1.0 + vy) + u * vyy),  // S9
                 v + v * ux + u * vx,                                   // S10
@@ -896,6 +913,7 @@ impl Subset {
             f_m: Some(f_m),
             grad_f: Some(grad_f),
             sigma_intensity: Some(sigma_intensity),
+            soil_properties: None,
             solution: None,
         })
     }
@@ -922,6 +940,7 @@ impl Subset {
             f_m: None,
             grad_f: None,
             sigma_intensity: None,
+            soil_properties: None,
             solution: Some(sol.clone()),
         }
     }
@@ -976,8 +995,9 @@ impl Subset {
         tolerance: f64,
         max_norm: f64,
         max_iterations: usize,
+        texture: Texture,
     ) -> Result<(), Error> {
-        let result = self.solve_icgn_result(p_0, tolerance, max_norm, max_iterations)?;
+        let result = self.solve_icgn_result(p_0, tolerance, max_norm, max_iterations, texture)?;
         self.solution = Some(self.build_solution(result));
         Ok(())
     }
@@ -994,8 +1014,9 @@ impl Subset {
         tolerance: f64,
         max_norm: f64,
         max_iterations: usize,
+        texture: Texture,
     ) -> Result<(), Error> {
-        let result = self.solve_fagn_result(p_0, tolerance, max_norm, max_iterations)?;
+        let result = self.solve_fagn_result(p_0, tolerance, max_norm, max_iterations, texture)?;
         self.solution = Some(self.build_solution(result));
         Ok(())
     }
@@ -1035,7 +1056,67 @@ impl Subset {
         Ok(())
     }
 
+    /// Rigid texture: `[fxx, fyy, fxy]` at the subset pixels and s², or
+    /// `None` (deformable solve) for `Deformable`, order 0, or a reference
+    /// with no measurable speckle.
+    fn grain_setup(&self, texture: Texture, f_coords: &Array2<f64>) -> Option<TemplateModel> {
+        if self.subset_order == 0 {
+            return None;
+        }
+        let img = self.f_img.as_ref()?;
+        match texture {
+            Texture::Deformable => None,
+            Texture::RigidSphere => {
+                let m = img.grain()?;
+                match self.soil_properties.as_ref().and_then(|p| p.grain_sigma2().ok().map(|g| (p, g))) {
+                    // known grains: blob width^2 = the grains' spread plus the
+                    // blur the image got on loading, and the correction acts
+                    // on grain-scale detail only - the coarse part (smoothed
+                    // by a Gaussian one median grain diameter wide, i.e. over
+                    // about two diameters) is left to stretch with the warp
+                    Some((p, g)) => {
+                        let blur = if img.filepath.is_some() { crate::image::LOAD_BLUR_SIGMA.powi(2) } else { 0.0 };
+                        let s2 = 2.0 * (g + blur);
+                        let k = crate::texture::smoothing_corr(s2);
+                        let (low, hl) = crate::texture::coarse_part(img, f_coords, p.d_p);
+                        let h: Vec<[f64; 3]> = m
+                            .sample_for(f_coords, s2)
+                            .iter()
+                            .zip(&hl)
+                            .map(|(a, b)| [a[0] - k * b[0], a[1] - k * b[1], a[2] - k * b[2]])
+                            .collect();
+                        let f = self.f.as_ref()?;
+                        let mean_band = f.iter().zip(&low).map(|(fi, li)| fi - li).sum::<f64>() / f.len() as f64;
+                        let base: Vec<f64> = low.iter().map(|li| li + mean_band).collect();
+                        Some(TemplateModel::Curvature { h, s2, base: Some(base) })
+                    }
+                    // otherwise the blob width from the correlation length
+                    None => Some(TemplateModel::Curvature { h: m.sample(f_coords), s2: m.s2, base: None }),
+                }
+            }
+            Texture::RigidEdge => {
+                // known grains only: edge distance from size and outline sphericity,
+                // side from the dye being darker or brighter than the matrix
+                let p = self.soil_properties.as_ref()?;
+                let rho = p.grain_edge_distance().ok()?;
+                let grad = self.grad_f.as_ref()?.clone();
+                let off = crate::texture::edge_offsets(&grad, rho, p.seed_brightness < p.matrix_brightness);
+                Some(TemplateModel::Edges { off, grad })
+            }
+            Texture::RigidShape => {
+                let grad = self.grad_f.as_ref()?.clone();
+                img.grain_centres().map(|c| TemplateModel::Grains { off: c.offsets(f_coords), grad })
+            }
+        }
+    }
+
     /// Inverse Compositional Gauss-Newton solve computation (no mutation).
+    ///
+    /// `texture`: [`Texture::RigidSphere`] fits `g` to the template `f + G(E(p))`,
+    /// rebuilt from the current warp at every iteration (its own mean and
+    /// norm in the ZNSSD); the steepest-descent images and Hessian stay those
+    /// of `f`. Falls back to the deformable solve when the reference has no
+    /// measurable speckle. [`Texture::Deformable`] is the classic solve.
     ///
     /// Safe to call repeatedly on the same `Subset` with different initial
     /// warps without disturbing any previously stored solution — this is what
@@ -1052,6 +1133,7 @@ impl Subset {
         tolerance: f64,
         max_norm: f64,
         max_iterations: usize,
+        texture: Texture,
     ) -> Result<SolveResult, Error> {
         let unavail = || Error::InvalidInput("solve_icgn: images unavailable".to_string());
         let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
@@ -1073,6 +1155,11 @@ impl Subset {
         let hessian = compute_hessian(&sdi_ref);
         let inv_h = hessian.try_inverse().expect("ICGN Hessian singular");
 
+        let grain = self.grain_setup(texture, f_coords);
+        // Template fitted at the latest iteration: (ft, ft_m, delta_ft),
+        // rebuilt from the current warp at every iteration.
+        let mut tpl: Option<(Array1<f64>, f64, f64)> = None;
+
         let mut history = Vec::with_capacity(max_iterations);
         let mut converged = false;
 
@@ -1088,9 +1175,17 @@ impl Subset {
             let g_m = g.sum() / n as f64;
             let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
 
+            if let Some(gr) = &grain {
+                tpl = Some(rigid_template(f, f_m, gr, &p, self.coord, f_coords));
+            }
+            let (tf, tf_m, delta_tf) = match &tpl {
+                Some((ft, ft_m, d)) => (ft, *ft_m, *d),
+                None => (f, f_m, self.delta_f),
+            };
+
             // Fused update + ZNSSD, one i-outer sweep (layer_rg_plan.md §11.2).
             let (dp_vec, c_znssd) = delta_p_and_znssd_icgn(
-                &inv_h, f, &g, f_m, g_m, self.delta_f, delta_g, &sdi_ref,
+                &inv_h, tf, &g, tf_m, g_m, delta_tf, delta_g, &sdi_ref,
             );
             let dp: Vec<f64> = dp_vec.iter().copied().collect();
             p = compose_icgn(&p, &dp);
@@ -1118,8 +1213,12 @@ impl Subset {
         // from it rather than threading them out of the hot loop above.
         let g_m_final = g.sum() / n as f64;
         let delta_g_final = g.iter().map(|&gi| (gi - g_m_final).powi(2)).sum::<f64>().sqrt();
+        let (tf, tf_m, delta_tf) = match &tpl {
+            Some((ft, ft_m, d)) => (ft, *ft_m, *d),
+            None => (f, f_m, self.delta_f),
+        };
         let eta_omitted = omitted_mode_diagnostic(
-            self.coord, self.subset_order, f_coords, grad_f, f, f_m, self.delta_f,
+            self.coord, self.subset_order, f_coords, grad_f, tf, tf_m, delta_tf,
             &g, g_m_final, delta_g_final,
         );
 
@@ -1128,6 +1227,7 @@ impl Subset {
             max_norm, tolerance,
             subset_order: self.subset_order, max_iterations, method: SolveMethod::Icgn,
             eta_omitted,
+            texture: grain.as_ref().map_or(Texture::Deformable, TemplateModel::texture),
         })
     }
 
@@ -1144,6 +1244,7 @@ impl Subset {
         tolerance: f64,
         max_norm: f64,
         max_iterations: usize,
+        texture: Texture,
     ) -> Result<SolveResult, Error> {
         let unavail = || Error::InvalidInput("solve_fagn: images unavailable".to_string());
         let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
@@ -1165,8 +1266,18 @@ impl Subset {
         // the final iteration's target intensities survive past `for` --
         // the warp-adequacy diagnostic below needs them.
         let mut g = Array1::<f64>::zeros(n);
+        // Rigid texture: as in `solve_icgn_result`.
+        let grain = self.grain_setup(texture, f_coords);
+        let mut tpl: Option<(Array1<f64>, f64, f64)> = None;
 
         for iteration in 1..=max_iterations {
+            if let Some(gr) = &grain {
+                tpl = Some(rigid_template(f, f_m, gr, &p, self.coord, f_coords));
+            }
+            let (tf, tf_m, delta_tf) = match &tpl {
+                Some((ft, ft_m, d)) => (ft, *ft_m, *d),
+                None => (f, f_m, self.delta_f),
+            };
             let g_center = [self.coord[0] + p[0], self.coord[1] + p[1]];
 
             let gc = apply_warp(self.coord, &p, f_coords);
@@ -1187,7 +1298,7 @@ impl Subset {
             let sdi_cur = steepest_descent(g_center, &gc, &grad_g, self.subset_order);
             let hessian = compute_hessian(&sdi_cur);
             let dp_vec = delta_p_fagn(
-                &hessian, f, &g, f_m, g_m, self.delta_f, delta_g, &sdi_cur,
+                &hessian, tf, &g, tf_m, g_m, delta_tf, delta_g, &sdi_cur,
             );
 
             // Additive update
@@ -1197,7 +1308,7 @@ impl Subset {
             let dp: Vec<f64> = dp_vec.iter().copied().collect();
 
             let norm = convergence_norm(&dp, size);
-            let c_znssd = znssd(f, &g, f_m, g_m, self.delta_f, delta_g);
+            let c_znssd = znssd(tf, &g, tf_m, g_m, delta_tf, delta_g);
             let c_zncc = 1.0 - c_znssd / 2.0;
             history.push((iteration, norm, c_zncc, c_znssd));
 
@@ -1217,8 +1328,12 @@ impl Subset {
         // Warp-adequacy diagnostic -- see solve_icgn_result.
         let g_m_final = g.sum() / n as f64;
         let delta_g_final = g.iter().map(|&gi| (gi - g_m_final).powi(2)).sum::<f64>().sqrt();
+        let (tf, tf_m, delta_tf) = match &tpl {
+            Some((ft, ft_m, d)) => (ft, *ft_m, *d),
+            None => (f, f_m, self.delta_f),
+        };
         let eta_omitted = omitted_mode_diagnostic(
-            self.coord, self.subset_order, f_coords, grad_f, f, f_m, self.delta_f,
+            self.coord, self.subset_order, f_coords, grad_f, tf, tf_m, delta_tf,
             &g, g_m_final, delta_g_final,
         );
 
@@ -1227,6 +1342,7 @@ impl Subset {
             max_norm, tolerance,
             subset_order: self.subset_order, max_iterations, method: SolveMethod::Fagn,
             eta_omitted,
+            texture: grain.as_ref().map_or(Texture::Deformable, TemplateModel::texture),
         })
     }
 
@@ -1251,17 +1367,28 @@ impl Subset {
         let sol = self.solution.as_ref().ok_or_else(|| {
             Error::InvalidInput("residual_map: subset has not been solved".to_string())
         })?;
-        self.residual_with(&sol.result.p)
+        self.residual_textured(&sol.result.p, sol.result.texture)
     }
 
     /// The per-pixel zero-normalised residual `e_i = zn(f_i) - zn(g_i)` at
     /// the warp `p` (any order), without solving.
     pub(crate) fn residual_with(&self, p: &[f64]) -> Result<Array1<f64>, Error> {
+        self.residual_textured(p, Texture::Deformable)
+    }
+
+    /// As [`Self::residual_with`], against the rigid-texture template
+    /// `f + G(E(p))` for [`Texture::RigidSphere`].
+    fn residual_textured(&self, p: &[f64], texture: Texture) -> Result<Array1<f64>, Error> {
         let unavail = || Error::InvalidInput("residual_map: images unavailable".to_string());
         let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;
-        let f       = self.f.as_ref().ok_or_else(unavail)?;
-        let f_m     = self.f_m.ok_or_else(unavail)?;
+        let f0      = self.f.as_ref().ok_or_else(unavail)?;
+        let f_m0    = self.f_m.ok_or_else(unavail)?;
         let g_img   = self.g_img.as_ref().ok_or_else(unavail)?;
+        let tpl = self.grain_setup(texture, f_coords).map(|gr| rigid_template(f0, f_m0, &gr, p, self.coord, f_coords));
+        let (f, f_m, delta_f) = match &tpl {
+            Some((ft, ft_m, d)) => (ft, *ft_m, *d),
+            None => (f0, f_m0, self.delta_f),
+        };
 
         let n = f_coords.nrows();
         let gv: &Image = &g_img;
@@ -1273,11 +1400,29 @@ impl Subset {
         let delta_g = g.iter().map(|&gi| (gi - g_m).powi(2)).sum::<f64>().sqrt();
 
         Ok((0..n)
-            .map(|i| (f[i] - f_m) / self.delta_f - (g[i] - g_m) / delta_g)
+            .map(|i| (f[i] - f_m) / delta_f - (g[i] - g_m) / delta_g)
             .collect())
     }
 
 }
+
+/// Rigid-texture template `(ft, ft_m, delta_ft)` for warp `p`: `f + G` with
+/// its mean and `sqrt(Σ(ft − ft_m)²)`, ready for the ZNSSD in place of
+/// `(f, f_m, delta_f)`.
+fn rigid_template(
+    f: &Array1<f64>,
+    f_m: f64,
+    grain: &TemplateModel,
+    p: &[f64],
+    coord: [f64; 2],
+    f_coords: &Array2<f64>,
+) -> (Array1<f64>, f64, f64) {
+    let ft = grain.template(f, f_m, p, coord, f_coords);
+    let ft_m = ft.sum() / ft.len() as f64;
+    let delta_ft = ft.iter().map(|&v| (v - ft_m).powi(2)).sum::<f64>().sqrt();
+    (ft, ft_m, delta_ft)
+}
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1773,7 +1918,7 @@ mod tests {
         ).unwrap();
         assert_eq!(subset.subset_order, 0);
 
-        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50, Texture::Deformable).unwrap();
 
         assert!(result.converged, "ICGN order-0 did not converge");
         assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
@@ -1793,10 +1938,13 @@ mod tests {
     ///
     /// Golden values (x-first coordinate convention) — computed from
     /// geopyv_dev, which differs from `geopyv` by the one-pixel B-spline
-    /// prefilter fix in `image.rs::build_kernel` (see its doc comment):
+    /// prefilter fix in `image.rs::build_kernel` (see its doc comment) and by
+    /// the spline gradient taken at the query point (`image.rs::qt_dpoly`,
+    /// 2026-11-04; before: at the pixel corner below, sssig 430204.02,
+    /// p ≈ [0.034043, 0.035697]):
     ///   iterations = 3
     ///   ZNCC ≈ 0.9999869  (Tier C: rtol = 1e-5)
-    ///   p ≈ [0.03404, 0.03570, 1.2e-4, -3.1e-5, 4.0e-5, -4.9e-5]
+    ///   p ≈ [0.033856, 0.035395, 1.1e-4, -3.2e-5, 1.3e-5, -4.8e-5]
     #[test]
     fn test_solve_icgn_order1_golden() {
         let ref_path = test_image_path("ref.jpg");
@@ -1829,12 +1977,12 @@ mod tests {
             "delta_f = {}", subset.delta_f
         );
         assert!(
-            (subset.sssig - 430204.0240975655).abs() < 1.0,
+            (subset.sssig - 436905.2584947199).abs() < 1.0,
             "sssig = {}", subset.sssig
         );
 
         // Solve
-        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50, Texture::Deformable).unwrap();
 
         // Tier C: ZNCC ≈ 0.9999869, rtol = 1e-5
         assert!(result.converged, "ICGN did not converge");
@@ -1843,14 +1991,14 @@ mod tests {
             (result.c_zncc - 0.9999869).abs() < 1e-4,
             "ZNCC = {} (expected ~0.9999869)", result.c_zncc
         );
-        // Displacement: p[0] ≈ 0.034043, p[1] ≈ 0.035697
+        // Displacement: p[0] ≈ 0.033856, p[1] ≈ 0.035395
         assert!(
-            (result.p[0] - 0.034043).abs() < 1e-4,
-            "p[0] = {} (expected ~0.034043)", result.p[0]
+            (result.p[0] - 0.033856).abs() < 1e-4,
+            "p[0] = {} (expected ~0.033856)", result.p[0]
         );
         assert!(
-            (result.p[1] - 0.035697).abs() < 1e-4,
-            "p[1] = {} (expected ~0.035697)", result.p[1]
+            (result.p[1] - 0.035395).abs() < 1e-4,
+            "p[1] = {} (expected ~0.035395)", result.p[1]
         );
     }
 
@@ -1858,9 +2006,10 @@ mod tests {
     ///
     /// Golden values (x-first coordinate convention) — computed from
     /// geopyv_dev with the one-pixel B-spline prefilter fix (see
-    /// `image.rs::build_kernel`):
+    /// `image.rs::build_kernel`) and the spline gradient at the query point
+    /// (`image.rs::qt_dpoly`, 2026-11-04; before: p ≈ [0.033595, 0.035016]):
     ///   iterations = 3, ZNCC ≈ 0.9999869
-    ///   p ≈ [0.033595, 0.035016, 1.2e-4, -2.9e-5, 3.9e-5, -4.1e-5]
+    ///   p ≈ [0.033917, 0.035200, 1.1e-4, -3.6e-5, 1.4e-5, -4.6e-5]
     #[test]
     fn test_solve_fagn_order1_golden() {
         let ref_path = test_image_path("ref.jpg");
@@ -1882,7 +2031,7 @@ mod tests {
             Arc::clone(&ref_img), Arc::clone(&tar_img), 1,
         ).unwrap();
 
-        let result = subset.solve_fagn_result(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_fagn_result(None, 0.75, 1e-3, 50, Texture::Deformable).unwrap();
 
         assert!(result.converged, "FAGN did not converge");
         assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
@@ -1891,12 +2040,12 @@ mod tests {
             "ZNCC = {} (expected ~0.9999869)", result.c_zncc
         );
         assert!(
-            (result.p[0] - 0.033595).abs() < 1e-4,
-            "p[0] = {} (expected ~0.033595)", result.p[0]
+            (result.p[0] - 0.033917).abs() < 1e-4,
+            "p[0] = {} (expected ~0.033917)", result.p[0]
         );
         assert!(
-            (result.p[1] - 0.035016).abs() < 1e-4,
-            "p[1] = {} (expected ~0.035016)", result.p[1]
+            (result.p[1] - 0.035200).abs() < 1e-4,
+            "p[1] = {} (expected ~0.035200)", result.p[1]
         );
     }
 
@@ -1922,7 +2071,7 @@ mod tests {
             Arc::clone(&ref_img), Arc::clone(&tar_img), 2,
         ).unwrap();
 
-        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 0.75, 1e-3, 50, Texture::Deformable).unwrap();
 
         assert!(result.converged, "ICGN order-2 did not converge");
         assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
@@ -1954,7 +2103,7 @@ mod tests {
             Arc::clone(&ref_img), Arc::clone(&tar_img), 2,
         ).unwrap();
 
-        let result = subset.solve_fagn_result(None, 0.75, 1e-3, 50).unwrap();
+        let result = subset.solve_fagn_result(None, 0.75, 1e-3, 50, Texture::Deformable).unwrap();
 
         assert!(result.converged, "FAGN order-2 did not converge");
         assert!(result.quality_ok, "subset should meet quality tolerance (c_zncc > 0.75)");
@@ -1987,7 +2136,7 @@ mod tests {
         ).unwrap();
 
         // Set tolerance above 1.0 so no solve can ever pass.
-        let result = subset.solve_icgn_result(None, 2.0, 1e-3, 50).unwrap();
+        let result = subset.solve_icgn_result(None, 2.0, 1e-3, 50, Texture::Deformable).unwrap();
 
         assert!(!result.quality_ok, "quality_ok should be false when tolerance > max possible ZNCC");
     }
@@ -2020,7 +2169,7 @@ mod tests {
 
         // Lenient tolerance (any positive correlation passes) but a single
         // iteration — nowhere near enough for `||Δp|| < max_norm` to hold.
-        let result = subset.solve_icgn_result(None, 0.0, 1e-8, 1).unwrap();
+        let result = subset.solve_icgn_result(None, 0.0, 1e-8, 1, Texture::Deformable).unwrap();
 
         assert!(!result.converged, "single-iteration solve should not have converged");
         assert!(
@@ -2056,7 +2205,7 @@ mod tests {
         assert!(!subset.solved(), "freshly constructed subset must be unsolved");
         assert!(subset.solution().is_none());
 
-        subset.solve_icgn(None, 0.75, 1e-3, 50).unwrap();
+        subset.solve_icgn(None, 0.75, 1e-3, 50, Texture::Deformable).unwrap();
 
         assert!(subset.solved(), "solved() must be true after solve_icgn");
         let sol = subset.solution().expect("solution must be Some after solve_icgn");
@@ -2067,4 +2216,122 @@ mod tests {
         );
     }
 
+}
+
+/// The warp vector convention, `[u, v, u_x, v_x, u_y, v_y, u_xx, v_xx, u_xy,
+/// v_xy, u_yy, v_yy]`, in the subset's own warp and its inverse-compositional
+/// update, with a different value in every slot.
+#[cfg(test)]
+mod warp_convention_tests {
+    use super::*;
+    use crate::particle::warp_convention_tests::{quad_warp, Q};
+
+    fn points() -> Array2<f64> {
+        Array2::from_shape_vec((4, 2), vec![13.0, 7.0, 4.0, 15.0, 9.5, 9.5, 16.0, 2.0]).unwrap()
+    }
+
+    #[test]
+    fn apply_warp_every_slot() {
+        let c = [10.0, 10.0];
+        let x = points();
+        for order in [1usize, 2] {
+            let p: Vec<f64> = if order == 1 { Q[..6].to_vec() } else { Q.to_vec() };
+            let g = apply_warp(c, &p, &x);
+            for i in 0..x.nrows() {
+                let (dx, dy) = (x[[i, 0]] - c[0], x[[i, 1]] - c[1]);
+                let mut want = quad_warp(dx, dy);
+                if order == 1 {
+                    want[0] = Q[0] + Q[2] * dx + Q[4] * dy;
+                    want[1] = Q[1] + Q[3] * dx + Q[5] * dy;
+                }
+                assert!((g[[i, 0]] - x[[i, 0]] - want[0]).abs() < 1e-12, "order {order} u");
+                assert!((g[[i, 1]] - x[[i, 1]] - want[1]).abs() < 1e-12, "order {order} v");
+            }
+        }
+    }
+
+    #[test]
+    fn steepest_descent_columns_are_warp_derivatives() {
+        // Column k of the steepest-descent image is grad(f) . d(warp)/d(p_k).
+        let c = [10.0, 10.0];
+        let x = points();
+        let grad = Array2::from_shape_vec((4, 2), vec![0.3, -0.7, 1.1, 0.2, -0.4, 0.9, 0.6, 0.5]).unwrap();
+        let sdi = steepest_descent(c, &x, &grad, 2);
+        let h = 1e-6;
+        let p0 = Q.to_vec();
+        for k in 0..12 {
+            let mut pp = p0.clone();
+            pp[k] += h;
+            let (gp, g0) = (apply_warp(c, &pp, &x), apply_warp(c, &p0, &x));
+            for i in 0..x.nrows() {
+                let d = [(gp[[i, 0]] - g0[[i, 0]]) / h, (gp[[i, 1]] - g0[[i, 1]]) / h];
+                let want = grad[[i, 0]] * d[0] + grad[[i, 1]] * d[1];
+                assert!((sdi[[i, k]] - want).abs() < 1e-6, "column {k}: {} vs {want}", sdi[[i, k]]);
+            }
+        }
+    }
+
+    #[test]
+    fn compose_zero_update_is_identity() {
+        for p in [Q[..6].to_vec(), Q.to_vec()] {
+            let q = compose_icgn(&p, &vec![0.0; p.len()]);
+            for k in 0..p.len() {
+                assert!((q[k] - p[k]).abs() < 1e-14, "slot {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn compose_order1_undoes_the_update() {
+        // W_new = W_old W_delta^-1, so applying delta then W_new is W_old.
+        let c = [10.0, 10.0];
+        let x = points();
+        let p = Q[..6].to_vec();
+        let dp = vec![0.05, -0.02, 0.004, -0.006, 0.003, 0.008];
+        let p_new = compose_icgn(&p, &dp);
+        let via = apply_warp(c, &p_new, &apply_warp(c, &dp, &x));
+        let direct = apply_warp(c, &p, &x);
+        for i in 0..x.nrows() {
+            for j in 0..2 {
+                assert!((via[[i, j]] - direct[[i, j]]).abs() < 1e-12, "point {i} coord {j}");
+            }
+        }
+    }
+
+    #[test]
+    fn compose_order2_inverse_is_second_order() {
+        // compose(0, dp) is the inverse of dp. Both warps are quadratic, so
+        // applying dp and then its inverse leaves only third-order terms: the
+        // round-trip error must fall about 8 times when the distance halves.
+        let c = [0.0, 0.0];
+        let dp = vec![0.2, -0.1, 0.02, 0.05, -0.03, 0.01, 0.002, -0.001, 0.0015, 0.001, -0.002, 0.0012];
+        let inv = compose_icgn(&vec![0.0; 12], &dp);
+        let err = |r: f64| {
+            let x = Array2::from_shape_vec((1, 2), vec![0.6 * r, -0.8 * r]).unwrap();
+            let back = apply_warp(c, &inv, &apply_warp(c, &dp, &x));
+            (back[[0, 0]] - x[[0, 0]]).hypot(back[[0, 1]] - x[[0, 1]])
+        };
+        for r in [8.0, 4.0, 2.0] {
+            let ratio = err(r) / err(r / 2.0);
+            assert!(ratio > 6.5, "error ratio {ratio} for r = {r} -> {}: not third order", r / 2.0);
+        }
+    }
+
+    #[test]
+    fn compose_order2_affine_parts_undo_the_update() {
+        // With no quadratic terms the order-2 composition is exactly affine.
+        let c = [10.0, 10.0];
+        let x = points();
+        let mut p = Q.to_vec();
+        p[6..].fill(0.0);
+        let dp = vec![0.05, -0.02, 0.004, -0.006, 0.003, 0.008, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let p_new = compose_icgn(&p, &dp);
+        let via = apply_warp(c, &p_new, &apply_warp(c, &dp, &x));
+        let direct = apply_warp(c, &p, &x);
+        for i in 0..x.nrows() {
+            for j in 0..2 {
+                assert!((via[[i, j]] - direct[[i, j]]).abs() < 1e-12, "point {i} coord {j}");
+            }
+        }
+    }
 }

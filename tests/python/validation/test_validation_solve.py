@@ -34,3 +34,24 @@ class TestValidationPyWrapper:
 
     def test_core_validation_field_data_exists(self):
         assert hasattr(_core, "ValidationFieldData")
+
+
+class TestSpeckleWarp:
+
+    def test_translation_warp(self):
+        sp = _make_speckle(image_no=3, u=2.0)
+        c = np.array([[10.0, 20.0], [150.0, 30.0]])
+        w = sp.warp(2, c)
+        assert w.shape == (2, 12)
+        np.testing.assert_allclose(w[:, 0], 2.0, atol=1e-12)
+        np.testing.assert_allclose(w[:, 1:], 0.0, atol=1e-12)
+
+    def test_reference_image_is_zero(self):
+        sp = _make_speckle(image_no=3, u=2.0)
+        w = sp.warp(0, np.array([[10.0, 20.0]]))
+        np.testing.assert_allclose(w, 0.0, atol=1e-12)
+
+    def test_out_of_range_image(self):
+        sp = _make_speckle(image_no=3)
+        with pytest.raises(ValueError):
+            sp.warp(3, np.array([[10.0, 20.0]]))

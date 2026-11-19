@@ -26,10 +26,6 @@ jobs:
           # Windows (matrix per Python version)
           # -------------------------
           - os: windows-latest
-            python-version: "3.8"
-          - os: windows-latest
-            python-version: "3.9"
-          - os: windows-latest
             python-version: "3.10"
           - os: windows-latest
             python-version: "3.11"
@@ -49,7 +45,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
           manylinux: auto
 
       - name: Build wheels (Linux aarch64)
@@ -57,7 +53,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist -i python3.8 -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
           manylinux: auto
           target: aarch64-unknown-linux-gnu
 

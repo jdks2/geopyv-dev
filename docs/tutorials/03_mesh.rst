@@ -171,7 +171,7 @@ The solver does **not** correlate all nodes independently or in a simple sweep:
        subset_order   = 2,
        tolerance      = 0.75,
        seed_tolerance = 0.9,
-       method         = "icgn",
+       solver         = "icgn",
    )
    print(f"solved      : {mesh.solved}")
    print(f"mean C_ZNCC : {mesh.c_zncc.mean():.4f}")

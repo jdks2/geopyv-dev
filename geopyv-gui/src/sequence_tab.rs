@@ -10,7 +10,7 @@ use geopyv_dev::io::GeopyvObject;
 use geopyv_dev::mesh::{SeedConfig, SolveConfig};
 use geopyv_dev::mesh::SolveMethod as LibSolveMethod;
 use geopyv_dev::geometry::region::{Region, RegionOption};
-use geopyv_dev::mesh::Masking;
+use geopyv_dev::mesh::{Masking, Texture};
 use geopyv_dev::sequence::{Sequence, SequenceMeshConfig, SequenceOptions as LibSequenceOptions, SequenceSolution, SequenceSolveConfig};
 use geopyv_dev::masks::{LocalMask, MaskShape};
 use geopyv_dev::timing::IncrementMode;
@@ -260,6 +260,7 @@ pub struct SequenceSpawnParams {
     pub border: usize,
     pub time: Option<geopyv_dev::timing::TimeInput>,
     pub masking: Masking,
+    pub texture: Texture,
     /// Directory /Meshes/<name>/ for per-frame .pyv files.
     pub mesh_subdir: PathBuf,
     /// Directory /Sequences/ for the overall SequenceSolution.
@@ -1262,6 +1263,7 @@ impl SequenceTabState {
                     ui.end_row();
 
                     crate::subset_tab::masking_row(ui, s);
+                    crate::subset_tab::texture_row(ui, s);
 
                     ui.label(lbl("Max norm:"));
                     let r = ui.add(
@@ -1543,6 +1545,7 @@ impl SequenceTabState {
                     method: form.solver.method,
                     subset_order: form.solver.order,
                     masking: form.solver.masking,
+                    texture: form.solver.texture,
                     max_norm: form.solver.max_norm,
                     max_iterations: form.solver.max_iterations,
                     zncc_tol: form.solver.zncc_tol,
@@ -1704,6 +1707,7 @@ fn run_solve(
                 SolveMethod::Fagn => LibSolveMethod::Fagn,
             },
             masking: params.masking,
+            texture: params.texture,
             ..Default::default()
         },
         local_mask,
@@ -1720,6 +1724,7 @@ fn run_solve(
         },
         border: params.border,
         save: None,
+        topology: Default::default(),
     };
 
     let progress = GuiProgress::new(|f, msg| set_progress(&state, f, msg), &cancel, 0.05, 0.95);

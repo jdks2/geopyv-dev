@@ -18,7 +18,7 @@ use pyo3::types::PyTuple;
 use geopyv_dev::{
     image::Image,
     mesh::{Preconditioning, SeedConfig, SolveConfig, SolveMethod},
-    sequence::{self, Sequence, SequenceMeshConfig, SequenceOptions, SequenceSolveConfig},
+    sequence::{self, Sequence, SequenceMeshConfig, SequenceOptions, SequenceSolveConfig, Topology},
     masks::LocalMask,
 };
 
@@ -120,7 +120,8 @@ pub struct PySequence {
 impl PySequence {
     #[new]
     #[pyo3(signature = (image_dir, boundary, target_nodes,
-                         size=(1.0, 1000.0), exclusions=None, mesh_order=1, time=None))]
+                         size=(1.0, 1000.0), exclusions=None, mesh_order=1, time=None, soil_properties=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         image_dir: &str,
         boundary: &Bound<'_, PyAny>,
@@ -129,8 +130,10 @@ impl PySequence {
         exclusions: Option<Vec<Bound<'_, PyAny>>>,
         mesh_order: u8,
         time: Option<&Bound<'_, PyAny>>,
+        soil_properties: Option<&Bound<'_, pyo3::types::PyDict>>,
     ) -> PyResult<Self> {
         let time = crate::utils::extract_time_input(time)?;
+        let soil = crate::py_speckle::soil_properties_arg(soil_properties)?;
         let boundary_region = extract_region_full(boundary)?;
         let excl_list = exclusions.unwrap_or_default();
         let excl_regions: Vec<geopyv_dev::geometry::region::Region> = excl_list
@@ -147,6 +150,7 @@ impl PySequence {
         let mut seq = Sequence::from_dir(std::path::Path::new(image_dir), mesh_cfg)
             .map_err(Error::from)?;
         seq.set_time(time.as_ref()).map_err(Error::from)?;
+        seq.soil_properties = soil;
         let boundary_obj = Some(boundary.clone().unbind());
         let exclusion_objs = excl_list.iter().map(|o| o.clone().unbind()).collect();
         Ok(PySequence { inner: seq, boundary_obj, exclusion_objs })
@@ -189,15 +193,34 @@ impl PySequence {
     ///     solved plain and its residuals give the noise for every later
     ///     pair, whose nodes are screened, investigated and corrected.
     ///     Needs ``subset_order=1``.
+    /// texture : str, optional
+    ///     ``"deformable"`` (default): the speckle stretches and shears with
+    ///     the material (painted speckle). ``"rigid"``: each speckle is a
+    ///     round lump that moves with the material under its centre but
+    ///     keeps its shape (grains, PIV tracer particles, ``gp.Speckle``);
+    ///     every pair's reference template is corrected for the mismatch this leaves
+    ///     at the current strain. Wrong for painted speckle. Order 0 carries
+    ///     no strain, so it is the same as ``"deformable"`` there.
+    ///     ``"grains"``: opaque rigid grains of any shape that turn with the
+    ///     material; each pixel corrected about its own grain's centre.
+    /// topology : str, optional
+    ///     ``"uniform"`` (default): a fresh mesh over the tracked region at
+    ///     every reference update. ``"tracked"``: the same subsets throughout
+    ///     -- at a reference update each subset is moved by its own
+    ///     displacement and the connectivity rebuilt, and every mesh solution
+    ///     carries each subset's history (``tracks``). Needs ``mesh_order=1``.
     #[pyo3(signature = (local_mask=None, seed_coord=None, seed_warp=None,
                          max_norm=1e-5, max_iterations=50, subset_order=1,
                          tolerance=0.75, seed_tolerance=0.9, method="icgn",
                          options=None, border=20, save=None,
                          preconditioning="RG",
                          masking="uniform",
+                         texture="deformable",
+                         grain=None,
                          layer_rg_batch_factor=4,
                          layer_rg_root_rel_eps=0.02,
-                         layer_rg_max_workers=None))]
+                         layer_rg_max_workers=None,
+                         topology="uniform"))]
     #[allow(clippy::too_many_arguments)]
     fn solve(
         &mut self,
@@ -216,10 +239,22 @@ impl PySequence {
         save: Option<&str>,
         preconditioning: &str,
         masking: &str,
+        texture: &str,
+        grain: Option<&str>,
         layer_rg_batch_factor: usize,
         layer_rg_root_rel_eps: f64,
         layer_rg_max_workers: Option<usize>,
+        topology: &str,
     ) -> PyResult<()> {
+        let topology = match topology {
+            "uniform" => Topology::Uniform,
+            "tracked" => Topology::Tracked,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "topology must be 'uniform' or 'tracked', got {other:?}"
+                )))
+            }
+        };
         let local_mask = local_mask.ok_or_else(|| {
             PyTypeError::new_err("local_mask is required")
         })?;
@@ -250,6 +285,11 @@ impl PySequence {
             max_workers: layer_rg_max_workers,
         };
         let masking = crate::py_mesh::check_masking(masking)?;
+        let texture = crate::py_mesh::check_texture(texture, grain)?;
+        if texture == geopyv_dev::mesh::Texture::RigidEdge && self.inner.soil_properties.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "grain='edge' needs the sequence's soil_properties"));
+        }
         let tmpl = local_mask
             .extract::<PyRef<'_, PyMask>>()
             .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;
@@ -273,6 +313,7 @@ impl PySequence {
                 preconditioning,
                 layer_rg,
                 masking,
+                texture,
                 ..Default::default()
             },
             local_mask,
@@ -284,6 +325,7 @@ impl PySequence {
             options: seq_options,
             border,
             save: save.map(PathBuf::from),
+            topology,
         };
         self.inner.solve(&cfg, None).map_err(Error::from)?;
         let sol = self.inner.solution().expect("solve() succeeded, solution must be Some");
@@ -388,6 +430,12 @@ impl PySequence {
     fn mesh_paths(&self) -> PyResult<Vec<String>> {
         let sol = self.require_solved()?;
         Ok(sol.mesh_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+    }
+
+    /// The soil properties given at instantiation (as a dict), or ``None``.
+    #[getter]
+    fn soil_properties<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        self.inner.soil_properties.as_ref().map(|c| crate::py_speckle::soil_properties_dict(py, c)).transpose()
     }
 
     /// ``True`` once ``solve()`` has been called (regardless of quality).
