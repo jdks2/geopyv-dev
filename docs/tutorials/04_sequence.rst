@@ -215,7 +215,7 @@ Solving
        subset_order   = 2,
        tolerance      = 0.75,
        seed_tolerance = 0.9,
-       method         = "icgn",
+       solver         = "icgn",
        options        = gp.SequenceOptions(guide=True, sync=True, sequential=False),
    )
    print(f"solved  : {sequence.solved}")

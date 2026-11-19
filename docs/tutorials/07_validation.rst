@@ -30,11 +30,11 @@ Setup
 
    val = gp.Validation(
        speckle         = speckle,
-       field_solutions = [field],
+       fields          = [field],
        labels          = ["standard"],
    )
 
-``labels`` is a list of strings of the same length as ``field_solutions``, used
+``labels`` is a list of strings of the same length as ``fields``, used
 to identify each field in plots and solution accessors.  Pass multiple fields
 to compare different solve configurations side-by-side.
 
@@ -75,7 +75,7 @@ Results
      - Progression multiplier at each image (deformation scale)
    * - ``solution.fields``
      - list of ``ValidationFieldData``
-     - Per-field results; one entry per element of ``field_solutions``
+     - Per-field results; one entry per element of ``fields``
    * - ``solution.labels``
      - list of str
      - Labels passed at construction

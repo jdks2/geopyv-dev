@@ -30,8 +30,8 @@ pytest tests/python/
 # Run a single Python test file
 pytest tests/python/mesh/test_mesh.py
 
-# Run the integration smoke-test (requires images/ directory)
-source .venv/bin/activate && python basictest.py
+# Run the demo scripts (demo/0_images.py ... 7_calibration.py; own images in demo/images/)
+source .venv/bin/activate && python demo/3_sequence.py
 ```
 
 ### Build the GUI
@@ -69,7 +69,7 @@ The `.github/workflows/release.yml` workflow triggers **only on version tags** �
    git push origin vx.y.z
    ```
 
-The tag push triggers the workflow: it builds manylinux + aarch64 + Windows wheels and an sdist, then publishes everything to PyPI via trusted publishing (no API token needed).
+The tag push triggers the workflow: it builds manylinux + aarch64 + Windows wheels (Python 3.10–3.13) and an sdist, then publishes everything to PyPI via trusted publishing (no API token needed).
 
 ## Architecture
 
@@ -90,7 +90,7 @@ The Python package that users import (`geopyv_dev`) is **not** the `.so` directl
 - `plots.py` — all matplotlib visualisation functions.
 - `_geopyv_dev.cpython-*.so` — the compiled Rust extension.
 
-The installed `.so` is also shadowed: `maturin` writes to `geopyv_dev/_geopyv_dev.so` directly, which means `maturin develop` + the existing `geopyv_dev/` package are the runtime. There is a `python/geopyv-dev/` stub that is only used during the maturin build and can be ignored.
+The installed `.so` is also shadowed: `maturin` writes to `geopyv_dev/_geopyv_dev.so` directly, which means `maturin develop` + the existing `geopyv_dev/` package are the runtime. `pyproject.toml` sets `python-source = "."`, so maturin packages `geopyv_dev/` directly.
 
 ### Rust core → PyO3 boundary
 

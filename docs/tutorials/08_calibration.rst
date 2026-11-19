@@ -206,7 +206,7 @@ Not every object in the pipeline should be calibrated:
    mesh = gp.Mesh(boundary=boundary, target_nodes=80, f_img=f_img, g_img=g_img,
                   size=(15.0, 70.0), mesh_order=2)
    mesh.solve(local_mask=local_mask, seed_coord=[200.0, 200.0], seed_warp=[0.0] * 12,
-              subset_order=2, tolerance=0.75, seed_tolerance=0.9, method="icgn")
+              subset_order=2, tolerance=0.75, seed_tolerance=0.9, solver="icgn")
 
    # boundary has already done its job — Mesh copied its pixel-space nodes at
    # construction — so calibrating it now is safe, and purely for reporting.

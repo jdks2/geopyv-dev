@@ -18,10 +18,15 @@ Work through the :doc:`tutorials/index` in order — each builds on the previous
 from loading images through to full strain-path tracking across an image sequence —
 then consult the :doc:`api/index` for full class and function documentation.
 
+Prefer a point-and-click workflow? The :doc:`gui` is installed with the package —
+run ``geopyv-gui``. Runnable scripts covering each tutorial are in the
+`demo folder <https://github.com/jdks2/geopyv-dev/tree/main/demo>`_ of the repository.
+
 .. toctree::
    :hidden:
    :maxdepth: 1
 
    installation
    tutorials/index
+   gui
    api/index

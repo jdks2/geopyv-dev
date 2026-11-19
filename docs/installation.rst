@@ -4,9 +4,10 @@ Installation
 There are two ways to install ``geopyv_dev``:
 
 - **pip**, from PyPI — prebuilt wheels, no Rust toolchain required. The
-  right choice for using the package.
-- **GitHub (from source)** — needed if you want the desktop GUI
-  (``geopyv-gui``), unreleased changes, or to contribute.
+  right choice for using the package, from scripts or the desktop GUI
+  (``geopyv-gui``).
+- **GitHub (from source)** — needed for unreleased changes, to contribute,
+  or on macOS.
 
 Both are covered below for **Linux** and **Windows**.
 
@@ -19,7 +20,7 @@ Prerequisites
    * - Route
      - Requirements
    * - pip
-     - Python ≥ 3.8, pip
+     - Python ≥ 3.10, pip
    * - GitHub (source)
      - Everything pip needs, plus `git <https://git-scm.com/downloads>`_ and
        `Rust <https://rustup.rs>`_ (stable, ≥ 1.85 — installed via ``rustup``).
@@ -33,7 +34,7 @@ Installing with pip
 ---------------------
 
 Prebuilt wheels are published for Linux (x86_64, aarch64) and Windows
-(Python 3.8–3.13) — no Rust toolchain needed for this route.
+(Python 3.10–3.13) — no Rust toolchain needed for this route.
 
 Linux
 ~~~~~~
@@ -58,11 +59,18 @@ Verify the install (either OS, with the virtual environment active):
 .. code-block:: bash
 
    python -c "import geopyv_dev"
+   geopyv-gui          # opens the desktop GUI
+
+Camera calibration (:doc:`tutorials/08_calibration`) also needs OpenCV:
+
+.. code-block:: bash
+
+   pip install "geopyv_dev[calibration]"   # or: pip install opencv-python
 
 Installing from GitHub (source)
 -----------------------------------
 
-Use this route to build the GUI, try unreleased changes, or contribute.
+Use this route to try unreleased changes, contribute, or install on macOS.
 
 Linux
 ~~~~~~
