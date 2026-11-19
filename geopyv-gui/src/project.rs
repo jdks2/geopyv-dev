@@ -70,6 +70,7 @@ const SUBDIRS: &[&str] = &[
     "Sequences",
     "Particles",
     "Fields",
+    "Calibrations",
     "Out",
 ];
 
@@ -163,6 +164,14 @@ impl Project {
         self.root.join("Fields")
     }
 
+    pub fn images_calibration_dir(&self) -> PathBuf {
+        self.root.join("Images/Calibration")
+    }
+
+    pub fn calibrations_dir(&self) -> PathBuf {
+        self.root.join("Calibrations")
+    }
+
     pub fn out_dir(&self) -> PathBuf {
         self.root.join("Out")
     }
@@ -225,6 +234,16 @@ impl Project {
     /// Sorted list of `.pyv` files in `/Fields/`.
     pub fn list_fields(&self) -> Vec<PathBuf> {
         list_files_with_exts(&self.fields_dir(), &["pyv"])
+    }
+
+    /// Sorted list of `.pyv` files in `/Calibrations/`.
+    pub fn list_calibrations(&self) -> Vec<PathBuf> {
+        list_files_with_exts(&self.calibrations_dir(), &["pyv"])
+    }
+
+    /// Naturally sorted list of ChArUco board images in `/Images/Calibration/`.
+    pub fn list_calibration_images(&self) -> Vec<PathBuf> {
+        list_files_with_exts(&self.images_calibration_dir(), &["jpg", "jpeg", "png", "tif", "tiff", "bmp"])
     }
 
 }

@@ -1,7 +1,12 @@
-"""Demo 6 - Validation: measured warps against the known applied deformation.
+"""Demo 6 - Validation: how accurate is it?
 
-The demo images are synthetic (gp.Speckle), so their true deformation is
-stored in images/shear/speckle_shear.pyv. Run 3_sequence.py and 5_field.py first.
+The demo images are synthetic: gp.Speckle moved the sand by a known amount,
+stored in images/shear/speckle_shear.pyv. Validation compares, particle by
+particle and image by image, the APPLIED (true) warp with the OBSERVED
+(measured) one. Doing this on synthetic images like your own - same grain
+size, subset size and mesh - tells you what accuracy to expect in a test.
+
+Run 3_sequence.py and 5_field.py first.
 """
 
 import sys
@@ -19,17 +24,23 @@ speckle = gp.load(str(IMAGES / "speckle_shear.pyv"))
 field = gp.load(str(OUTPUT / "field.pyv"))
 
 # ---------------------------------------------------------------------------
-# Solve: compare applied and observed warps particle by particle
+# Compare applied and observed
 # ---------------------------------------------------------------------------
 print("=== Validation ===")
 val = gp.Validation(speckle=speckle, fields=[field], labels=["demo"])
-val.solve(cumulative=True)
+val.solve(cumulative=True)  # True: totals since image 0; False: each step on its own.
 
 fd = val.solution.fields[0]
-print(f"  applied:  {fd.applied.shape}  (frames, particles, warp components)")
-u_error = fd.applied[-1, :, 0] - fd.observed[-1, :, 0]
-print(f"  mean |u error|, last frame: {abs(u_error).mean():.4f} px")
+n_frames, n_particles, _ = fd.applied.shape
+print(f"{n_particles} particles compared over {n_frames} images")
+for k in range(n_frames):
+    du = abs(fd.applied[k, :, 0] - fd.observed[k, :, 0])
+    dv = abs(fd.applied[k, :, 1] - fd.observed[k, :, 1])
+    print(f"  image {k + 1}: mean |u error| {du.mean():.4f} px, mean |v error| {dv.mean():.4f} px")
+print("Errors of thousandths of a pixel, as here, are typical for clean synthetic")
+print("images; camera noise, blur and larger strains make them bigger.")
 
-val.standard_error(component=0)  # Spread of u error against frame.
-val.mean_error(component=0)  # Bias of u error against frame.
-val.spatial_error(field_index=0, time_index=fd.applied.shape[0] - 1, quantity="R")
+val.standard_error(component=0)  # Spread of the u error, image by image.
+val.mean_error(component=0)  # Average (bias) of the u error, image by image.
+val.spatial_error(field_index=0, time_index=n_frames - 1, quantity="R")  # Where the errors are.
+print("\nNext: 7_calibration.py converts pixels into millimetres.")

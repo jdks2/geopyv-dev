@@ -3,6 +3,7 @@ use std::time::SystemTime;
 
 use eframe::egui;
 
+use crate::calibration_tab::{CalibrationBackend, CalibrationTabState};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
 use crate::field_tab::{FieldSpawnParams, FieldTabState};
 use crate::mesh_tab::{MeshSpawnParams, MeshTabState};
@@ -18,6 +19,7 @@ use crate::subset_tab::{SubsetSpawnParams, SubsetTabState};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Images,
+    Calibration,
     Subsets,
     Meshes,
     Sequences,
@@ -28,6 +30,7 @@ pub enum Tab {
 impl Tab {
     const ALL: &'static [Tab] = &[
         Tab::Images,
+        Tab::Calibration,
         Tab::Subsets,
         Tab::Meshes,
         Tab::Sequences,
@@ -38,6 +41,7 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Images => "Images",
+            Tab::Calibration => "Calibration",
             Tab::Subsets => "Subsets",
             Tab::Meshes => "Meshes",
             Tab::Sequences => "Sequences",
@@ -112,6 +116,12 @@ impl LeftPaneState {
                         path: p,
                     }
                 })
+                .collect(),
+
+            Tab::Calibration => project
+                .list_calibrations()
+                .into_iter()
+                .map(file_entry_stem)
                 .collect(),
 
             Tab::Subsets => project
@@ -196,6 +206,7 @@ pub struct MainWindow {
     pub sequence: SequenceTabState,
     pub particle: ParticleTabState,
     pub field: FieldTabState,
+    pub calibration: CalibrationTabState,
     pub texture_cache: TextureCache,
     pending_refresh: bool,
     pub error_modal: Option<String>,
@@ -203,7 +214,7 @@ pub struct MainWindow {
 }
 
 impl MainWindow {
-    pub fn new() -> Self {
+    pub fn new(calibration: Option<std::sync::Arc<CalibrationBackend>>) -> Self {
         Self {
             active_tab: Tab::Images,
             mode: PaneMode::View,
@@ -214,6 +225,7 @@ impl MainWindow {
             sequence: SequenceTabState::new(),
             particle: ParticleTabState::new(),
             field: FieldTabState::new(),
+            calibration: CalibrationTabState::new(calibration),
             texture_cache: TextureCache::new(),
             pending_refresh: false,
             error_modal: None,
@@ -230,6 +242,7 @@ impl MainWindow {
             || self.sequence.is_solving()
             || self.particle.is_solving()
             || self.field.is_solving()
+            || self.calibration.is_solving()
         {
             ctx.request_repaint();
         }
@@ -260,7 +273,7 @@ impl MainWindow {
         // Poll mesh solve completion.
         if let Some(outcome) = self.mesh.check_solve_complete() {
             match outcome {
-                Ok((solution, name, target_image)) => {
+                Ok((solution, name)) => {
                     let save_path = project.meshes_dir().join(format!("{name}.pyv"));
                     if let Err(e) = geopyv_dev::io::save(
                         &save_path,
@@ -270,7 +283,6 @@ impl MainWindow {
                     } else {
                         self.mesh.view.solution = Some(solution);
                         self.mesh.view.loaded_path = Some(save_path);
-                        self.mesh.view.target_image = target_image;
                         self.mesh.view.nodal_cache = None;
                         self.mode = PaneMode::View;
                         self.pending_refresh = true;
@@ -326,6 +338,25 @@ impl MainWindow {
             }
         }
 
+        // Poll calibration solve completion.
+        if let Some(outcome) = self.calibration.check_solve_complete() {
+            match outcome {
+                Ok((solution, name)) => {
+                    let save_path = project.calibrations_dir().join(format!("{name}.pyv"));
+                    if let Err(e) = geopyv_dev::io::save(&save_path, &geopyv_dev::io::GeopyvObject::Calibration(solution.clone())) {
+                        self.error_modal = Some(format!("Save error: {e}"));
+                    } else {
+                        self.calibration.view.set_solution(Some(save_path), Some(solution));
+                        self.mode = PaneMode::View;
+                        self.pending_refresh = true;
+                    }
+                }
+                Err(e) => {
+                    self.error_modal = Some(format!("Calibration failed: {e}"));
+                }
+            }
+        }
+
         // Poll field solve completion.
         if let Some(outcome) = self.field.check_solve_complete() {
             match outcome {
@@ -363,6 +394,10 @@ impl MainWindow {
         let particles_dir = project.particles_dir();
         let fields_dir = project.fields_dir();
         let out_dir = project.out_dir();
+        let calibrations = project.list_calibrations();
+        let board_images = project.list_calibration_images();
+        let board_dir = project.images_calibration_dir();
+        let calibrations_dir = project.calibrations_dir();
 
         // Ctrl+S — trigger Save for the active tab.
         let ctrl_s = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
@@ -431,11 +466,12 @@ impl MainWindow {
                     &images,
                     &sequences,
                     &out_dir,
+                    &PanePaths { calibrations: &calibrations, board_images: &board_images, board_dir: &board_dir, calibrations_dir: &calibrations_dir },
                 );
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.show_central(ui, selected_path.as_deref(), &images);
+            self.show_central(ui, selected_path.as_deref(), &images, &board_images);
         });
 
         // Handle Run from subset form.
@@ -629,7 +665,10 @@ impl MainWindow {
                         if ui.button("Import").clicked() {
                             self.action_import(project);
                         }
-                    } else if ui.button("New").clicked() {
+                    } else if tab == Tab::Calibration && ui.button("Import").clicked() {
+                        self.action_import_calibration(project);
+                    }
+                    if tab != Tab::Images && ui.button("New").clicked() {
                         self.left.selected = None;
                         self.mode = PaneMode::New;
                         if self.active_tab == Tab::Meshes {
@@ -748,6 +787,7 @@ impl MainWindow {
         ui: &mut egui::Ui,
         selected_path: Option<&std::path::Path>,
         images: &[PathBuf],
+        board_images: &[PathBuf],
     ) {
         let tab = self.active_tab;
         let available = ui.available_rect_before_wrap();
@@ -788,6 +828,14 @@ impl MainWindow {
                     });
                 });
                 None
+            }
+            (Tab::Calibration, _) => {
+                let mode = self.mode;
+                let cache = &mut self.texture_cache;
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
+                    self.calibration.show_central(ui, viewer_rect, mode, selected_path, board_images, cache)
+                })
+                .inner
             }
             (Tab::Subsets, _) => {
                 let mode = self.mode;
@@ -905,6 +953,7 @@ impl MainWindow {
         images: &[PathBuf],
         sequences: &[PathBuf],
         out_dir: &std::path::Path,
+        paths: &PanePaths<'_>,
     ) -> (
         Option<SubsetSpawnParams>,
         Option<MeshSpawnParams>,
@@ -963,6 +1012,12 @@ impl MainWindow {
                                 .color(ui.visuals().weak_text_color()),
                         );
                     }
+                    (Tab::Calibration, PaneMode::View, _) => {
+                        self.calibration.show_right_view(ui, selected_path);
+                    }
+                    (Tab::Calibration, PaneMode::New, _) => {
+                        self.calibration.show_right_new(ui, paths.board_images, paths.board_dir, paths.calibrations_dir);
+                    }
                     (Tab::Subsets, PaneMode::View, _) => {
                         self.subset.show_right_view(ui, selected_path);
                     }
@@ -970,13 +1025,13 @@ impl MainWindow {
                         subset_spawn = self.subset.show_right_new(ui, images);
                     }
                     (Tab::Meshes, PaneMode::View, _) => {
-                        self.mesh.show_right_view(ui, selected_path);
+                        self.mesh.show_right_view(ui, selected_path, paths.calibrations);
                     }
                     (Tab::Meshes, PaneMode::New, _) => {
                         mesh_spawn = self.mesh.show_right_new(ui, images);
                     }
                     (Tab::Sequences, PaneMode::View, _) => {
-                        self.sequence.show_right_view(ui, selected_path);
+                        self.sequence.show_right_view(ui, selected_path, paths.calibrations);
                     }
                     (Tab::Sequences, PaneMode::New, _) => {
                         sequence_spawn = self.sequence.show_right_new(ui, images);
@@ -991,7 +1046,7 @@ impl MainWindow {
                         self.field.show_right_view(ui, selected_path, out_dir);
                     }
                     (Tab::Fields, PaneMode::New, _) => {
-                        field_spawn = self.field.show_right_new(ui, sequences);
+                        field_spawn = self.field.show_right_new(ui, sequences, paths.calibrations);
                     }
                 }
             });
@@ -1040,6 +1095,32 @@ impl MainWindow {
     // -----------------------------------------------------------------------
     // Import action (Images tab)
     // -----------------------------------------------------------------------
+
+    /// Copy a calibration `.pyv` (e.g. saved from a script) into the project.
+    fn action_import_calibration(&mut self, project: &mut Project) {
+        let Some(src) = rfd::FileDialog::new()
+            .set_title("Import a calibration")
+            .add_filter("geopyv calibration", &["pyv"])
+            .pick_file()
+        else {
+            return;
+        };
+        if let Err(e) = crate::calibration_tab::load_calibration(&src) {
+            self.error_modal = Some(e);
+            return;
+        }
+        let Some(name) = src.file_name() else { return };
+        let dest = project.calibrations_dir().join(name);
+        if dest.exists() {
+            self.error_modal = Some(format!("{} already exists in Calibrations", name.to_string_lossy()));
+            return;
+        }
+        if let Err(e) = std::fs::copy(&src, &dest) {
+            self.error_modal = Some(format!("Import failed: {e}"));
+            return;
+        }
+        self.left.refresh(Tab::Calibration, project, true);
+    }
 
     fn action_import(&mut self, project: &mut Project) {
         let Some(paths) = rfd::FileDialog::new()
@@ -1137,6 +1218,14 @@ impl MainWindow {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Project paths the right pane needs beyond the image lists.
+pub struct PanePaths<'a> {
+    pub calibrations: &'a [PathBuf],
+    pub board_images: &'a [PathBuf],
+    pub board_dir: &'a std::path::Path,
+    pub calibrations_dir: &'a std::path::Path,
+}
 
 fn file_entry_stem(path: PathBuf) -> FileEntry {
     let display = path

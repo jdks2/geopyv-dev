@@ -86,6 +86,15 @@ impl CalibrationParams {
         out
     }
 
+    /// Displacements of image points `nodes` by `disp` (both `(N, 2)`, px) in
+    /// object space: `i2o(nodes + disp) - i2o(nodes)`. Positions themselves
+    /// stay in the image (lens distortion means "calibrated positions" would
+    /// not overlay it).
+    pub fn object_displacements(&self, nodes: ArrayView2<f64>, disp: ArrayView2<f64>) -> Array2<f64> {
+        let moved = &nodes + &disp;
+        self.i2o(moved.view()) - self.i2o(nodes)
+    }
+
     /// Map image pixels to object-space coordinates (z = 0 plane).
     ///
     /// `imgpnts` — `(N, 2)` pixel coordinates `[u, v]`.
@@ -203,6 +212,50 @@ impl CalibrationSolution {
     pub fn params(&self) -> Result<CalibrationParams, Error> {
         CalibrationParams::new(self.intmat.clone(), self.extmat.clone(), self.dist)
     }
+
+    /// Every accepted image's detected corners stacked, `(N, 2)` px.
+    pub fn all_corners(&self) -> Array2<f64> {
+        stack_rows(&self.corners)
+    }
+
+    /// How far the lens model moves each detected corner (`all_corners`
+    /// order), `(N, 2)` px: the corner minus where it would be with no
+    /// distortion (OpenCV `undistortImagePoints`), independent of the pose.
+    pub fn undistortion(&self) -> Array2<f64> {
+        let pts = self.all_corners();
+        let k = &self.intmat;
+        let (fx, fy, cx, cy, skew) = (k[[0, 0]], k[[1, 1]], k[[0, 2]], k[[1, 2]], k[[0, 1]]);
+        let mut out = Array2::<f64>::zeros(pts.raw_dim());
+        for i in 0..pts.nrows() {
+            let yn = (pts[[i, 1]] - cy) / fy;
+            let xn = (pts[[i, 0]] - cx - skew * yn) / fx;
+            let [xu, yu] = undistort_point([xn, yn], &self.dist);
+            out[[i, 0]] = pts[[i, 0]] - (fx * xu + skew * yu + cx);
+            out[[i, 1]] = pts[[i, 1]] - (fy * yu + cy);
+        }
+        out
+    }
+
+    /// Reprojection error of each detected corner (`all_corners` order),
+    /// `(N, 2)` px: the solved model's reprojection minus the detection.
+    pub fn reprojection_error(&self) -> Array2<f64> {
+        stack_rows(&self.reimgpnts) - self.all_corners()
+    }
+}
+
+/// `(N_i, 2)` arrays stacked into one `(sum N_i, 2)` array.
+fn stack_rows(parts: &[Array2<f64>]) -> Array2<f64> {
+    let n = parts.iter().map(|a| a.nrows()).sum();
+    let mut out = Array2::<f64>::zeros((n, 2));
+    let mut r = 0;
+    for a in parts {
+        for row in a.rows() {
+            out[[r, 0]] = row[0];
+            out[[r, 1]] = row[1];
+            r += 1;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +372,47 @@ mod tests {
         ];
         let dist = [-0.1, 0.02, 0.0, 0.0, 0.0];
         CalibrationParams::new(intmat, extmat, dist).unwrap()
+    }
+
+    #[test]
+    fn object_displacements_of_zero_move_are_zero_and_match_i2o() {
+        let p = test_params();
+        let nodes = array![[300.0, 200.0], [900.0, 700.0]];
+        let disp = array![[0.0, 0.0], [5.0, -3.0]];
+        let d = p.object_displacements(nodes.view(), disp.view());
+        assert!(d.row(0).iter().all(|v| v.abs() < 1e-12));
+        let want = p.i2o(array![[905.0, 697.0]].view()) - p.i2o(array![[900.0, 700.0]].view());
+        assert!((d[[1, 0]] - want[[0, 0]]).abs() < 1e-12 && (d[[1, 1]] - want[[0, 1]]).abs() < 1e-12);
+    }
+
+    /// Undistortion inverts the forward lens model: a point distorted from a
+    /// known undistorted position moves back by exactly that offset; the
+    /// reprojection error is reimgpnts - corners.
+    #[test]
+    fn undistortion_and_reprojection_error() {
+        let p = test_params();
+        let (fx, fy, cx, cy) = (2000.0, 2000.0, 640.0, 480.0);
+        let [k1, k2, _, _, k3] = p.dist;
+        let (xu, yu) = (0.2, -0.15);
+        let r2 = xu * xu + yu * yu;
+        let f = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+        let distorted = [fx * xu * f + cx, fy * yu * f + cy];
+        let sol = CalibrationSolution {
+            intmat: p.intmat.clone(),
+            extmat: p.extmat.clone(),
+            dist: p.dist,
+            corners: vec![array![[distorted[0], distorted[1]]], array![[640.0, 480.0]]],
+            ids: vec![array![0], array![1]],
+            accepted_images: vec![PathBuf::from("a.png"), PathBuf::from("b.png")],
+            image_size: (960, 1280),
+            reimgpnts: vec![array![[distorted[0] + 0.5, distorted[1]]], array![[640.0, 479.0]]],
+        };
+        let u = sol.undistortion();
+        assert!((u[[0, 0]] - (distorted[0] - (fx * xu + cx))).abs() < 1e-6);
+        assert!((u[[0, 1]] - (distorted[1] - (fy * yu + cy))).abs() < 1e-6);
+        assert!(u.row(1).iter().all(|v| v.abs() < 1e-9));           // the principal point does not move
+        let e = sol.reprojection_error();
+        assert_eq!(e, array![[0.5, 0.0], [0.0, -1.0]]);
     }
 
     #[test]

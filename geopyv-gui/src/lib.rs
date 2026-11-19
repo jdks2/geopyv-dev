@@ -3,10 +3,13 @@
 //! crate only gathers inputs, runs core solves on worker threads and draws
 //! results.
 //!
-//! [`run`] is the single entry point, shared by the `geopyv-gui` binary and
-//! the Python package's `geopyv-gui` console script.
+//! [`run`] is the entry point of the `geopyv-gui` binary; the Python
+//! package's `geopyv-gui` console script uses [`run_with`] to also hand over
+//! the calibration solve (ChArUco detection and the camera fit run in OpenCV,
+//! through Python).
 
 mod app;
+mod calibration_tab;
 mod colormap;
 mod draw;
 mod field_tab;
@@ -23,11 +26,21 @@ mod sequence_tab;
 mod subset_tab;
 mod time_input;
 
-/// Open the geopyv window and block until it is closed.
+pub use calibration_tab::{CalibrationBackend, CalibrationRequest};
+
+/// Open the geopyv window and block until it is closed. Calibrations can be
+/// loaded and used but not solved (see [`run_with`]).
 ///
 /// Must be called from the process's main thread, and at most once per
 /// process (the windowing event loop cannot be re-created).
 pub fn run() -> eframe::Result {
+    run_with(None)
+}
+
+/// [`run`], with `calibration` solving calibrations from the project's
+/// calibration images.
+pub fn run_with(calibration: Option<CalibrationBackend>) -> eframe::Result {
+    let calibration = calibration.map(std::sync::Arc::new);
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("geopyv")
@@ -40,6 +53,6 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         "geopyv",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::GeopyvApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::GeopyvApp::new(cc, calibration)))),
     )
 }

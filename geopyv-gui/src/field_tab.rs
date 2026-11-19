@@ -94,6 +94,8 @@ pub struct NewFieldForm {
     pub factor_text: String,
     pub factor: f64,
     pub true_incs: bool,
+    /// Solve in a calibration's board units (`None`: px).
+    pub calibration: Option<(PathBuf, geopyv_dev::calibration::CalibrationParams)>,
     pub form_error: Option<String>,
     cached_grid: Vec<egui::Pos2>,
     /// Per preview particle: inside the mesh (boundary minus exclusions).
@@ -116,6 +118,7 @@ impl Default for NewFieldForm {
             factor_text: geopyv_dev::particle::ParticleConfig::default().factor.to_string(),
             factor: geopyv_dev::particle::ParticleConfig::default().factor,
             true_incs: true,
+            calibration: None,
             form_error: None,
             cached_grid: Vec::new(),
             cached_inside: Vec::new(),
@@ -255,6 +258,8 @@ pub struct FieldSpawnParams {
     pub depth: f64,
     pub factor: f64,
     pub true_incs: bool,
+    /// Particle positions and strains in this calibration's board units.
+    pub calibration: Option<geopyv_dev::calibration::CalibrationParams>,
     pub fields_dir: PathBuf,
 }
 
@@ -432,6 +437,7 @@ impl FieldTabState {
         &mut self,
         ui: &mut egui::Ui,
         sequences: &[PathBuf],
+        calibrations: &[PathBuf],
     ) -> Option<FieldSpawnParams> {
         if self.is_solving() {
             let (progress, message) = {
@@ -705,6 +711,7 @@ impl FieldTabState {
 
         ui.add_space(3.0);
         ui.checkbox(&mut form.true_incs, "True increments (logarithmic strain)");
+        crate::calibration_tab::calibration_combo(ui, "field_units", "Units:", "px", calibrations, &mut form.calibration);
 
         ui.add_space(6.0);
         ui.separator();
@@ -736,6 +743,7 @@ impl FieldTabState {
                     depth: form.depth,
                     factor: form.factor,
                     true_incs: form.true_incs,
+                    calibration: form.calibration.as_ref().map(|c| c.1.clone()),
                     fields_dir: PathBuf::new(),
                 });
                 form.form_error = None;
@@ -911,7 +919,7 @@ fn run_solve(
 
     set_progress(&state, 0.15, "Solving field\u{2026}");
 
-    if let Err(e) = field.solve(params.factor, params.true_incs, None, geopyv_dev::particle::StrainMethod::default()) {
+    if let Err(e) = field.solve(params.factor, params.true_incs, params.calibration.as_ref(), geopyv_dev::particle::StrainMethod::default()) {
         set_error(&state, format!("Solve error: {e}"));
         return;
     }

@@ -201,8 +201,6 @@ impl PySequence {
     ///     every pair's reference template is corrected for the mismatch this leaves
     ///     at the current strain. Wrong for painted speckle. Order 0 carries
     ///     no strain, so it is the same as ``"deformable"`` there.
-    ///     ``"grains"``: opaque rigid grains of any shape that turn with the
-    ///     material; each pixel corrected about its own grain's centre.
     /// topology : str, optional
     ///     ``"uniform"`` (default): a fresh mesh over the tracked region at
     ///     every reference update. ``"tracked"``: the same subsets throughout
@@ -216,7 +214,6 @@ impl PySequence {
                          preconditioning="RG",
                          masking="uniform",
                          texture="deformable",
-                         grain=None,
                          layer_rg_batch_factor=4,
                          layer_rg_root_rel_eps=0.02,
                          layer_rg_max_workers=None,
@@ -240,7 +237,6 @@ impl PySequence {
         preconditioning: &str,
         masking: &str,
         texture: &str,
-        grain: Option<&str>,
         layer_rg_batch_factor: usize,
         layer_rg_root_rel_eps: f64,
         layer_rg_max_workers: Option<usize>,
@@ -285,11 +281,7 @@ impl PySequence {
             max_workers: layer_rg_max_workers,
         };
         let masking = crate::py_mesh::check_masking(masking)?;
-        let texture = crate::py_mesh::check_texture(texture, grain)?;
-        if texture == geopyv_dev::mesh::Texture::RigidEdge && self.inner.soil_properties.is_none() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "grain='edge' needs the sequence's soil_properties"));
-        }
+        let texture = crate::py_mesh::check_texture(texture)?;
         let tmpl = local_mask
             .extract::<PyRef<'_, PyMask>>()
             .map_err(|_| PyTypeError::new_err("local_mask must be a Mask"))?;

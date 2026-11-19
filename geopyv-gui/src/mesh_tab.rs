@@ -15,6 +15,8 @@ use geopyv_dev::masks::{LocalMask, MaskShape};
 use crate::colormap::{self, ColormapType};
 use crate::draw::{ActiveDrawMode, DrawShapeMode, ImageCoord};
 use crate::image_viewer::{HoverInfo, ImageViewer, TextureCache};
+use crate::calibration_tab::calibration_combo;
+use crate::overlay::{frame_row, nice_range, ViewFrame};
 use crate::subset_tab::{SolveMethod, SolverConfig, SubsetOrder};
 
 // ---------------------------------------------------------------------------
@@ -44,8 +46,8 @@ impl Default for MeshGenConfig {
             mesh_order: MeshOrder::First,
             size_lower_text: "20".to_string(),
             size_lower: 20.0,
-            size_upper_text: "40".to_string(),
-            size_upper: 40.0,
+            size_upper_text: "500".to_string(),
+            size_upper: 500.0,
             target_nodes_text: "200".to_string(),
             target_nodes: 200,
             parse_error: None,
@@ -193,7 +195,6 @@ impl NewMeshForm {
 pub struct MeshViewState {
     pub loaded_path: Option<PathBuf>,
     pub solution: Option<MeshSolution>,
-    pub target_image: Option<PathBuf>,
     pub active_pane: MeshViewPane,
     pub plot_type: MeshPlotType,
     pub colormap: ColormapType,
@@ -208,6 +209,13 @@ pub struct MeshViewState {
     pub show_seams: bool,
     /// Plot displacements as velocities (÷ the pair's Δt).
     pub rate: bool,
+    /// Draw over the reference image (mesh as built) or the target image
+    /// (mesh moved by the displacements).
+    pub frame: ViewFrame,
+    /// Contour opacity, 0-1.
+    pub opacity: f32,
+    /// Displacements in a calibration's board units instead of px.
+    pub calibration: Option<(PathBuf, geopyv_dev::calibration::CalibrationParams)>,
     // Cached per-node scalar values (invalidated when plot_type or rate changes).
     pub nodal_cache: Option<(MeshPlotType, Vec<f64>)>,
 }
@@ -217,7 +225,6 @@ impl MeshViewState {
         Self {
             loaded_path: None,
             solution: None,
-            target_image: None,
             active_pane: MeshViewPane::default(),
             plot_type: MeshPlotType::default(),
             colormap: ColormapType::default(),
@@ -230,6 +237,9 @@ impl MeshViewState {
             show_node_indices: false,
             show_seams: false,
             rate: false,
+            frame: ViewFrame::default(),
+            opacity: 0.8,
+            calibration: None,
             nodal_cache: None,
         }
     }
@@ -300,7 +310,6 @@ pub struct MeshTabState {
     pub image_viewer: ImageViewer,
     pub solve_state: Arc<Mutex<MeshSolveState>>,
     pub pending_save_name: Option<String>,
-    pub pending_target_image: Option<PathBuf>,
 }
 
 impl MeshTabState {
@@ -311,7 +320,6 @@ impl MeshTabState {
             image_viewer: ImageViewer::new(),
             solve_state: Arc::new(Mutex::new(MeshSolveState::new())),
             pending_save_name: None,
-            pending_target_image: None,
         }
     }
 
@@ -321,20 +329,18 @@ impl MeshTabState {
 
     pub fn check_solve_complete(
         &mut self,
-    ) -> Option<Result<(MeshSolution, String, Option<PathBuf>), String>> {
+    ) -> Option<Result<(MeshSolution, String), String>> {
         let mut state = self.solve_state.lock().unwrap();
         if state.running || state.result.is_none() {
             return None;
         }
         let result = state.result.take()?;
         let name = self.pending_save_name.take().unwrap_or_default();
-        let target = self.pending_target_image.take();
-        Some(result.map(|sol| (sol, name, target)))
+        Some(result.map(|sol| (sol, name)))
     }
 
     pub fn spawn_solve(&mut self, params: MeshSpawnParams) {
         self.pending_save_name = Some(params.name.clone());
-        self.pending_target_image = Some(params.target_path.clone());
         let mut state = self.solve_state.lock().unwrap();
         state.running = true;
         state.progress = 0.0;
@@ -380,10 +386,6 @@ impl MeshTabState {
                         if let GeopyvObject::Mesh(m) = obj { Some(m) } else { None }
                     })
                 });
-                // Populate target_image from the solution's stored path.
-                self.view.target_image = self.view.solution.as_ref()
-                    .map(|sol| sol.g_img_path.clone())
-                    .filter(|p| !p.as_os_str().is_empty());
             }
         }
 
@@ -455,11 +457,17 @@ impl MeshTabState {
             return None;
         }
 
-        // Show target image (if available) with the image viewer for pan/zoom.
-        let hover = if let Some(target_path) = self.view.target_image.clone() {
-            if target_path.exists() {
+        // The reference or target image (by frame) with the image viewer for pan/zoom.
+        let frame_image = self.view.solution.as_ref()
+            .map(|sol| match self.view.frame {
+                ViewFrame::Reference => sol.f_img_path.clone(),
+                ViewFrame::Target => sol.g_img_path.clone(),
+            })
+            .filter(|p| !p.as_os_str().is_empty());
+        let hover = if let Some(image_path) = frame_image {
+            if image_path.exists() {
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(viewer_rect), |ui| {
-                    self.image_viewer.show(ui, &target_path, cache, None)
+                    self.image_viewer.show(ui, &image_path, cache, None)
                 })
                 .inner
             } else {
@@ -489,7 +497,8 @@ impl MeshTabState {
 
             // Ensure cache is up to date.
             if self.view.nodal_cache.as_ref().map(|(t, _)| *t) != Some(plot_type) {
-                let vals = extract_nodal_values(sol, plot_type, self.view.rate);
+                let cal = self.view.calibration.as_ref().map(|c| &c.1);
+                let vals = extract_nodal_values(sol, plot_type, self.view.rate, cal);
                 self.view.nodal_cache = Some((plot_type, vals));
             }
 
@@ -497,9 +506,9 @@ impl MeshTabState {
                 let (vmin, vmax) = match range_mode {
                     RangeMode::Manual => (manual_min, manual_max),
                     RangeMode::Auto => {
-                        let mn = vals.iter().cloned().fold(f64::INFINITY, f64::min);
-                        let mx = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                        (mn, mx)
+                        let mn = vals.iter().cloned().filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min);
+                        let mx = vals.iter().cloned().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+                        nice_range(mn, mx)
                     }
                 };
 
@@ -521,12 +530,15 @@ impl MeshTabState {
                     show_wireframe,
                     show_node_indices,
                     &coord,
+                    self.view.frame == ViewFrame::Target,
+                    (self.view.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
                 );
 
-                if self.view.show_seams {
+                // cuts and actions are located on the reference mesh
+                if self.view.show_seams && self.view.frame == ViewFrame::Reference {
                     render_seam_overlay(&painter, sol, &coord);
                 }
-                render_colorbar(&painter, viewer_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate));
+                render_colorbar(&painter, viewer_rect, vmin, vmax, colormap, &plot_label(plot_type, self.view.rate, self.view.calibration.is_some()));
             }
         }
 
@@ -539,7 +551,7 @@ impl MeshTabState {
                 .rect_filled(viewer_rect, 0.0, egui::Color32::from_rgb(15, 15, 15));
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    egui::RichText::new("No target image — re-run solve to enable image underlay")
+                    egui::RichText::new("Image not found — it may have been moved since the solve")
                         .size(15.0)
                         .color(ui.visuals().weak_text_color()),
                 );
@@ -598,7 +610,7 @@ impl MeshTabState {
     // Right pane — view mode (§10.2)
     // -----------------------------------------------------------------------
 
-    pub fn show_right_view(&mut self, ui: &mut egui::Ui, selected_path: Option<&Path>) {
+    pub fn show_right_view(&mut self, ui: &mut egui::Ui, selected_path: Option<&Path>, calibrations: &[PathBuf]) {
         if self.view.loaded_path.as_deref() != selected_path {
             self.view.loaded_path = selected_path.map(|p| p.to_path_buf());
             self.view.nodal_cache = None;
@@ -607,9 +619,6 @@ impl MeshTabState {
                     if let GeopyvObject::Mesh(m) = obj { Some(m) } else { None }
                 })
             });
-            self.view.target_image = self.view.solution.as_ref()
-                .map(|sol| sol.g_img_path.clone())
-                .filter(|p| !p.as_os_str().is_empty());
         }
 
         let Some(sol) = self.view.solution.as_ref() else {
@@ -705,6 +714,9 @@ impl MeshTabState {
                 if let Some(dt) = dt {
                     ui.label(egui::RichText::new(format!("Δt = {} s", format_sci(dt))).size(14.0).color(ui.visuals().weak_text_color()));
                 }
+                if calibration_combo(ui, "mesh_units", "Units:", "px", calibrations, &mut self.view.calibration) {
+                    self.view.nodal_cache = None;
+                }
             }
             MeshViewPane::Quality => {
                 ui.horizontal_wrapped(|ui| {
@@ -793,7 +805,8 @@ impl MeshTabState {
         } else {
             let (mn, mx) = {
                 if self.view.nodal_cache.as_ref().map(|(t, _)| *t) != Some(self.view.plot_type) {
-                    let vals = extract_nodal_values(sol, self.view.plot_type, self.view.rate);
+                    let cal = self.view.calibration.as_ref().map(|c| &c.1);
+                    let vals = extract_nodal_values(sol, self.view.plot_type, self.view.rate, cal);
                     self.view.nodal_cache = Some((self.view.plot_type, vals));
                 }
                 self.view
@@ -818,6 +831,8 @@ impl MeshTabState {
         }
 
         ui.add_space(4.0);
+        frame_row(ui, &mut self.view.frame);
+        ui.add(egui::Slider::new(&mut self.view.opacity, 0.0..=1.0).text("opacity"));
         ui.checkbox(&mut self.view.show_wireframe, "Show wireframe");
         ui.checkbox(&mut self.view.show_node_indices, "Show node indices");
         if self.view.solution.as_ref().is_some_and(|s| s.seams.is_some()) {
@@ -1628,7 +1643,14 @@ fn run_solve(
 
 /// Compute per-node scalar values for the given plot type; with `rate`,
 /// displacements become velocities (÷ the pair's Δt; NaN without times).
-pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType, rate: bool) -> Vec<f64> {
+/// With `cal`, displacements are in its board units (see
+/// `CalibrationParams::object_displacements`).
+pub fn extract_nodal_values(
+    sol: &MeshSolution,
+    plot: MeshPlotType,
+    rate: bool,
+    cal: Option<&geopyv_dev::calibration::CalibrationParams>,
+) -> Vec<f64> {
     match plot {
         MeshPlotType::CZncc => sol.c_zncc.to_vec(),
         MeshPlotType::Iterations => sol.iterations.iter().map(|&v| v as f64).collect(),
@@ -1636,7 +1658,13 @@ pub fn extract_nodal_values(sol: &MeshSolution, plot: MeshPlotType, rate: bool) 
         MeshPlotType::Noise | MeshPlotType::StillMismatch | MeshPlotType::Correction => {
             seam_values(sol, plot).unwrap_or_else(|| vec![f64::NAN; sol.nodes.nrows()])
         }
-        _ => displacement_values(&sol.displacements, plot, rate.then(|| sol.dt().unwrap_or(f64::NAN))),
+        _ => {
+            let dt = rate.then(|| sol.dt().unwrap_or(f64::NAN));
+            match cal {
+                Some(c) => displacement_values(&c.object_displacements(sol.nodes.view(), sol.displacements.view()), plot, dt),
+                None => displacement_values(&sol.displacements, plot, dt),
+            }
+        }
     }
 }
 
@@ -1741,13 +1769,15 @@ pub fn displacement_values(disp: &ndarray::Array2<f64>, plot: MeshPlotType, dt: 
         .collect()
 }
 
-/// Colorbar label: velocities gain `(px/s)`.
-pub fn plot_label(plot: MeshPlotType, rate: bool) -> String {
+/// Colorbar label: displacements gain their unit (`px`, or `calibrated` for
+/// board units), per second for velocities.
+pub fn plot_label(plot: MeshPlotType, rate: bool, calibrated: bool) -> String {
     let is_disp = matches!(plot, MeshPlotType::Ux | MeshPlotType::Uy | MeshPlotType::UMag);
-    if rate && is_disp {
-        format!("{} (px/s)", plot.label())
-    } else {
-        plot.label().to_string()
+    let unit = if calibrated { "calibrated" } else { "px" };
+    match (is_disp, rate) {
+        (true, true) => format!("{} ({unit}/s)", plot.label()),
+        (true, false) => format!("{} ({unit})", plot.label()),
+        _ => plot.label().to_string(),
     }
 }
 
@@ -1770,6 +1800,8 @@ pub fn render_mesh_overlay(
     show_wireframe: bool,
     show_node_indices: bool,
     coord: &ImageCoord,
+    deformed: bool,
+    alpha: u8,
 ) {
     let n_nodes = sol.nodes.nrows();
     let n_elems = sol.elements.nrows();
@@ -1778,22 +1810,28 @@ pub fn render_mesh_overlay(
         return;
     }
 
-    // Screen-space positions for all nodes.
+    // Screen-space positions for all nodes: where they were built, or
+    // (`deformed`) moved by their displacements, in the target image.
     let positions: Vec<egui::Pos2> = (0..n_nodes)
         .map(|i| {
-            coord.to_screen(egui::pos2(
-                sol.nodes[[i, 0]] as f32,
-                sol.nodes[[i, 1]] as f32,
-            ))
+            let (mut x, mut y) = (sol.nodes[[i, 0]], sol.nodes[[i, 1]]);
+            if deformed {
+                let (u, v) = (sol.displacements[[i, 0]], sol.displacements[[i, 1]]);
+                if u.is_finite() && v.is_finite() {
+                    x += u;
+                    y += v;
+                }
+            }
+            coord.to_screen(egui::pos2(x as f32, y as f32))
         })
         .collect();
 
-    // Per-node colours (semi-transparent for image underlay blending).
+    // Per-node colours (`alpha` for image underlay blending).
     let colors: Vec<egui::Color32> = values
         .iter()
         .map(|&v| {
             let c = colormap::map_value(v, vmin, vmax, cmap);
-            egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 200)
+            egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
         })
         .collect();
 

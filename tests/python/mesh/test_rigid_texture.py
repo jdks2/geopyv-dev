@@ -1,4 +1,4 @@
-"""Rigid speckle texture (solver_options={"texture": "rigid", "grain": ...}) on
+"""Rigid speckle texture (solver_options={"texture": "rigid"}) on
 Subset, Mesh and Sequence.
 
 Synthetic images through gp.Speckle (round speckles that move rigidly with the
@@ -48,7 +48,7 @@ def _subset(paths, texture, order=1):
     s = gp.Subset([150.3, 150.6], _mask(), gp.Image(filepath=paths[0]), gp.Image(filepath=paths[-1]),
                   subset_order=order)
     p0 = [0.0] * (6 * order)
-    opts = {"texture": "deformable"} if texture == "deformable" else {"texture": "rigid", "grain": "sphere"}
+    opts = {"texture": "deformable"} if texture == "deformable" else {"texture": "rigid"}
     s.solve(p_0=p0, max_norm=1e-6, max_iterations=100, solver_options=opts)
     return s
 
@@ -56,20 +56,20 @@ def _subset(paths, texture, order=1):
 def test_subset_rigid_fits_better_and_records(frames, tmp_path):
     _, p = frames
     d, r = _subset(p, "deformable"), _subset(p, "rigid")
-    assert d.texture == ("deformable", None) and r.texture == ("rigid", "sphere")
+    assert d.texture == "deformable" and r.texture == "rigid"
     assert r.converged
     assert r.c_znssd < d.c_znssd
     path = str(tmp_path / "s.pyv")
     r.save(path)
-    assert gp.load(path).texture == ("rigid", "sphere")
+    assert gp.load(path).texture == "rigid"
 
 
 def test_subset_order0_records_deformable(frames):
     _, p = frames
     s = gp.Subset([150.0, 150.0], _mask(), gp.Image(filepath=p[0]), gp.Image(filepath=p[0]),
                   subset_order=0)
-    s.solve(solver_options={"texture": "rigid", "grain": "sphere"})
-    assert s.converged and s.texture == ("deformable", None)
+    s.solve(solver_options={"texture": "rigid"})
+    assert s.converged and s.texture == "deformable"
 
 
 def test_subset_rejects_bad_texture_and_unknown_keys(frames):
@@ -77,10 +77,8 @@ def test_subset_rejects_bad_texture_and_unknown_keys(frames):
     s = gp.Subset([150.0, 150.0], _mask(), gp.Image(filepath=p[0]), gp.Image(filepath=p[1]))
     with pytest.raises(ValueError, match="texture"):
         s.solve(solver_options={"texture": "painted"})
-    with pytest.raises(ValueError, match="grain"):
-        s.solve(solver_options={"texture": "rigid", "grain": "cube"})
-    with pytest.raises(ValueError, match="grain"):
-        s.solve(solver_options={"texture": "deformable", "grain": "shape"})
+    with pytest.raises(ValueError, match="accepts only"):      # grain="shape"/"edge" were removed
+        s.solve(solver_options={"texture": "rigid", "grain": "shape"})
     with pytest.raises(ValueError, match="accepts only"):
         s.solve(solver_options={"preconditioning": "RG"})
 
@@ -92,34 +90,36 @@ def _mesh(paths):
 def test_mesh_rigid_runs_and_round_trips(frames, tmp_path):
     _, p = frames
     m = _mesh(p)
-    m.solve(_mask(), _SEED, tolerance=0.5, solver_options={"texture": "rigid", "grain": "sphere"})
-    assert m.texture == ("rigid", "sphere")
+    m.solve(_mask(), _SEED, tolerance=0.5, solver_options={"texture": "rigid"})
+    assert m.texture == "rigid"
     assert np.all(np.isfinite(np.asarray(m.displacements)))
     path = str(tmp_path / "m.pyv")
     m.save(path)
-    assert gp.load(path).texture == ("rigid", "sphere")
+    assert gp.load(path).texture == "rigid"
 
 
 def test_mesh_default_is_deformable(frames):
     _, p = frames
     m = _mesh(p)
     m.solve(_mask(), _SEED, tolerance=0.5)
-    assert m.texture == ("deformable", None)
+    assert m.texture == "deformable"
 
 
 def test_mesh_rejects_bad_texture(frames):
     _, p = frames
     with pytest.raises(ValueError, match="texture"):
         _mesh(p).solve(_mask(), _SEED, solver_options={"texture": "painted"})
+    with pytest.raises(ValueError, match="unknown solver_options"):
+        _mesh(p).solve(_mask(), _SEED, solver_options={"texture": "rigid", "grain": "edge"})
 
 
 def test_sequence_rigid_reaches_every_mesh(frames):
     d, _ = frames
     seq = gp.Sequence(image_dir=str(d), boundary=_BOUNDARY, target_nodes=30, size=(10.0, 100.0), mesh_order=1)
     seq.solve(local_mask=_mask(), seed_coord=_SEED, subset_order=1, tolerance=0.5,
-              solver_options={"texture": "rigid", "grain": "sphere"})
+              solver_options={"texture": "rigid"})
     assert seq.solved
-    assert all(m.texture == ("rigid", "sphere") for m in seq.mesh_solutions)
+    assert all(m.texture == "rigid" for m in seq.mesh_solutions)
 
 
 def test_sequence_rejects_bad_texture(frames):
@@ -127,46 +127,6 @@ def test_sequence_rejects_bad_texture(frames):
     seq = gp.Sequence(image_dir=str(d), boundary=_BOUNDARY, target_nodes=30, size=(10.0, 100.0), mesh_order=1)
     with pytest.raises(ValueError, match="texture"):
         seq.solve(local_mask=_mask(), seed_coord=_SEED, solver_options={"texture": "painted"})
-
-
-# --- texture="rigid", grain="shape" (default): grains of any shape ---------------------
-
-@pytest.fixture(scope="module")
-def opaque_ellipses(tmp_path_factory):
-    d = tmp_path_factory.mktemp("opaque_ellipses")
-    comp = [0.0] * 12
-    comp[4] = _SHEAR
-    sp = _core.Speckle(
-        image_cfg={"image_dir": str(d), "name": "frame", "image_size": (301, 301), "file_format": ".png"},
-        speckle_cfg={"speckle_size": 10.0, "speckle_number": 700, "speckle_limit": True,
-                     "shape": "ellipse", "aspect": 2.0, "overlap": "opaque"},
-        progression="deformation", deformation_cfg={"comp": comp, "origin": (150.0, 150.0)},
-        noise_cfg=(0.0, 0.0), scale_cfg={"scale": "lin", "n": 2})
-    sp.solve(seed=5)
-    return sorted(str(p) for p in d.glob("frame_*.png"))
-
-
-def test_subset_grains_fits_better_and_records(opaque_ellipses, tmp_path):
-    p = opaque_ellipses
-    out = {}
-    for texture in ("deformable", "rigid"):
-        s = gp.Subset([150.3, 150.6], _mask(25), gp.Image(filepath=p[0]), gp.Image(filepath=p[1]))
-        s.solve(max_norm=1e-6, max_iterations=100, solver_options={"texture": texture})
-        assert s.converged
-        out[texture] = s
-    assert out["rigid"].texture == ("rigid", "shape")      # "shape" is the default
-    assert out["rigid"].c_znssd < out["deformable"].c_znssd
-    path = str(tmp_path / "g.pyv")
-    out["rigid"].save(path)
-    assert gp.load(path).texture == ("rigid", "shape")
-
-
-def test_mesh_grains_runs(opaque_ellipses):
-    p = opaque_ellipses
-    m = gp.Mesh(_BOUNDARY, 40, gp.Image(filepath=p[0]), gp.Image(filepath=p[-1]), time=(0, 1))
-    m.solve(_mask(), _SEED, tolerance=0.5, solver_options={"texture": "rigid", "grain": "shape"})
-    assert m.texture == ("rigid", "shape")
-    assert np.all(np.isfinite(np.asarray(m.displacements)))
 
 
 # --- gp.Speckle soil images -------------------------------------------------------------
@@ -257,7 +217,7 @@ def test_speckle_soil_rejects_bad_input(tmp_path):
 
 def test_subset_soil_properties(tmp_path):
     """soil_properties round-trips, takes a Speckle speckle_cfg as it is (image keys ignored), and changes the
-    sphere correction through the grain size."""
+    rigid correction through the grain size."""
     comp = [0.0] * 12
     comp[5] = -0.05
     cfg = {"soil": "clay", "matrix_brightness": 180, "seed_brightness": 100, "asr": 0.15, "d_p": 6,
@@ -273,7 +233,7 @@ def test_subset_soil_properties(tmp_path):
 
     def solve(props):
         s = gp.Subset([80.0, 80.0], mask, f, g, soil_properties=props)
-        s.solve(p_0=[truth[0], truth[1], 0, 0, 0, 0], solver_options={"texture": "rigid", "grain": "sphere"})
+        s.solve(p_0=[truth[0], truth[1], 0, 0, 0, 0], solver_options={"texture": "rigid"})
         return s
 
     plain, known = solve(None), solve(cfg)
@@ -288,30 +248,9 @@ def test_subset_soil_properties(tmp_path):
         gp.Subset([80.0, 80.0], mask, f, g, soil_properties={**cfg, "asr": 2.0})
 
 
-def test_edge_texture_needs_soil_properties(tmp_path):
-    """grain='edge': needs the subset's soil_properties and reports ('rigid', 'edge')."""
-    comp = [0.0] * 12
-    comp[5] = -0.05
-    cfg = {"soil": "clay", "matrix_brightness": 180, "seed_brightness": 100, "asr": 0.15, "d_p": 6, "aspect_ratio": 0.5}
-    sp = _core.Speckle(image_cfg={"image_dir": str(tmp_path), "name": "c", "image_size": (161, 161),
-                                  "file_format": ".png"},
-                       speckle_cfg=cfg, progression="deformation", deformation_cfg={"comp": comp},
-                       noise_cfg=(0.0, 0.0), scale_cfg={"scale": "lin", "n": 2})
-    sp.solve(seed=3)
-    f, g = gp.Image(filepath=str(tmp_path / "c_0.png")), gp.Image(filepath=str(tmp_path / "c_1.png"))
-    mask = gp.Mask(mask_type="local", shape="circle", size=30)
-    opts = {"texture": "rigid", "grain": "edge"}
-    with pytest.raises(ValueError, match="soil_properties"):
-        gp.Subset([80.0, 80.0], mask, f, g).solve(solver_options=opts)
-    s = gp.Subset([80.0, 80.0], mask, f, g, soil_properties=cfg)
-    truth = np.asarray(sp.warp(1, np.array([[80.0, 80.0]])))[0]
-    s.solve(p_0=[truth[0], truth[1], 0, 0, 0, 0], solver_options=opts)
-    assert s.texture == ("rigid", "edge") and s.converged
-
-
 def test_mesh_sequence_soil_properties(tmp_path):
-    """Mesh and Sequence take soil_properties as Subset does, hand them to every subset (the sphere correction
-    then matches a Subset given the same properties), and accept grain='edge' only with them."""
+    """Mesh and Sequence take soil_properties as Subset does, hand them to every subset (the rigid correction
+    then matches a Subset given the same properties)."""
     comp = [0.0] * 12
     comp[5] = -0.05
     cfg = {"soil": "clay", "matrix_brightness": 180, "seed_brightness": 100, "asr": 0.15, "d_p": 6,
@@ -324,7 +263,7 @@ def test_mesh_sequence_soil_properties(tmp_path):
     f, g = gp.Image(filepath=str(tmp_path / "c_0.png")), gp.Image(filepath=str(tmp_path / "c_1.png"))
     boundary = np.array([[50.0, 50.0], [150.0, 50.0], [150.0, 150.0], [50.0, 150.0]])
     mask = gp.Mask(mask_type="local", shape="circle", size=20)
-    opts = {"texture": "rigid", "grain": "sphere"}
+    opts = {"texture": "rigid"}
 
     def mesh(props):
         m = gp.Mesh(gp.PathRegion(nodes=boundary, hard=False), 30, f, g, time=(0, 1), soil_properties=props)
@@ -340,20 +279,11 @@ def test_mesh_sequence_soil_properties(tmp_path):
     s = gp.Subset(list(nodes[k]), mask, f, g, time=(0, 1), soil_properties=cfg)
     s.solve(p_0=list(np.asarray(known.warps)[k][:6]), max_norm=1e-6, solver_options=opts)
     assert np.allclose(np.asarray(s.p)[:2], np.asarray(known.displacements)[k], atol=1e-4)
-    with pytest.raises(ValueError, match="soil_properties"):
-        plain.solve(local_mask=mask, seed_coord=[100.0, 100.0], solver_options={"texture": "rigid", "grain": "edge"})
-    edge = gp.Mesh(gp.PathRegion(nodes=boundary, hard=False), 30, f, g, time=(0, 1), soil_properties=cfg)
-    edge.solve(local_mask=mask, seed_coord=[100.0, 100.0], tolerance=0.5,
-               solver_options={"texture": "rigid", "grain": "edge"})
-    assert edge.solved
 
     seq = gp.Sequence(str(tmp_path), gp.PathRegion(nodes=boundary, hard=False), 30, time=1.0, soil_properties=cfg)
     assert seq.soil_properties["soil"] == "clay"
     seq.solve(local_mask=mask, seed_coord=[100.0, 100.0], max_norm=1e-6, tolerance=0.5, solver_options=opts)
     assert np.allclose(np.asarray(seq.mesh_solutions[0].displacements), np.asarray(known.displacements), atol=1e-6)
-    with pytest.raises(ValueError, match="soil_properties"):
-        gp.Sequence(str(tmp_path), gp.PathRegion(nodes=boundary, hard=False), 30, time=1.0).solve(
-            local_mask=mask, seed_coord=[100.0, 100.0], solver_options={"texture": "rigid", "grain": "edge"})
 
 
 def _soil_speckle(tmp_path, **cfg):

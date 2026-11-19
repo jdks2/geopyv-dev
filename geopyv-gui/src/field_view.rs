@@ -420,7 +420,8 @@ impl FieldViewState {
         cache: &mut TextureCache,
     ) -> (Option<HoverInfo>, ImageCoord) {
         let sol = self.solution.as_ref().expect("checked by caller");
-        let image = sol.image_0_path.clone().filter(|p| p.exists());
+        // a calibrated field's positions are in board units, not on the image
+        let image = sol.image_0_path.clone().filter(|p| p.exists() && !sol.calibrated);
         let mut hover = None;
         let mut coord = None;
         if let Some(path) = image {

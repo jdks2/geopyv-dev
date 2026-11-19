@@ -21,6 +21,70 @@ pub fn format_sci(v: f64) -> String {
     }
 }
 
+/// Labels for evenly spaced `ticks`, all with the same number of decimals:
+/// as few as the step needs (scientific when the values are very large or
+/// the step very small).
+pub fn tick_labels(ticks: &[f64]) -> Vec<String> {
+    let step = ticks.windows(2).map(|w| (w[1] - w[0]).abs()).fold(f64::INFINITY, f64::min);
+    let step = if step.is_finite() && step > 0.0 { step } else { ticks.first().map_or(1.0, |v| v.abs().max(1e-12)) };
+    let big = ticks.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    // fewest decimals d with every tick a whole number of 10^-d
+    let decimals = |scale: f64| {
+        (0..=8)
+            .find(|&d| ticks.iter().all(|v| {
+                let x = v / scale * 10f64.powi(d);
+                (x - x.round()).abs() < 1e-6 * x.abs().max(1.0)
+            }))
+            .unwrap_or(8) as usize
+    };
+    let zero = |v: f64| if v.abs() < 1e-9 * step { 0.0 } else { v };
+    if big >= 1e4 || step < 1e-3 {
+        let e = big.max(step).log10().floor() as i32;
+        let d = decimals(10f64.powi(e));
+        ticks.iter().map(|&v| if zero(v) == 0.0 { "0".to_string() } else { format!("{:.*e}", d, v) }).collect()
+    } else {
+        let d = decimals(1.0);
+        ticks.iter().map(|&v| format!("{:.*}", d, zero(v))).collect()
+    }
+}
+
+/// Auto colour range: `[vmin, vmax]` widened to the nearest round tick values
+/// either side, so the colour bar ends on round numbers.
+pub fn nice_range(vmin: f64, vmax: f64) -> (f64, f64) {
+    if !(vmin.is_finite() && vmax.is_finite()) || vmax <= vmin {
+        return (vmin, vmax);
+    }
+    let ticks = max_n_locator_ticks(vmin, vmax, 6);
+    let lo = ticks.iter().copied().filter(|&t| t <= vmin).fold(f64::NEG_INFINITY, f64::max);
+    let hi = ticks.iter().copied().filter(|&t| t >= vmax).fold(f64::INFINITY, f64::min);
+    (if lo.is_finite() { lo } else { vmin }, if hi.is_finite() { hi } else { vmax })
+}
+
+// ---------------------------------------------------------------------------
+// Image frame
+// ---------------------------------------------------------------------------
+
+/// Which image a mesh result is drawn over: the reference image with the
+/// mesh where it was built, or the target image with the mesh moved by the
+/// measured displacements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewFrame {
+    #[default]
+    Reference,
+    Target,
+}
+
+/// "Frame:" radio row for the Mesh and Sequence views.
+pub fn frame_row(ui: &mut egui::Ui, frame: &mut ViewFrame) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Frame:").size(16.0).color(ui.visuals().weak_text_color()));
+        ui.radio_value(frame, ViewFrame::Reference, "Reference")
+            .on_hover_text("Reference image, mesh where it was built");
+        ui.radio_value(frame, ViewFrame::Target, "Target")
+            .on_hover_text("Target image, mesh moved by the measured displacements");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Coordinate transform without an image underlay
 // ---------------------------------------------------------------------------
@@ -378,8 +442,9 @@ pub fn render_colorbar_scale(
     let lc = egui::Color32::from_rgb(220, 220, 220);
     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
     let lx = bar_x + BAR_W + LABEL_PAD;
-    let label_at = |y: f32, v: f64| {
-        painter.text(egui::pos2(lx, y), egui::Align2::LEFT_CENTER, format_sci(v), font.clone(), lc);
+    let label_at = |y: f32, text: &str| {
+        painter.line_segment([egui::pos2(bar_x + BAR_W - 4.0, y), egui::pos2(bar_x + BAR_W, y)], egui::Stroke::new(1.0, lc));
+        painter.text(egui::pos2(lx, y), egui::Align2::LEFT_CENTER, text, font.clone(), lc);
     };
 
     match scale {
@@ -394,8 +459,25 @@ pub fn render_colorbar_scale(
                 );
                 painter.rect_filled(strip, egui::CornerRadius::same(0), colormap::sample(t, cmap));
             }
-            label_at(bar_y, vmax);
-            label_at(bar_y + bar_h, vmin);
+            // Round ticks inside the range, thinned so labels stay >= 14 px apart.
+            let span = vmax - vmin;
+            if !(span.is_finite() && span > 0.0) {
+                label_at(bar_y, &format_sci(vmax));
+                return;
+            }
+            let ticks: Vec<f64> = max_n_locator_ticks(vmin, vmax, 6)
+                .into_iter()
+                .filter(|&t| t >= vmin - 1e-9 * span && t <= vmax + 1e-9 * span)
+                .collect();
+            let labels = tick_labels(&ticks);
+            let mut last_y = f32::NEG_INFINITY;
+            for (t, text) in ticks.iter().zip(&labels).rev() {
+                let y = bar_y + bar_h * (1.0 - ((t - vmin) / span) as f32);
+                if y - last_y >= 14.0 {
+                    label_at(y, text);
+                    last_y = y;
+                }
+            }
         }
         ColorbarScale::Levels(levels) => {
             let n = levels.len().saturating_sub(1);
@@ -412,9 +494,10 @@ pub fn render_colorbar_scale(
             }
             // Label every level, thinned so labels stay >= 14 px apart.
             let every = ((14.0 / band_h).ceil() as usize).max(1);
-            for (k, &v) in levels.iter().enumerate() {
+            let labels = tick_labels(levels);
+            for (k, text) in labels.iter().enumerate() {
                 if k % every == 0 || k == n {
-                    label_at(bar_y + (n - k) as f32 * band_h, v);
+                    label_at(bar_y + (n - k) as f32 * band_h, text);
                 }
             }
         }
@@ -424,6 +507,22 @@ pub fn render_colorbar_scale(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tick_labels_share_rounding() {
+        assert_eq!(tick_labels(&[-0.16, -0.08, 0.0, 0.08, 0.16]), ["-0.16", "-0.08", "0.00", "0.08", "0.16"]);
+        assert_eq!(tick_labels(&[0.0, 0.5, 1.0, 1.5]), ["0.0", "0.5", "1.0", "1.5"]);
+        assert_eq!(tick_labels(&[-440.0, -400.0, -360.0]), ["-440", "-400", "-360"]);
+        assert_eq!(tick_labels(&[-8.0e-7, 0.0, 8.0e-7, 1.6e-6]), ["-8.0e-7", "0", "8.0e-7", "1.6e-6"]);
+    }
+
+    #[test]
+    fn nice_range_ends_on_round_values() {
+        assert_eq!(nice_range(0.0123, 0.987), (0.0, 1.0));
+        let (lo, hi) = nice_range(-0.1410, 0.3643);
+        assert!((lo + 0.2).abs() < 1e-12 && (hi - 0.4).abs() < 1e-12, "{lo} {hi}");
+        assert_eq!(nice_range(2.0, 2.0), (2.0, 2.0));
+    }
 
     /// Reference levels from matplotlib 3.10 `tricontourf(z).levels`
     /// (default N = 7) for data spanning `[zmin, zmax]`.

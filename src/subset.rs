@@ -183,7 +183,7 @@ pub struct SolveResult {
     /// pre-existing `.pyv` saved before this field existed.
     #[serde(default)]
     pub eta_omitted: Option<(f64, f64)>,
-    /// Template the solve fitted: [`Texture::RigidSphere`] only when a rigid solve
+    /// Template the solve fitted: [`Texture::Rigid`] only when a rigid solve
     /// actually used the rigid-texture template (not for order 0 or a
     /// reference without measurable speckle, which fall back).
     #[serde(default)]
@@ -1066,7 +1066,7 @@ impl Subset {
         let img = self.f_img.as_ref()?;
         match texture {
             Texture::Deformable => None,
-            Texture::RigidSphere => {
+            Texture::Rigid => {
                 let m = img.grain()?;
                 match self.soil_properties.as_ref().and_then(|p| p.grain_sigma2().ok().map(|g| (p, g))) {
                     // known grains: blob width^2 = the grains' spread plus the
@@ -1094,25 +1094,12 @@ impl Subset {
                     None => Some(TemplateModel::Curvature { h: m.sample(f_coords), s2: m.s2, base: None }),
                 }
             }
-            Texture::RigidEdge => {
-                // known grains only: edge distance from size and outline sphericity,
-                // side from the dye being darker or brighter than the matrix
-                let p = self.soil_properties.as_ref()?;
-                let rho = p.grain_edge_distance().ok()?;
-                let grad = self.grad_f.as_ref()?.clone();
-                let off = crate::texture::edge_offsets(&grad, rho, p.seed_brightness < p.matrix_brightness);
-                Some(TemplateModel::Edges { off, grad })
-            }
-            Texture::RigidShape => {
-                let grad = self.grad_f.as_ref()?.clone();
-                img.grain_centres().map(|c| TemplateModel::Grains { off: c.offsets(f_coords), grad })
-            }
         }
     }
 
     /// Inverse Compositional Gauss-Newton solve computation (no mutation).
     ///
-    /// `texture`: [`Texture::RigidSphere`] fits `g` to the template `f + G(E(p))`,
+    /// `texture`: [`Texture::Rigid`] fits `g` to the template `f + G(E(p))`,
     /// rebuilt from the current warp at every iteration (its own mean and
     /// norm in the ZNSSD); the steepest-descent images and Hessian stay those
     /// of `f`. Falls back to the deformable solve when the reference has no
@@ -1377,7 +1364,7 @@ impl Subset {
     }
 
     /// As [`Self::residual_with`], against the rigid-texture template
-    /// `f + G(E(p))` for [`Texture::RigidSphere`].
+    /// `f + G(E(p))` for [`Texture::Rigid`].
     fn residual_textured(&self, p: &[f64], texture: Texture) -> Result<Array1<f64>, Error> {
         let unavail = || Error::InvalidInput("residual_map: images unavailable".to_string());
         let f_coords = self.f_coords.as_ref().ok_or_else(unavail)?;

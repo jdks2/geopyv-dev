@@ -1,4 +1,9 @@
-"""Demo 5 - Field: many particles distributed over the region.
+"""Demo 5 - Field: strain histories over the whole area.
+
+A Field is many particles (demo 4) spread over the measured area, one per
+triangle of the first mesh, each standing for that triangle's share of the
+area. Together they give maps of strain - where the soil is shearing,
+compressing or dilating - and how those maps grow through the test.
 
 Run 3_sequence.py first. Saves output/field.pyv, which demo 6 loads.
 """
@@ -16,38 +21,39 @@ if not (OUTPUT / "sequence.pyv").exists():
 sequence = gp.load(str(OUTPUT / "sequence.pyv"))
 
 # ---------------------------------------------------------------------------
-# Build: one particle per element, placed from the first mesh
+# 1. Place the particles
 # ---------------------------------------------------------------------------
-print("=== Field ===")
+print("=== 1. Placing particles ===")
 m0 = sequence.mesh_solution_at(0)
 coords, volumes = gp.field_distribute_particles(nodes=m0.nodes, elements=m0.elements, depth=1.0)
-print(f"{len(volumes)} particles distributed from mesh 0")
-
+print(f"{len(volumes)} particles, one per triangle of the first mesh")
 field = gp.Field(sequence, track=True, depth=1.0, coordinates=coords, volumes=volumes)
-print(field)
 
 # ---------------------------------------------------------------------------
-# Solve
+# 2. Solve
 # ---------------------------------------------------------------------------
+print("\n=== 2. Solving ===")
 field.solve()
 print(field)
-print(f"  n_particles: {field.n_particles}")
-print(f"  increments:  {field.inc_no}")
 p0 = field.particle_at(0)
-print(f"  particle 0 final eps_xy: {p0.strains[-1, 5]:.5f}")
+print(f"  particle 0 ends with shear strain eps_xy = {p0.strains[-1, 5]:.5f}")
 
-field.inspect()
-field.contour("gamma_max")  # Total over the test.
-field.contour("gamma_max", increment=2, mode="sequential", rate=True)  # One increment, /s.
+field.inspect()  # Where the particles are.
+print("\nMaximum shear strain (gamma_max) over the whole test - uniform here,")
+print("as the whole image was sheared evenly:")
+field.contour("gamma_max")
+print("The same over one step (image 2 to 3), as a rate in /s:")
+field.contour("gamma_max", increment=2, mode="sequential", rate=True)
+print("Volumetric strain (ep_vol): about zero, as shear does not change area:")
 field.contour("ep_vol")
-field.history(particle_index=0, quantity="strains")
-field.trace(quantity="warps", component=0)  # Paths coloured by u.
+field.history(particle_index=0, quantity="strains")  # One particle's strains against time.
+field.trace(quantity="warps", component=0)  # All paths, coloured by u.
 
 # ---------------------------------------------------------------------------
-# Save and reload
+# 3. Save and reload
 # ---------------------------------------------------------------------------
 path = OUTPUT / "field.pyv"
 field.save(str(path))
 field = gp.load(str(path))
-print(f"\nLoaded: {field}")
-field.contour("gamma_max")
+print(f"\nLoaded from output/field.pyv: {field}")
+print("\nNext: 6_validation.py checks these results against the true deformation.")

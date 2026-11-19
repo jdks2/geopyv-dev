@@ -196,10 +196,6 @@ impl PyMesh {
     ///     the reference template is corrected for the mismatch this leaves
     ///     at the current strain. Wrong for painted speckle. Order 0 carries
     ///     no strain, so it is the same as ``"deformable"`` there.
-    ///     ``"grains"``: opaque rigid grains of any shape (a grain surface such as
-    ///     sand) that turn with the material; the reference is split into grains
-    ///     once and each pixel corrected about its own grain's centre. Wrong where
-    ///     grains overlap and add (painted or translucent speckle).
     /// preconditioning : str, optional
     ///     Intra-mesh RG frontier traversal strategy -- ``"RG"`` (default,
     ///     today's serial cascade) or ``"layer-RG"`` (layer-parallel
@@ -223,7 +219,6 @@ impl PyMesh {
                         preconditioning="RG",
                         masking="uniform",
                         texture="deformable",
-                        grain=None,
                         layer_rg_batch_factor=4,
                         layer_rg_root_rel_eps=0.02,
                         layer_rg_max_workers=None))]
@@ -244,7 +239,6 @@ impl PyMesh {
         preconditioning: &str,
         masking: &str,
         texture: &str,
-        grain: Option<&str>,
         layer_rg_batch_factor: usize,
         layer_rg_root_rel_eps: f64,
         layer_rg_max_workers: Option<usize>,
@@ -282,10 +276,7 @@ impl PyMesh {
             max_workers: layer_rg_max_workers,
         };
         let masking = check_masking(masking)?;
-        let texture = check_texture(texture, grain)?;
-        if texture == Texture::RigidEdge && self.inner.soil_properties.is_none() {
-            return Err(PyValueError::new_err("grain='edge' needs the mesh's soil_properties"));
-        }
+        let texture = check_texture(texture)?;
         let cfg = SolveConfig {
             max_norm,
             max_iterations,
@@ -451,11 +442,10 @@ impl PyMesh {
         Ok(self.require_solved()?.subset_order)
     }
 
-    /// Speckle texture the mesh was solved with: ``("deformable", None)``,
-    /// ``("rigid", "sphere")`` or ``("rigid", "shape")``.
+    /// Speckle texture the mesh was solved with: ``"deformable"`` or ``"rigid"``.
     #[getter]
-    fn texture(&self) -> PyResult<(&'static str, Option<&'static str>)> {
-        Ok(texture_pair(self.require_solved()?.solve_config.as_ref().map(|c| c.texture)))
+    fn texture(&self) -> PyResult<&'static str> {
+        Ok(texture_name(self.require_solved()?.solve_config.as_ref().map(|c| c.texture)))
     }
 
     /// Per-node iteration counts ``(N,)``.
@@ -747,11 +737,10 @@ impl PyMeshSolution {
         self.inner.subset_order
     }
 
-    /// Speckle texture the mesh was solved with: ``("deformable", None)``,
-    /// ``("rigid", "sphere")`` or ``("rigid", "shape")``.
+    /// Speckle texture the mesh was solved with: ``"deformable"`` or ``"rigid"``.
     #[getter]
-    fn texture(&self) -> (&'static str, Option<&'static str>) {
-        texture_pair(self.inner.solve_config.as_ref().map(|c| c.texture))
+    fn texture(&self) -> &'static str {
+        texture_name(self.inner.solve_config.as_ref().map(|c| c.texture))
     }
 
     #[getter]
@@ -961,31 +950,22 @@ pub(crate) fn check_masking(masking: &str) -> PyResult<Masking> {
     }
 }
 
-/// `texture=` and `grain=`: `"deformable"` (no `grain`), or `"rigid"` with
-/// `grain` `"shape"` (default) or `"sphere"` — see [`Texture`].
-pub(crate) fn check_texture(texture: &str, grain: Option<&str>) -> PyResult<Texture> {
-    match (texture, grain) {
-        ("deformable", None) => Ok(Texture::Deformable),
-        ("deformable", Some(g)) => Err(PyValueError::new_err(format!(
-            "grain={g:?} applies only to texture='rigid'"))),
-        ("rigid", None | Some("shape")) => Ok(Texture::RigidShape),
-        ("rigid", Some("sphere")) => Ok(Texture::RigidSphere),
-        ("rigid", Some("edge")) => Ok(Texture::RigidEdge),
-        ("rigid", Some(other)) => Err(PyValueError::new_err(format!(
-            "grain must be 'sphere', 'shape' or 'edge', got {other:?}"))),
-        (other, _) => Err(PyValueError::new_err(format!(
+/// `texture=`: `"deformable"` or `"rigid"` — see [`Texture`].
+pub(crate) fn check_texture(texture: &str) -> PyResult<Texture> {
+    match texture {
+        "deformable" => Ok(Texture::Deformable),
+        "rigid" => Ok(Texture::Rigid),
+        other => Err(PyValueError::new_err(format!(
             "texture must be 'deformable' or 'rigid', got {other:?}"))),
     }
 }
 
-/// Python form of a texture: `("deformable", None)`, `("rigid", "sphere")`
-/// or `("rigid", "shape")` (`None` input: no stored setting, i.e. deformable).
-pub(crate) fn texture_pair(t: Option<Texture>) -> (&'static str, Option<&'static str>) {
+/// Python form of a texture: `"deformable"` or `"rigid"` (`None` input: no
+/// stored setting, i.e. deformable).
+pub(crate) fn texture_name(t: Option<Texture>) -> &'static str {
     match t.unwrap_or_default() {
-        Texture::Deformable => ("deformable", None),
-        Texture::RigidSphere => ("rigid", Some("sphere")),
-        Texture::RigidShape => ("rigid", Some("shape")),
-        Texture::RigidEdge => ("rigid", Some("edge")),
+        Texture::Deformable => "deformable",
+        Texture::Rigid => "rigid",
     }
 }
 

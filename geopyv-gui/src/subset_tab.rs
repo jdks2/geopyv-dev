@@ -77,7 +77,9 @@ impl Default for SolverConfig {
                 geopyv_dev::mesh::SolveMethod::Icgn => SolveMethod::Icgn,
                 geopyv_dev::mesh::SolveMethod::Fagn => SolveMethod::Fagn,
             },
-            order: if core.subset_order == 1 { SubsetOrder::First } else { SubsetOrder::Second },
+            // order 1, as the Python Subset/Mesh/Sequence solves default to
+            // (the core's default is 2; order 2 is ~3x slower per node)
+            order: SubsetOrder::First,
             masking: core.masking,
             texture: core.texture,
             max_norm_text: format!("{:e}", core.max_norm),
@@ -115,15 +117,10 @@ pub fn texture_row(ui: &mut egui::Ui, s: &mut SolverConfig) {
     ui.horizontal(|ui| {
         ui.radio_value(&mut s.texture, Texture::Deformable, "Deformable")
             .on_hover_text("The speckle stretches and shears with the material (painted speckle).");
-        ui.radio_value(&mut s.texture, Texture::RigidSphere, "Rigid: sphere").on_hover_text(
+        ui.radio_value(&mut s.texture, Texture::Rigid, "Rigid").on_hover_text(
             "Each speckle is a round lump that moves with the material under its centre but keeps \
              its shape (grains, tracer particles, synthetic Speckle images). Corrects the template \
              for the mismatch this leaves under strain. Wrong for painted speckle.",
-        );
-        ui.radio_value(&mut s.texture, Texture::RigidShape, "Rigid: shape").on_hover_text(
-            "Rigid grains of any shape that do not overlap and turn with the material (a grain \
-             surface such as sand). Splits the reference into grains and corrects each pixel about \
-             its own grain's centre. Not for speckle that overlaps.",
         );
     });
     ui.end_row();
@@ -163,7 +160,7 @@ impl Default for NewSubsetForm {
             template_size: 20,
             template_size_error: None,
             // Python's `Subset` defaults to first order.
-            solver: SolverConfig { order: SubsetOrder::First, ..SolverConfig::default() },
+            solver: SolverConfig::default(),
             draw: crate::draw::DrawState::new(),
             form_error: None,
         }

@@ -1,6 +1,6 @@
 [package]
 name = "geopyv-dev-python"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 
 [lib]
@@ -9,7 +9,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 geopyv-dev = { path = ".." }
-geopyv-gui = { path = "../geopyv-gui" }
+geopyv-gui = { path = "../geopyv-gui", optional = true }
 pyo3 = { version = "0.22", features = ["extension-module", "multiple-pymethods"] }
 numpy = "0.22"
 ndarray = "0.16"
+
+[features]
+# The desktop GUI (`geopyv-gui`); off for docs builds, which do not need it.
+default = ["gui"]
+gui = ["dep:geopyv-gui"]

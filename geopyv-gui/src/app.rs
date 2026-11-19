@@ -1,5 +1,6 @@
 use eframe::egui;
 
+use crate::calibration_tab::CalibrationBackend;
 use crate::main_window::MainWindow;
 use crate::project::Project;
 use crate::recent::RecentProjects;
@@ -12,6 +13,8 @@ pub struct GeopyvApp {
     state: AppState,
     recent: RecentProjects,
     error: Option<String>,
+    /// How calibrations are solved (`None`: the GUI was started without Python).
+    calibration: Option<std::sync::Arc<CalibrationBackend>>,
 }
 
 enum AppState {
@@ -23,12 +26,13 @@ enum AppState {
 }
 
 impl GeopyvApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, calibration: Option<std::sync::Arc<CalibrationBackend>>) -> Self {
         configure_visuals(&cc.egui_ctx);
         Self {
             state: AppState::Startup,
             recent: RecentProjects::load(),
             error: None,
+            calibration,
         }
     }
 
@@ -186,7 +190,7 @@ impl GeopyvApp {
         // (MaxInnerSize from startup mode must be lifted.)
         self.state = AppState::ProjectOpen {
             project,
-            window: MainWindow::new(),
+            window: MainWindow::new(self.calibration.clone()),
         };
     }
 

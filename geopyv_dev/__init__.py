@@ -140,34 +140,17 @@ _NOT_YET_IMPLEMENTED = {
 }
 
 
-# `grain` qualifies texture="rigid" only: "shape" (default) or "sphere".
-_GRAIN_VALUES = {"sphere", "shape", "edge"}
-
-
-def _check_grain(solver_options, texture):
-    """The `grain` key: only with texture='rigid'; `None` lets the solver use its
-    default ("shape")."""
-    if "grain" not in solver_options:
-        return None
-    grain = solver_options["grain"]
-    if texture != "rigid":
-        raise ValueError("solver_options['grain'] applies only to solver_options['texture']='rigid'")
-    if grain not in _GRAIN_VALUES:
-        raise ValueError(f"solver_options['grain'] must be one of {sorted(_GRAIN_VALUES)!r}, got {grain!r}")
-    return grain
-
-
 def _subset_options(solver_options):
-    """`Subset.solve`'s solver_options: only the masking and texture axes (and
-    `grain` with texture='rigid') apply. Returns (masking, texture, grain)."""
+    """`Subset.solve`'s solver_options: only the masking and texture axes
+    apply. Returns (masking, texture)."""
     if solver_options is None:
         solver_options = {}
     if not isinstance(solver_options, dict):
         raise TypeError(f"solver_options must be a dict, got {type(solver_options).__name__}")
-    unknown = set(solver_options) - {"masking", "texture", "grain"}
+    unknown = set(solver_options) - {"masking", "texture"}
     if unknown:
-        raise ValueError(f"Subset.solve accepts only solver_options['masking'], ['texture'] "
-                         f"and ['grain'], got {sorted(unknown)!r}")
+        raise ValueError(f"Subset.solve accepts only solver_options['masking'] and ['texture'], "
+                         f"got {sorted(unknown)!r}")
     values = []
     for axis in ("masking", "texture"):
         value = solver_options.get(axis, _SOLVER_OPTION_DEFAULTS[axis])
@@ -175,7 +158,7 @@ def _subset_options(solver_options):
             raise ValueError(f"solver_options[{axis!r}] must be one of "
                              f"{sorted(_SOLVER_OPTION_AXES[axis])!r}, got {value!r}")
         values.append(value)
-    return (*values, _check_grain(solver_options, values[1]))
+    return tuple(values)
 
 
 def _adaptive_subset_order(masking, kwargs):
@@ -191,7 +174,7 @@ def _adaptive_subset_order(masking, kwargs):
 def _validate_solver_options(solver_options):
     """Validate + normalise a `solver_options` dict per
     solver_options_restructure.md §6. Returns
-    (topology, masking, preconditioning, texture, grain, layer_rg_opts) --
+    (topology, masking, preconditioning, texture, layer_rg_opts) --
     every axis filled with its default if absent, every sub-dict {} if
     absent. Raises ValueError for any unrecognised key/value or a sub-dict
     supplied for an axis not at the value it belongs to; NotImplementedError
@@ -203,7 +186,7 @@ def _validate_solver_options(solver_options):
     if solver_options.get("masking") == "zonal" or "zonal" in solver_options:
         raise ValueError(_ZONAL_REMOVED)
 
-    allowed_top = set(_SOLVER_OPTION_AXES) | _SOLVER_OPTION_SUBDICTS | {"grain"}
+    allowed_top = set(_SOLVER_OPTION_AXES) | _SOLVER_OPTION_SUBDICTS
     unknown_top = set(solver_options) - allowed_top
     if unknown_top:
         raise ValueError(
@@ -246,8 +229,7 @@ def _validate_solver_options(solver_options):
             )
 
     return (axis_values["topology"], axis_values["masking"], axis_values["preconditioning"],
-            axis_values["texture"], _check_grain(solver_options, axis_values["texture"]),
-            sub_opts["layer_rg"])
+            axis_values["texture"], sub_opts["layer_rg"])
 
 
 def _resolve_solver(explicit_solver, kwargs, deprecated_name):
@@ -330,7 +312,7 @@ class Subset:
     ``outlines``, ``matrix_brightness``, ``matrix_spread``,
     ``seed_brightness``, ``seed_spread``, ``asr``); image-only keys are ignored, so a
     Speckle's ``speckle_cfg`` can be passed as it is. Used by the rigid-texture
-    corrections: with it, ``grain="sphere"`` takes its blob width from the grains
+    correction (``texture="rigid"``): with it, the correction takes its blob width from the grains
     (their spread about their centres, plus the 1.1 px blur applied when an image
     is loaded from a file) instead of the image's correlation length.
     """
@@ -381,13 +363,12 @@ class Subset:
             the line, or re-solve at order 2). Lossless images only. Needs an
             order-1 subset (an order-2 one is rebuilt at order 1, with a
             warning). The plain solve is kept in ``.seams``.
-            ``{"texture": "rigid", "grain": "shape" | "sphere"}``: the
-            speckle moves with the material but keeps its shape -- see
-            `Mesh.solve`. Default ``"deformable"``. Read back via
-            ``.texture`` as a pair, e.g. ``("rigid", "shape")``.
+            ``{"texture": "rigid"}``: the speckle moves with the material
+            but keeps its shape -- see `Mesh.solve`. Default
+            ``"deformable"``. Read back via ``.texture``.
         """
         algo = _checked_solver(_resolve_solver(solver, extra_kwargs, "algorithm"))
-        masking, texture, grain = _subset_options(solver_options)
+        masking, texture = _subset_options(solver_options)
         if masking == "adaptive" and self._inner.subset_order != 1:
             warnings.warn("solver_options['masking']='adaptive' needs subset_order=1; rebuilding "
                           "the subset at order 1 (order 2 is applied where bending is found)",
@@ -397,7 +378,7 @@ class Subset:
                                        time=i.time)
         kwargs = dict(p_0=p_0, max_norm=max_norm,
                       max_iterations=max_iterations, tolerance=tolerance, masking=masking,
-                      texture=texture, grain=grain)
+                      texture=texture)
         if algo == "fagn":
             self._inner.solve_fagn(**kwargs)
         else:
@@ -493,43 +474,24 @@ class Mesh:
               ``root_rel_eps``, ``max_workers``.
             - ``texture`` : ``"deformable"`` (default): the speckle
               stretches and shears with the material (painted speckle).
-              ``"rigid"``: each grain moves with the material under its
-              centre but keeps its shape (sand grains, PIV tracer
-              particles). At each solver iteration the reference is
-              corrected for the mismatch this leaves at the current strain.
-              Wrong for painted speckle, which does deform. Which correction
-              is set by ``grain``:
-
-              - ``"grain": "shape"`` (default): grains of any shape that do
-                not overlap and turn with the material. The reference is
-                split into grains once (each pixel climbs to its brightest
-                neighbour until it reaches a peak) and each pixel is
-                corrected about its own grain's centre. Not for speckle that
-                overlaps.
-              - ``"grain": "sphere"``: round, Gaussian-shaped speckle; the
-                correction uses the reference image's curvature and its
-                measured speckle size (or, given ``soil_properties``, the
-                grains' size).
-              - ``"grain": "edge"``: flat grains in a matrix (sand grains in
-                clay), corrected at their edges: each edge pixel is moved
-                about a grain centre that lies across the edge, on the grain
-                side, at the grains' mean edge distance d / (2 sphericity),
-                the sphericity that of the outlines Speckle would draw.
-                Needs ``soil_properties`` (size, outlines, and matrix / dye
-                brightness for which side is the grain), given when the
-                subset, mesh or sequence is made.
-
-              Order 0 carries no strain, so it is the same as
-              ``"deformable"``; an image with no measurable speckle or no
-              grains falls back to ``"deformable"`` with a warning. Read
-              back via ``.texture`` as a pair: ``("deformable", None)``,
-              ``("rigid", "sphere")``, ``("rigid", "shape")`` or ``("rigid", "edge")``.
+              ``"rigid"``: each speckle is a round, Gaussian-shaped lump
+              that moves with the material under its centre but keeps its
+              shape (sand grains, PIV tracer particles, ``gp.Speckle``
+              images). At each solver iteration the reference is corrected
+              for the mismatch this leaves at the current strain, from the
+              reference image's curvature and its measured speckle size (or,
+              given ``soil_properties``, the grains' size). Wrong for
+              painted speckle, which does deform. Order 0 carries no strain,
+              so it is the same as ``"deformable"``; an image with no
+              measurable speckle falls back to ``"deformable"`` with a
+              warning. Read back via ``.texture``: ``"deformable"`` or
+              ``"rigid"``.
 
         ``method="adaptive"`` (and the ``adaptive_*`` kwargs) is not
         available and raises ``ValueError``."""
         _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
-        topology, masking, preconditioning, texture, grain, layer_rg_opts = \
+        topology, masking, preconditioning, texture, layer_rg_opts = \
             _validate_solver_options(solver_options)
         if topology == "tracked":
             raise ValueError("solver_options['topology']='tracked' carries subsets between "
@@ -538,7 +500,7 @@ class Mesh:
         self._inner.solve(
             local_mask, seed_coord, seed_warp=seed_warp,
             method=resolved_solver, preconditioning=preconditioning, masking=masking,
-            texture=texture, grain=grain, **_layer_rg_kwargs(layer_rg_opts), **kwargs,
+            texture=texture, **_layer_rg_kwargs(layer_rg_opts), **kwargs,
         )
 
     def save(self, path):
@@ -635,12 +597,12 @@ class Sequence:
         ``method="adaptive"`` is not available and raises ``ValueError``."""
         _reject_adaptive(kwargs)
         resolved_solver = _checked_solver(_resolve_solver(solver, kwargs, "method"))
-        topology, masking, preconditioning, texture, grain, layer_rg_opts = \
+        topology, masking, preconditioning, texture, layer_rg_opts = \
             _validate_solver_options(solver_options)
         _adaptive_subset_order(masking, kwargs)
         self._inner.solve(
             *args, method=resolved_solver, preconditioning=preconditioning, masking=masking,
-            texture=texture, grain=grain, topology=topology, **_layer_rg_kwargs(layer_rg_opts), **kwargs,
+            texture=texture, topology=topology, **_layer_rg_kwargs(layer_rg_opts), **kwargs,
         )
 
     @property

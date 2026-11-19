@@ -2816,6 +2816,18 @@ pub fn save<P: AsRef<Path>>(path: P, object: &GeopyvObject) -> Result<(), Error>
 /// `Legacy*V1` types and migrated into the current shapes — see "Schema
 /// versioning" in the module docs.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
+    load_any(path).map_err(|e| match e {
+        // a stored enum tag this build no longer has: in practice the removed
+        // rigid-texture corrections (grain "shape" / "edge", Texture tags 2 and 3)
+        Error::Io(m) if m.contains("variant index") => Error::Io(format!(
+            "{m}: the file uses an option this version no longer has (texture=\"rigid\" with \
+             grain \"shape\" or \"edge\" was removed in 0.2.4; re-solve with texture=\"rigid\")"
+        )),
+        e => e,
+    })
+}
+
+fn load_any<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
     let mut file = std::fs::File::open(path.as_ref()).map_err(|e| {
         Error::FileNotFound(format!("{}: {}", path.as_ref().display(), e))
     })?;
@@ -2997,6 +3009,16 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<GeopyvObject, Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_texture_tag_names_the_option() {
+        use crate::mesh::Texture;
+        // tag 2 was `RigidShape`; bincode reports an out-of-range variant index
+        let err = bincode::serde::decode_from_slice::<Texture, _>(&[2u8], bincode::config::standard()).unwrap_err();
+        assert!(err.to_string().contains("variant index"), "{err}");
+        let (t, _) = bincode::serde::decode_from_slice::<Texture, _>(&[1u8], bincode::config::standard()).unwrap();
+        assert_eq!(t, Texture::Rigid);
+    }
+
     use super::*;
     use std::path::PathBuf;
     use ndarray::{array, Array1, Array2};
@@ -3962,20 +3984,20 @@ mod tests {
     #[test]
     fn test_texture_round_trip() {
         let mut sol = seam_subset_solution();
-        sol.result.texture = Texture::RigidSphere;
+        sol.result.texture = Texture::Rigid;
         let tmp = std::env::temp_dir().join("geopyv_test_texture_subset.pyv");
         save(&tmp, &GeopyvObject::Subset(sol)).unwrap();
         match load(&tmp).unwrap() {
-            GeopyvObject::Subset(s) => assert_eq!(s.result.texture, Texture::RigidSphere),
+            GeopyvObject::Subset(s) => assert_eq!(s.result.texture, Texture::Rigid),
             _ => panic!("expected Subset variant"),
         }
         let _ = std::fs::remove_file(tmp);
         let mut m = make_mesh_solution();
-        m.solve_config.as_mut().unwrap().texture = Texture::RigidSphere;
+        m.solve_config.as_mut().unwrap().texture = Texture::Rigid;
         let tmp = std::env::temp_dir().join("geopyv_test_texture_mesh.pyv");
         save(&tmp, &GeopyvObject::Mesh(m)).unwrap();
         match load(&tmp).unwrap() {
-            GeopyvObject::Mesh(l) => assert_eq!(l.solve_config.map(|c| c.texture), Some(Texture::RigidSphere)),
+            GeopyvObject::Mesh(l) => assert_eq!(l.solve_config.map(|c| c.texture), Some(Texture::Rigid)),
             _ => panic!("expected Mesh"),
         }
         let _ = std::fs::remove_file(tmp);

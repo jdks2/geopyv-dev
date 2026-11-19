@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "geopyv-dev"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 
 [dependencies]
@@ -12,7 +12,8 @@ thiserror = "2"
 nalgebra = "0.33"
 ndarray = { version = "0.16", features = ["serde"] }
 rustfft = "6"
-image = "0.25"
+# Only the formats geopyv reads/writes; the defaults pull in heavy encoders (AVIF, ...).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "bmp"] }
 rayon = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 bincode = { version = "2", features = ["serde"] }
